@@ -43,10 +43,14 @@ include("Geometry.jl")
 include("Grids.jl")
 include("Solvers.jl")
 include("Decomposition.jl")
+include("Spectral.jl")
 include("TestFields.jl")
 
 # Extension point for CairoMakie visualization (implemented in ext/HelmholtzDecompositionCairoMakieExt.jl)
 function plot_decomposition end
 export plot_decomposition
+
+export AbstractSpectralHelmholtzResult, SpectralCartesianResult, SpectralSphericalResult
+export helmholtz_decompose_spectral, helmholtz_project_spectral!
 
 end # module HelmholtzDecomposition

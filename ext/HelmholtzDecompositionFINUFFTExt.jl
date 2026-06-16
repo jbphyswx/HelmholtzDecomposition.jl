@@ -104,6 +104,55 @@ function HelmholtzDecomposition.solve_poisson!(
     return HelmholtzDecomposition.SolverResult{T}(true, 1, zero(T))
 end
 
+function HelmholtzDecomposition._decompose_spectral(
+    ::HelmholtzDecomposition.CartesianGeometry,
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    grid::HelmholtzDecomposition.StructuredGrid;
+    Nk_x::Int = HelmholtzDecomposition.size_tuple(grid)[1],
+    Nk_y::Int = HelmholtzDecomposition.size_tuple(grid)[2],
+    tol::Real = 1e-8,
+    kwargs...
+)
+    Nx, Ny = HelmholtzDecomposition.size_tuple(grid)
+    dx = grid.geometry.dx
+    dy = grid.geometry.dy
+    T = eltype(u)
+
+    Lx = Nx * dx
+    Ly = Ny * dy
+
+    M = Nx * Ny
+    x_nodes = Vector{T}(undef, M)
+    y_nodes = Vector{T}(undef, M)
+    u_complex = Vector{Complex{T}}(undef, M)
+    v_complex = Vector{Complex{T}}(undef, M)
+
+    k = 0
+    for j in 1:Ny
+        for i in 1:Nx
+            k += 1
+            x_nodes[k] = T(2π) * grid.lon[i] / Lx - T(π)
+            y_nodes[k] = T(2π) * grid.lat[j] / Ly - T(π)
+            u_complex[k] = Complex{T}(u[i, j])
+            v_complex[k] = Complex{T}(v[i, j])
+        end
+    end
+
+    u_hat_raw = FINUFFT.nufft2d1(x_nodes, y_nodes, u_complex, +1, tol, Nk_x, Nk_y)
+    v_hat_raw = FINUFFT.nufft2d1(x_nodes, y_nodes, v_complex, +1, tol, Nk_x, Nk_y)
+    u_hat = dropdims(u_hat_raw, dims=3)
+    v_hat = dropdims(v_hat_raw, dims=3)
+
+    kx_range = -div(Nk_x, 2):div(Nk_x - 1, 2)
+    ky_range = -div(Nk_y, 2):div(Nk_y - 1, 2)
+
+    kx = [T(2π) * kxv / Lx for kxv in kx_range]
+    ky = [T(2π) * kyv / Ly for kyv in ky_range]
+
+    return HelmholtzDecomposition.helmholtz_project_spectral(u_hat, v_hat, kx, ky; kwargs...)
+end
+
 function __init__()
     HelmholtzDecomposition.register_spectral_solver!(:cartesian_irregular, CartesianNUFFTSolver)
 end

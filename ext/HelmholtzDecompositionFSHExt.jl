@@ -73,6 +73,77 @@ function HelmholtzDecomposition.solve_poisson!(
     return HelmholtzDecomposition.SolverResult{T}(true, 1, zero(T))
 end
 
+function HelmholtzDecomposition._decompose_spectral(
+    ::HelmholtzDecomposition.SphericalGeometry,
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    grid::HelmholtzDecomposition.StructuredGrid;
+    kwargs...
+)
+    Nlon, Nlat = HelmholtzDecomposition.size_tuple(grid)
+    T = eltype(u)
+    R = grid.geometry.R
+    dλ = Nlon > 1 ? grid.lon[2] - grid.lon[1] : T(0)
+    dφ = Nlat > 1 ? grid.lat[2] - grid.lat[1] : T(0)
+
+    div_f = zeros(T, Nlon, Nlat)
+    vort_f = zeros(T, Nlon, Nlat)
+
+    for j in 1:Nlat
+        for i in 1:Nlon
+            ip = i < Nlon ? i+1 : i
+            im = i > 1 ? i-1 : i
+            jp = j < Nlat ? j+1 : j
+            jm = j > 1 ? j-1 : j
+
+            φ = grid.lat[j]
+            cosφ = cos(φ)
+
+            h_λ = (ip - im) * dλ
+            h_φ = (jp - jm) * dφ
+
+            dudλ = ip == im ? zero(T) : (u[ip, j] - u[im, j]) / h_λ
+            v_cos_jp = v[i, jp] * cos(grid.lat[jp])
+            v_cos_jm = v[i, jm] * cos(grid.lat[jm])
+            d_vcos_dφ = jp == jm ? zero(T) : (v_cos_jp - v_cos_jm) / h_φ
+            div_f[i, j] = (dudλ + d_vcos_dφ) / (R * cosφ)
+
+            dvdλ = ip == im ? zero(T) : (v[ip, j] - v[im, j]) / h_λ
+            u_cos_jp = u[i, jp] * cos(grid.lat[jp])
+            u_cos_jm = u[i, jm] * cos(grid.lat[jm])
+            d_ucos_dφ = jp == jm ? zero(T) : (u_cos_jp - u_cos_jm) / h_φ
+            vort_f[i, j] = (dvdλ - d_ucos_dφ) / (R * cosφ)
+        end
+    end
+
+    lmax = Nlat - 1
+    C_vort = Matrix{T}(undef, Nlat, Nlon)
+    C_div = Matrix{T}(undef, Nlat, Nlon)
+    for j in 1:Nlat
+        for i in 1:Nlon
+            C_vort[j, i] = vort_f[i, j]
+            C_div[j, i] = div_f[i, j]
+        end
+    end
+
+    FastSphericalHarmonics.sph_transform!(C_vort)
+    FastSphericalHarmonics.sph_transform!(C_div)
+
+    for ℓ in 1:lmax
+        eigenval = -T(ℓ * (ℓ + 1)) / R^2
+        for m in -ℓ:ℓ
+            idx = FastSphericalHarmonics.sph_mode(ℓ, m)
+            C_vort[idx] /= eigenval
+            C_div[idx] /= eigenval
+        end
+    end
+    idx0 = FastSphericalHarmonics.sph_mode(0, 0)
+    C_vort[idx0] = zero(T)
+    C_div[idx0] = zero(T)
+
+    return HelmholtzDecomposition.SpectralSphericalResult(C_vort, C_div, lmax)
+end
+
 function __init__()
     HelmholtzDecomposition.register_spectral_solver!(:spherical_regular, SphericalSpectralSolver)
 end

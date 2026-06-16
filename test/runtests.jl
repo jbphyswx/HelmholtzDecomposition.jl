@@ -245,4 +245,48 @@ using FFTW: FFTW
             @test maximum(abs.(u)) > 0
         end
     end
+
+    @testset "Spectral Decomposition" begin
+        @testset "Base complex Cartesian projection" begin
+            N = 64
+            L = 1.0
+            dx = L / N
+            geom = HelmholtzDecomposition.CartesianGeometry(dx, dx)
+            xs = collect(range(0.0, L - dx, length=N))
+            ys = collect(range(0.0, L - dx, length=N))
+            grid = HelmholtzDecomposition.StructuredGrid(geom, xs, ys)
+
+            u, v, _, _, _, _ = HelmholtzDecomposition.taylor_green_vortex(grid)
+            u_hat = FFTW.rfft(u)
+            v_hat = FFTW.rfft(v)
+
+            res = HelmholtzDecomposition.helmholtz_project_spectral(u_hat, v_hat, grid)
+            @test res isa HelmholtzDecomposition.SpectralCartesianResult
+
+            # Exact reconstruction: u_rot_hat + u_div_hat ≈ u_hat
+            @test maximum(abs.(res.u_rot .+ res.u_div .- u_hat)) < 1e-12
+            @test maximum(abs.(res.v_rot .+ res.v_div .- v_hat)) < 1e-12
+
+            # For Taylor-Green (purely rotational), divergent component should be very small
+            @test maximum(abs.(res.u_div)) / maximum(abs.(res.u_rot)) < 1e-10
+        end
+
+        @testset "Physical Cartesian spectral decomposition (FFTW)" begin
+            N = 64
+            L = 1.0
+            dx = L / N
+            geom = HelmholtzDecomposition.CartesianGeometry(dx, dx)
+            xs = collect(range(0.0, L - dx, length=N))
+            ys = collect(range(0.0, L - dx, length=N))
+            grid = HelmholtzDecomposition.StructuredGrid(geom, xs, ys)
+
+            u, v, _, _, _, _ = HelmholtzDecomposition.taylor_green_vortex(grid)
+            res = HelmholtzDecomposition.helmholtz_decompose_spectral(u, v, grid)
+            @test res isa HelmholtzDecomposition.SpectralCartesianResult
+
+            # Test reconstruction
+            u_hat = FFTW.rfft(u)
+            @test maximum(abs.(res.u_rot .+ res.u_div .- u_hat)) < 1e-12
+        end
+    end
 end

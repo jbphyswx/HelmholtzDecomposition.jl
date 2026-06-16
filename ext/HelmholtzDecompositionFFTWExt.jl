@@ -60,6 +60,18 @@ function HelmholtzDecomposition.solve_poisson!(
     return HelmholtzDecomposition.SolverResult{T}(true, 1, zero(T))
 end
 
+function HelmholtzDecomposition._decompose_spectral(
+    ::HelmholtzDecomposition.CartesianGeometry,
+    u::AbstractMatrix,
+    v::AbstractMatrix,
+    grid::HelmholtzDecomposition.StructuredGrid;
+    kwargs...
+)
+    u_hat = FFTW.rfft(u)
+    v_hat = FFTW.rfft(v)
+    return HelmholtzDecomposition.helmholtz_project_spectral(u_hat, v_hat, grid; kwargs...)
+end
+
 function __init__()
     HelmholtzDecomposition.register_spectral_solver!(:cartesian_regular, CartesianSpectralSolver)
 end
