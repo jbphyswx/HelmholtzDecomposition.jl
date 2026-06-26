@@ -8,6 +8,7 @@ correctly recovers each component.
 
 export taylor_green_vortex, point_source_sink, rankine_vortex_with_source
 export rossby_wave, kelvin_ekman_flow
+export disk_mask, harmonic_vortex, harmonic_source
 
 # ---------------------------------------------------------------------------
 # Cartesian test fields
@@ -218,4 +219,95 @@ function kelvin_ekman_flow(
     v = v_rot .+ v_div
 
     return u, v, u_rot, v_rot, u_div, v_div
+end
+
+# ---------------------------------------------------------------------------
+# Harmonic (multiply-connected) test fields
+# ---------------------------------------------------------------------------
+
+"""
+    disk_mask(grid; center=domain center, radius) -> Array{Bool}
+
+Boolean active mask (`true` = wet) for a 2-D Cartesian grid with a circular disk of the
+given `radius` masked out (set to land), producing an annulus / domain-with-island. Useful
+for constructing multiply-connected domains that carry a nonzero harmonic component.
+"""
+function disk_mask(
+    grid::StructuredGrid{2,<:CartesianGeometry{2,T}};
+    center::Tuple{<:Real,<:Real} = _domain_center(grid),
+    radius::Real = (grid.coords_axes[1][end] - grid.coords_axes[1][1]) / 4,
+) where {T}
+    xs, ys = grid.coords_axes
+    cx, cy = T(center[1]), T(center[2])
+    r2 = T(radius)^2
+    mask = trues(length(xs), length(ys))
+    @inbounds for j in eachindex(ys), i in eachindex(xs)
+        ((xs[i] - cx)^2 + (ys[j] - cy)^2) <= r2 && (mask[i, j] = false)
+    end
+    return mask
+end
+
+function _domain_center(grid::StructuredGrid{2})
+    xs, ys = grid.coords_axes
+    return ((xs[1] + xs[end]) / 2, (ys[1] + ys[end]) / 2)
+end
+
+"""
+    harmonic_vortex(grid; Γ=1.0, center=domain center) → (u, v)
+
+Point-vortex velocity field `u = Γ/(2π) · (−(y−y₀), (x−x₀)) / r²`. Away from the
+singular center this field is **both** divergence-free and curl-free — i.e. purely
+*harmonic*. On a domain with the center masked out (see [`disk_mask`](@ref)) it has net
+circulation `Γ` around the hole and cannot be represented by a single-valued streamfunction
+or velocity potential, so a Helmholtz decomposition must place essentially all of it in the
+harmonic component. The definitive test for issue #1.
+"""
+function harmonic_vortex(
+    grid::StructuredGrid{2,<:CartesianGeometry{2,T}};
+    Γ::Real = one(T),
+    center::Tuple{<:Real,<:Real} = _domain_center(grid),
+) where {T}
+    xs, ys = grid.coords_axes
+    cx, cy = T(center[1]), T(center[2])
+    g = T(Γ) / T(2π)
+    u = zeros(T, length(xs), length(ys))
+    v = zeros(T, length(xs), length(ys))
+    @inbounds for j in eachindex(ys), i in eachindex(xs)
+        dx = xs[i] - cx
+        dy = ys[j] - cy
+        r2 = dx^2 + dy^2
+        r2 == 0 && continue
+        u[i, j] = -g * dy / r2
+        v[i, j] = g * dx / r2
+    end
+    return u, v
+end
+
+"""
+    harmonic_source(grid; q=1.0, center=domain center) → (u, v)
+
+Point-source velocity field `u = q/(2π) · (x−x₀, y−y₀) / r²`. Away from the singular
+center it is both curl-free and divergence-free — purely *harmonic* — with net outward flux
+`q` through any loop enclosing the center. Complementary to [`harmonic_vortex`](@ref): the
+flux mode of the harmonic subspace on a multiply-connected domain.
+"""
+function harmonic_source(
+    grid::StructuredGrid{2,<:CartesianGeometry{2,T}};
+    q::Real = one(T),
+    center::Tuple{<:Real,<:Real} = _domain_center(grid),
+) where {T}
+    xs, ys = grid.coords_axes
+    cx, cy = T(center[1]), T(center[2])
+    g = T(q) / T(2π)
+    u = zeros(T, length(xs), length(ys))
+    v = zeros(T, length(xs), length(ys))
+    @inbounds for j in eachindex(ys), i in eachindex(xs)
+        dx = xs[i] - cx
+        dy = ys[j] - cy
+        r2 = dx^2 + dy^2
+        r2 == 0 && continue
+        u[i, j] = g * dx / r2
+        v[i, j] = g * dy / r2
+    end
+    return u, v
 end

@@ -180,6 +180,38 @@ relnorm(x) = sqrt(sum(abs2, x))
         @test length(HD.vector_potential(res)) == 3
     end
 
+    @testset "Harmonic component (issue #1)" begin
+        # Annulus: a central disk masked out → multiply-connected (b₁ = 1).
+        n = 41; L = 2.0; h = L / (n - 1)
+        xs = collect(range(-1.0, 1.0, length = n)); ys = copy(xs)
+        base = HD.StructuredGrid(HD.CartesianGeometry(h, h), xs, ys)
+        mask = HD.disk_mask(base; center = (0.0, 0.0), radius = 0.3)
+        grid = HD.StructuredGrid(HD.CartesianGeometry(h, h), xs, ys; mask = mask)
+        @test HD.count_islands(grid) == 1
+        @test HD.betti1_estimate(grid) == 1
+
+        # Pure circulation about the hole: harmonic (div-free AND curl-free in the annulus).
+        u, v = HD.harmonic_vortex(grid; Γ = 1.0)
+        solver = HD.SORSolver(; max_iter = 20_000, tol = 1e-9, boundary = :dirichlet)
+        res = HD.helmholtz_decompose(u, v, grid; solver = solver, boundary_χ = :dirichlet, boundary_ψ = :dirichlet)
+        U = cat(u, v; dims = 3)
+        # Essentially all of the field is harmonic.
+        @test res.harmonic_fraction > 0.9
+        @test relnorm(res.u_rot) / relnorm(U) < 0.1
+        @test relnorm(res.u_div) / relnorm(U) < 0.1
+        # Exact reconstruction by construction, on wet cells (the hole is masked out).
+        wet = repeat(mask, 1, 1, 2)
+        @test maximum(abs.((res.u_rot .+ res.u_div .+ res.u_harm .- U)[wet])) < 1e-8
+
+        # Pure source (flux mode) is likewise harmonic on the annulus.
+        us, vs = HD.harmonic_source(grid; q = 1.0)
+        ress = HD.helmholtz_decompose(us, vs, grid; solver = solver, boundary_χ = :dirichlet, boundary_ψ = :dirichlet)
+        @test ress.harmonic_fraction > 0.9
+
+        # A fully wet rectangle is simply-connected.
+        @test HD.count_islands(base) == 0
+    end
+
     @testset "AutoSolver is mask-aware" begin
         # With a mask, AutoSolver must not pick the periodic FFT solver.
         mask = trues(16, 16); mask[8, 8] = false

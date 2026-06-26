@@ -42,6 +42,7 @@ module HelmholtzDecomposition
 include("Geometry.jl")
 include("Grids.jl")
 include("Operators.jl")
+include("Topology.jl")
 include("Solvers.jl")
 include("Decomposition.jl")
 include("Spectral.jl")
