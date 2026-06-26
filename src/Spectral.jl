@@ -128,7 +128,7 @@ function helmholtz_potentials_spectral(velocity_hat::AbstractArray, ks::NTuple{N
 
     kdims = size(velocity_hat)[1:N]
     P = n_rotation_components(N)
-    R_hat = Array{CT,N + 1}(undef, kdims..., P)
+    R_hat = similar(velocity_hat, CT, (kdims..., P))
     pairs = rotation_pairs(Val(N))
     for (p, (a, b)) in enumerate(pairs)
         ûa = comp(velocity_hat, a)
@@ -257,7 +257,7 @@ function build_cartesian_result(grid::StructuredGrid{N,<:CartesianGeometry,T}, U
         for c in 1:M
             phys = inverse(comp(spec, c))
             if out === nothing
-                out = Array{eltype(phys),N + 1}(undef, size(phys)..., M)
+                out = similar(phys, (size(phys)..., M))
             end
             copyto!(_component(out, c, Val(N)), phys)
         end

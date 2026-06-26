@@ -4,13 +4,15 @@ version = "0.1.0"
 authors = ["Jordan Benjamin"]
 
 [workspace]
-projects = ["test", "docs"]
+projects = ["test", "docs", "gpu"]
 
 [deps]
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 
 [weakdeps]
+AbstractFFTs = "621f4979-c628-5d54-868e-fcf4e3e8185c"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
@@ -21,6 +23,7 @@ NUFSHT = "e99b67a3-9706-455a-90e2-85b195a33206"
 OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
 
 [extensions]
+HelmholtzDecompositionCUDAExt = ["CUDA", "AbstractFFTs"]
 HelmholtzDecompositionCairoMakieExt = ["CairoMakie"]
 HelmholtzDecompositionDistributedExt = ["Distributed"]
 HelmholtzDecompositionFFTWExt = ["FFTW"]
@@ -38,6 +41,8 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 test = ["NUFSHT", "Test"]
 
 [compat]
+AbstractFFTs = "1"
+CUDA = "5, 6"
 CairoMakie = "0.15"
 Distributed = "1.11"
 FFTW = "1"
