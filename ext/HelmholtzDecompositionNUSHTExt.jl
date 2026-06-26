@@ -80,46 +80,15 @@ function HD.solve_poisson!(
     return HD.SolverResult{T}(true, 1, zero(T))
 end
 
+# Solve via the nuSHT Poisson solver, then reconstruct → physical HelmholtzResult.
 function HD._decompose_spectral(
     solver::SphericalNUSHTSolver,
     ::HD.SphericalGeometry,
-    U::AbstractArray{T},
-    grid::HD.StructuredGrid{2,<:HD.SphericalGeometry{T}};
-    output::Symbol = :physical,
-    lmax::Int = solver.lmax,
-    tol::Real = solver.tol,
+    U::AbstractArray,
+    grid::HD.StructuredGrid{2,<:HD.SphericalGeometry};
     kwargs...,
-) where {T}
-    # Physical output: solve via the nuSHT Poisson solver, then reconstruct.
-    output === :physical && return HD.helmholtz_decompose(U, grid; solver = solver)
-
-    Nlon, Nlat = HD.size_tuple(grid)
-    R = grid.geometry.R
-
-    div_f = zeros(T, Nlon, Nlat)
-    vort = zeros(T, Nlon, Nlat, 1)
-    HD._compute_div_rot!(div_f, vort, U, grid)
-    ζ = HD._component(vort, 1, Val(2))
-
-    θ, φ = _flatten_nodes(grid)
-    M = Nlon * Nlat
-    div_vec = Vector{T}(undef, M)
-    vort_vec = Vector{T}(undef, M)
-    k = 0
-    for j in 1:Nlat, i in 1:Nlon
-        k += 1
-        div_vec[k] = div_f[i, j]
-        vort_vec[k] = ζ[i, j]
-    end
-
-    plan = NUFSHT.make_plan(θ, φ, lmax; tol = tol, T = T)
-    C_vort = similar(plan.C)
-    C_div = similar(plan.C)
-    NUFSHT.nusht_type1!(C_vort, vort_vec, plan)
-    NUFSHT.nusht_type1!(C_div, div_vec, plan)
-    _divide_eigenvalues!(C_vort, lmax, R)
-    _divide_eigenvalues!(C_div, lmax, R)
-    return HD.SpectralSphericalResult(C_vort, C_div, lmax)
+)
+    return HD.helmholtz_decompose(U, grid; solver = solver)
 end
 
 function __init__()

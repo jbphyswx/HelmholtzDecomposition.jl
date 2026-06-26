@@ -205,15 +205,16 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    helmholtz_decompose_spectral(u, grid; output=:physical, kwargs...)
+    helmholtz_decompose_spectral(u, grid; kwargs...)
     helmholtz_decompose_spectral(u, v, grid; kwargs...)        # 2D convenience
     helmholtz_decompose_spectral(u, v, w, grid; kwargs...)     # 3D convenience
 
-Decompose a physical velocity field on `grid` using a spectral transform. Requires the
-appropriate extension to be loaded (`using FFTW`, `using FastSphericalHarmonics`, …).
+Decompose a physical velocity field on `grid` using a spectral transform, returning a
+physical [`HelmholtzResult`](@ref) (CPU) — or, on the GPU path, a `(; u_rot, u_div, u_harm)`
+NamedTuple of `CuArray`s. Requires the appropriate extension (`using FFTW`,
+`using FastSphericalHarmonics`, …). Pass `solver=` to select among loaded spectral backends.
 
-`output` selects what the extension returns: `:physical` (a [`HelmholtzResult`](@ref)),
-`:coefficients` (the spectral result type), or `:both`.
+For raw spectral coefficients, use the lower-level [`helmholtz_project_spectral`](@ref).
 """
 function helmholtz_decompose_spectral(u::AbstractArray, grid::AbstractGrid; kwargs...)
     return _spectral_dispatch(u, grid; kwargs...)

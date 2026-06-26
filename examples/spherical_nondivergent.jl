@@ -19,8 +19,8 @@ grid = HD.StructuredGrid(HD.SphericalGeometry(1.0),
 u, v, = HD.rossby_wave(grid)
 U = cat(u, v; dims = 3)
 
-solver = HD.SORSolver(; max_iter = 20_000, tol = 1e-6, boundary = :dirichlet)
-result = HD.helmholtz_decompose(u, v, grid; solver = solver, boundary_χ = :neumann, boundary_ψ = :dirichlet)
+solver = HD.SORSolver(; max_iter = 20_000, tol = 1e-6, boundary = HD.Dirichlet())
+result = HD.helmholtz_decompose(u, v, grid; solver = solver, boundary_χ = HD.Neumann(), boundary_ψ = HD.Dirichlet())
 
 rot_mag = Statistics.mean(speed(result.u_rot))
 div_mag = Statistics.mean(speed(result.u_div))

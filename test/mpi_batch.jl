@@ -20,8 +20,8 @@ mkfield(s) = begin
     U
 end
 fields = [mkfield(s) for s in (1.0, 2.0, 0.5, 1.5, 0.8)]
-solver = HD.SORSolver(; max_iter = 3_000, tol = 1e-8, boundary = :dirichlet)
-kw = (; solver = solver, boundary_χ = :dirichlet, boundary_ψ = :dirichlet)
+solver = HD.SORSolver(; max_iter = 3_000, tol = 1e-8, boundary = HD.Dirichlet())
+kw = (; solver = solver, boundary_χ = HD.Dirichlet(), boundary_ψ = HD.Dirichlet())
 
 serial = HD.helmholtz_decompose_batch(grid, fields; kw...)
 mpi = HD.helmholtz_decompose_batch(grid, fields; backend = HD.MPIBackend(), kw...)

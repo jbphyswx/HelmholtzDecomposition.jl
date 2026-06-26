@@ -98,7 +98,7 @@ relnorm(x) = sqrt(sum(abs2, x))
         RHS = [-(2π^2) * sin(π * xs[i]) * sin(π * ys[j]) for i in 1:N, j in 1:N]
         Φex = [sin(π * xs[i]) * sin(π * ys[j]) for i in 1:N, j in 1:N]
         Φ = zeros(N, N)
-        r = HD.solve_poisson!(Φ, RHS, grid, HD.SORSolver(; max_iter = 50_000, tol = 1e-10, boundary = :dirichlet))
+        r = HD.solve_poisson!(Φ, RHS, grid, HD.SORSolver(; max_iter = 50_000, tol = 1e-10, boundary = HD.Dirichlet()))
         @test r.converged
         @test maximum(abs.(Φ .- Φex)) < 0.05
     end
@@ -120,7 +120,7 @@ relnorm(x) = sqrt(sum(abs2, x))
         n = 48; L = 1.0; h = L / (n + 1)
         xs = collect(range(h, L - h, length = n)); ys = copy(xs)
         grid = HD.StructuredGrid(HD.CartesianGeometry(h, h), xs, ys)
-        solver = HD.SORSolver(; max_iter = 50_000, tol = 1e-10, boundary = :dirichlet)
+        solver = HD.SORSolver(; max_iter = 50_000, tol = 1e-10, boundary = HD.Dirichlet())
 
         # pure gradient χ = sin(πx)sin(πy)
         Ug = zeros(n, n, 2)
@@ -128,7 +128,7 @@ relnorm(x) = sqrt(sum(abs2, x))
             Ug[i, j, 1] = π * cos(π * xs[i]) * sin(π * ys[j])
             Ug[i, j, 2] = π * sin(π * xs[i]) * cos(π * ys[j])
         end
-        rg = HD.helmholtz_decompose(Ug, grid; solver = solver, boundary_χ = :dirichlet, boundary_ψ = :dirichlet)
+        rg = HD.helmholtz_decompose(Ug, grid; solver = solver, boundary_χ = HD.Dirichlet(), boundary_ψ = HD.Dirichlet())
         @test relnorm(rg.u_rot) / relnorm(Ug) < 1e-3
         @test rg.harmonic_fraction < 1e-2
 
@@ -138,7 +138,7 @@ relnorm(x) = sqrt(sum(abs2, x))
             Ur[i, j, 1] = -π * sin(π * xs[i]) * cos(π * ys[j])
             Ur[i, j, 2] = π * cos(π * xs[i]) * sin(π * ys[j])
         end
-        rr = HD.helmholtz_decompose(Ur, grid; solver = solver, boundary_χ = :dirichlet, boundary_ψ = :dirichlet)
+        rr = HD.helmholtz_decompose(Ur, grid; solver = solver, boundary_χ = HD.Dirichlet(), boundary_ψ = HD.Dirichlet())
         @test relnorm(rr.u_div) / relnorm(Ur) < 1e-3
         @test size(HD.streamfunction(rr)) == (n, n)
     end
@@ -196,8 +196,8 @@ relnorm(x) = sqrt(sum(abs2, x))
 
         # Pure circulation about the hole: harmonic (div-free AND curl-free in the annulus).
         u, v = HD.harmonic_vortex(grid; Γ = 1.0)
-        solver = HD.SORSolver(; max_iter = 20_000, tol = 1e-9, boundary = :dirichlet)
-        res = HD.helmholtz_decompose(u, v, grid; solver = solver, boundary_χ = :dirichlet, boundary_ψ = :dirichlet)
+        solver = HD.SORSolver(; max_iter = 20_000, tol = 1e-9, boundary = HD.Dirichlet())
+        res = HD.helmholtz_decompose(u, v, grid; solver = solver, boundary_χ = HD.Dirichlet(), boundary_ψ = HD.Dirichlet())
         U = cat(u, v; dims = 3)
         # Essentially all of the field is harmonic.
         @test res.harmonic_fraction > 0.9
@@ -209,7 +209,7 @@ relnorm(x) = sqrt(sum(abs2, x))
 
         # Pure source (flux mode) is likewise harmonic on the annulus.
         us, vs = HD.harmonic_source(grid; q = 1.0)
-        ress = HD.helmholtz_decompose(us, vs, grid; solver = solver, boundary_χ = :dirichlet, boundary_ψ = :dirichlet)
+        ress = HD.helmholtz_decompose(us, vs, grid; solver = solver, boundary_χ = HD.Dirichlet(), boundary_ψ = HD.Dirichlet())
         @test ress.harmonic_fraction > 0.9
 
         # A fully active rectangle is simply-connected.
@@ -229,9 +229,9 @@ relnorm(x) = sqrt(sum(abs2, x))
             U[i, j, 1] = -π * sin(π * (0.05i)) * cos(π * (0.05j))
             U[i, j, 2] = π * cos(π * (0.05i)) * sin(π * (0.05j))
         end
-        solver = HD.SORSolver(; max_iter = 5_000, tol = 1e-8, boundary = :dirichlet)
-        ra = HD.helmholtz_decompose(U, grid; solver = solver, boundary_χ = :dirichlet, boundary_ψ = :dirichlet)
-        rb = HD.helmholtz_decompose(U, grid; backend = HD.SerialBackend(), solver = solver, boundary_χ = :dirichlet, boundary_ψ = :dirichlet)
+        solver = HD.SORSolver(; max_iter = 5_000, tol = 1e-8, boundary = HD.Dirichlet())
+        ra = HD.helmholtz_decompose(U, grid; solver = solver, boundary_χ = HD.Dirichlet(), boundary_ψ = HD.Dirichlet())
+        rb = HD.helmholtz_decompose(U, grid; backend = HD.SerialBackend(), solver = solver, boundary_χ = HD.Dirichlet(), boundary_ψ = HD.Dirichlet())
         @test ra.u_rot == rb.u_rot
     end
 
@@ -247,11 +247,11 @@ relnorm(x) = sqrt(sum(abs2, x))
         lons = collect(range(0, 2π, length = 49)[1:48])   # periodic longitude
         lats = collect(range(-1.3, 1.3, length = 40))
         grid = HD.StructuredGrid(HD.SphericalGeometry(1.0), lons, lats)
-        solver = HD.SORSolver(; max_iter = 30_000, tol = 1e-9, boundary = :dirichlet)
+        solver = HD.SORSolver(; max_iter = 30_000, tol = 1e-9, boundary = HD.Dirichlet())
 
         # Purely rotational Rossby wave → divergent part is small.
         u, v, = HD.rossby_wave(grid; n = 3, m = 2)
-        res = HD.helmholtz_decompose(u, v, grid; solver = solver, boundary_χ = :neumann, boundary_ψ = :dirichlet)
+        res = HD.helmholtz_decompose(u, v, grid; solver = solver, boundary_χ = HD.Neumann(), boundary_ψ = HD.Dirichlet())
         U = cat(u, v; dims = 3)
         @test relnorm(res.u_div) / relnorm(U) < 0.05
         @test maximum(abs.(res.u_rot .+ res.u_div .+ res.u_harm .- U)) < 1e-8
@@ -267,19 +267,19 @@ relnorm(x) = sqrt(sum(abs2, x))
         cclats = collect(range(-1.2, 1.2, length = Nlat))
         ccgrid = HD.StructuredGrid(HD.SphericalGeometry(1.0), cclons, cclats)
         us, vs, = HD.rossby_wave(ccgrid; n = 2, m = 1)
-        # Default :physical returns a HelmholtzResult; :coefficients returns SH coefficients.
+        # Spectral decomposition returns a physical HelmholtzResult. (Accuracy on a true
+        # Clenshaw–Curtis node set is validated separately; here the evenly-spaced grid only
+        # exercises the FSH plumbing, and the SOR path above checks spherical accuracy.)
         sres = HD.helmholtz_decompose_spectral(us, vs, ccgrid; solver = fsh)
         @test sres isa HD.HelmholtzResult
-        cres = HD.helmholtz_decompose_spectral(us, vs, ccgrid; solver = fsh, output = :coefficients)
-        @test cres isa HD.SpectralSphericalResult
-        @test all(isfinite, cres.ψ) && all(isfinite, cres.χ)
+        @test all(isfinite, sres.u_rot)
 
         # NUFSHT returns a physical result on an arbitrary grid.
         nres = HD.helmholtz_decompose_spectral(u, v, grid; solver = nusht)
         @test nres isa HD.HelmholtzResult
 
-        # FSH grid validation rejects a non-CC grid (coefficients path hits the validator).
-        @test_throws ArgumentError HD.helmholtz_decompose_spectral(u, v, grid; solver = fsh, output = :coefficients)
+        # FSH grid validation rejects a non-CC grid.
+        @test_throws ArgumentError HD.helmholtz_decompose_spectral(u, v, grid; solver = fsh)
     end
 
     @testset "Batch decomposition (serial/threaded/distributed)" begin
@@ -294,8 +294,8 @@ relnorm(x) = sqrt(sum(abs2, x))
             U
         end
         fields = [mkfield(s) for s in (1.0, 2.0, 0.5, 1.5)]
-        solver = HD.SORSolver(; max_iter = 3_000, tol = 1e-8, boundary = :dirichlet)
-        kw = (; solver = solver, boundary_χ = :dirichlet, boundary_ψ = :dirichlet)
+        solver = HD.SORSolver(; max_iter = 3_000, tol = 1e-8, boundary = HD.Dirichlet())
+        kw = (; solver = solver, boundary_χ = HD.Dirichlet(), boundary_ψ = HD.Dirichlet())
 
         serial = HD.helmholtz_decompose_batch(grid, fields; kw...)
         @test length(serial) == 4

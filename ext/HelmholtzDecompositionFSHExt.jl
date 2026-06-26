@@ -55,48 +55,17 @@ function HD.solve_poisson!(
     return HD.SolverResult{T}(true, 1, zero(T))
 end
 
+# Solve the potentials with the SHT Poisson solver, then run the standard reconstruction
+# pipeline (FD div/vort → SHT solve → spherical reconstruct) → physical HelmholtzResult.
 function HD._decompose_spectral(
     solver::SphericalSpectralSolver,
     ::HD.SphericalGeometry,
-    U::AbstractArray{T},
-    grid::HD.StructuredGrid{2,<:HD.SphericalGeometry{T}};
-    output::Symbol = :physical,
+    U::AbstractArray,
+    grid::HD.StructuredGrid{2,<:HD.SphericalGeometry};
     kwargs...,
-) where {T}
-    Nlon, Nlat = HD.size_tuple(grid)
-    _validate_fsh_grid(Nlon, Nlat)
-    # Physical output: solve the potentials with the SHT Poisson solver, then run the
-    # standard reconstruction pipeline (FD div/vort → SHT solve → spherical reconstruct).
-    output === :physical && return HD.helmholtz_decompose(U, grid; solver = solver)
-
-    R = grid.geometry.R
-    lmax = Nlat - 1
-
-    # Vorticity & divergence via the package's spherical operators (periodic longitude).
-    div_f = zeros(T, Nlon, Nlat)
-    vort = zeros(T, Nlon, Nlat, 1)
-    HD._compute_div_rot!(div_f, vort, U, grid)
-    ζ = HD._component(vort, 1, Val(2))
-
-    C_vort = Matrix{T}(undef, Nlat, Nlon)
-    C_div = Matrix{T}(undef, Nlat, Nlon)
-    @inbounds for j in 1:Nlat, i in 1:Nlon
-        C_vort[j, i] = ζ[i, j]
-        C_div[j, i] = div_f[i, j]
-    end
-    FSH.sph_transform!(C_vort)
-    FSH.sph_transform!(C_div)
-    for ℓ in 1:lmax
-        eig = -T(ℓ * (ℓ + 1)) / R^2
-        for m in -ℓ:ℓ
-            idx = FSH.sph_mode(ℓ, m)
-            C_vort[idx] /= eig
-            C_div[idx] /= eig
-        end
-    end
-    C_vort[FSH.sph_mode(0, 0)] = zero(T)
-    C_div[FSH.sph_mode(0, 0)] = zero(T)
-    return HD.SpectralSphericalResult(C_vort, C_div, lmax)
+)
+    _validate_fsh_grid(HD.size_tuple(grid)...)
+    return HD.helmholtz_decompose(U, grid; solver = solver)
 end
 
 function __init__()

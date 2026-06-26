@@ -16,6 +16,28 @@ See the README "Solver Extensions" section for setup instructions.
 
 export AbstractPoissonSolver, SORSolver, AutoSolver
 export solve_poisson!, register_spectral_solver!
+export AbstractBoundaryCondition, Dirichlet, Neumann, Periodic
+
+# ---------------------------------------------------------------------------
+# Boundary conditions (dispatchable types, not symbols)
+# ---------------------------------------------------------------------------
+
+"""
+    AbstractBoundaryCondition
+
+Supertype for Poisson boundary conditions. Concrete: [`Dirichlet`](@ref) (zero value),
+[`Neumann`](@ref) (zero normal gradient), [`Periodic`](@ref).
+"""
+abstract type AbstractBoundaryCondition end
+
+"Homogeneous Dirichlet boundary condition (`Φ = 0` on the boundary)."
+struct Dirichlet <: AbstractBoundaryCondition end
+
+"Homogeneous Neumann boundary condition (`∂Φ/∂n = 0` on the boundary)."
+struct Neumann <: AbstractBoundaryCondition end
+
+"Periodic boundary condition (the implicit assumption of the FFT/SHT spectral solvers)."
+struct Periodic <: AbstractBoundaryCondition end
 
 # ---------------------------------------------------------------------------
 # Abstract interface
@@ -135,7 +157,7 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    SORSolver(; max_iter=10_000, tol=1e-6, ω=1.85, boundary=:neumann)
+    SORSolver(; max_iter=10_000, tol=1e-6, ω=1.85, boundary=Neumann())
 
 Red-Black Successive Over-Relaxation solver for the Poisson equation `∇²Φ = RHS`.
 Dimension-generic for Cartesian grids; `N == 2` for spherical grids. Works on any masked
@@ -146,16 +168,16 @@ the spectral extensions for large grids.
 - `max_iter::Int` — maximum sweeps (default `10_000`).
 - `tol::Float64` — tolerance on the max absolute update (default `1e-6`).
 - `ω::Float64` — relaxation factor, `1 < ω < 2` (default `1.85`).
-- `boundary::Symbol` — `:neumann` (zero normal gradient) or `:dirichlet` (zero value).
+- `boundary::AbstractBoundaryCondition` — [`Neumann`](@ref) or [`Dirichlet`](@ref).
 """
-struct SORSolver <: AbstractPoissonSolver
+struct SORSolver{BC<:AbstractBoundaryCondition} <: AbstractPoissonSolver
     max_iter::Int
     tol::Float64
     ω::Float64
-    boundary::Symbol
+    boundary::BC
 end
 
-SORSolver(; max_iter::Int = 10_000, tol::Float64 = 1e-6, ω::Float64 = 1.85, boundary::Symbol = :neumann) =
+SORSolver(; max_iter::Int = 10_000, tol::Float64 = 1e-6, ω::Float64 = 1.85, boundary::AbstractBoundaryCondition = Neumann()) =
     SORSolver(max_iter, tol, ω, boundary)
 
 @inline _effective_boundary(solver::SORSolver, boundary) = boundary === nothing ? solver.boundary : boundary
@@ -172,7 +194,7 @@ function solve_poisson!(
     RHS::AbstractArray{T,N},
     grid::StructuredGrid{N,<:CartesianGeometry{N,T}},
     solver::SORSolver;
-    boundary::Union{Nothing,Symbol} = nothing,
+    boundary::Union{Nothing,AbstractBoundaryCondition} = nothing,
     kwargs...,
 ) where {T<:AbstractFloat,N}
     spacing = grid.geometry.spacing
@@ -181,7 +203,7 @@ function solve_poisson!(
     ω = T(solver.ω)
     tol = T(solver.tol)
     bc = _effective_boundary(solver, boundary)
-    dirichlet = bc === :dirichlet
+    dirichlet = bc isa Dirichlet
 
     fill!(Φ, zero(T))
     final_iter = 0
@@ -230,7 +252,7 @@ function solve_poisson!(
     RHS::AbstractMatrix{T},
     grid::StructuredGrid{2,<:SphericalGeometry{T}},
     solver::SORSolver;
-    boundary::Union{Nothing,Symbol} = nothing,
+    boundary::Union{Nothing,AbstractBoundaryCondition} = nothing,
     pole_tol::Real = sqrt(eps(T)),
     kwargs...,
 ) where {T<:AbstractFloat}
@@ -244,7 +266,7 @@ function solve_poisson!(
     ω = T(solver.ω)
     tol = T(solver.tol)
     bc = _effective_boundary(solver, boundary)
-    dirichlet = bc === :dirichlet
+    dirichlet = bc isa Dirichlet
     periodic_lon = _is_periodic_longitude(lon, dλ)
 
     fill!(Φ, zero(T))

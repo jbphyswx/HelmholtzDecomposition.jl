@@ -6,10 +6,10 @@ unmodified on `CuArray`s, so the GPU path is: forward `rfft` (CUFFT) → project
 → optional inverse `irfft`. This extension wires CUFFT in and resolves an `AutoBackend` to a
 `GPUBackend` for `CuArray` inputs.
 
-`helmholtz_decompose_spectral(U::CuArray, grid; output)` returns the GPU velocity split:
-`:coefficients` (a `SpectralCartesianResult` of `CuArray`s, default) or `:physical`
-(a `(; u_rot, u_div)` NamedTuple of physical `CuArray`s). The full `HelmholtzResult`
-(potentials, harmonic diagnostics over the host grid) remains a CPU construction.
+`helmholtz_decompose_spectral(U::CuArray, grid)` returns the physical GPU velocity split as
+a `(; u_rot, u_div, u_harm)` NamedTuple of `CuArray`s. (The full `HelmholtzResult` with
+potentials and harmonic diagnostics over the host grid remains a CPU construction; raw
+coefficients are available from `helmholtz_project_spectral`.)
 """
 module HelmholtzDecompositionCUDAExt
 
@@ -36,7 +36,6 @@ end
 function HD._spectral_dispatch(
     U::CUDA.CuArray{T},
     grid::HD.StructuredGrid{N,<:HD.CartesianGeometry{N,T}};
-    output::Symbol = :coefficients,
     solver = nothing,
     kwargs...,
 ) where {T,N}
@@ -50,17 +49,17 @@ function HD._spectral_dispatch(
         copyto!(HD._component(velocity_hat, c, Val(N)), rfft(HD._component(U, c, Val(N))))
     end
 
+    # GPU Leray projection (pure broadcast) → inverse transform to the physical split.
     ks = _gpu_wavenumbers(T, dims, spacing)
     proj = HD.helmholtz_project_spectral(velocity_hat, ks)
-    output === :coefficients && return proj
-
     u_rot = similar(U)
     u_div = similar(U)
     for c in 1:N
         copyto!(HD._component(u_rot, c, Val(N)), irfft(HD._component(proj.u_rot, c, Val(N)), dims[1]))
         copyto!(HD._component(u_div, c, Val(N)), irfft(HD._component(proj.u_div, c, Val(N)), dims[1]))
     end
-    return (; u_rot, u_div)
+    u_harm = U .- u_rot .- u_div
+    return (; u_rot, u_div, u_harm)
 end
 
 end # module

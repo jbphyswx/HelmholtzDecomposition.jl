@@ -54,7 +54,6 @@ function HD._decompose_spectral(
     ::HD.CartesianGeometry,
     U::AbstractArray{T,M},
     grid::HD.StructuredGrid{N,<:HD.CartesianGeometry{N,T}};
-    output::Symbol = :physical,
     kwargs...,
 ) where {T,M,N}
     dims = HD.size_tuple(grid)
@@ -71,13 +70,9 @@ function HD._decompose_spectral(
         copyto!(HD._component(velocity_hat, c, Val(N)), ĉ)
     end
 
-    if output === :coefficients
-        return HD.helmholtz_project_spectral(velocity_hat, ks)
-    end
+    # Fully-spectral decomposition (exact derivatives) → physical HelmholtzResult.
     inverse = x -> FFTW.irfft(x, dims[1])
-    result = HD.build_cartesian_result(grid, U, velocity_hat, ks, inverse)
-    output === :both && return (result, HD.helmholtz_project_spectral(velocity_hat, ks))
-    return result
+    return HD.build_cartesian_result(grid, U, velocity_hat, ks, inverse)
 end
 
 function __init__()

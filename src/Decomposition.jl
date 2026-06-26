@@ -135,8 +135,8 @@ arrays for convenience.
 
 # Keyword Arguments
 - `solver::AbstractPoissonSolver = AutoSolver()` — Poisson solver.
-- `boundary_χ::Symbol = :neumann` — boundary condition for the velocity potential `χ`.
-- `boundary_ψ::Symbol = :dirichlet` — boundary condition for the rotation potential.
+- `boundary_χ::AbstractBoundaryCondition = Neumann()` — BC for the velocity potential `χ`.
+- `boundary_ψ::AbstractBoundaryCondition = Dirichlet()` — BC for the rotation potential.
 
 Returns a [`HelmholtzResult`](@ref).
 """
@@ -215,8 +215,8 @@ function helmholtz_decompose!(
     u::AbstractArray,
     grid::StructuredGrid{N,G,T};
     solver::AbstractPoissonSolver = AutoSolver(),
-    boundary_χ::Symbol = :neumann,
-    boundary_ψ::Symbol = :dirichlet,
+    boundary_χ::AbstractBoundaryCondition = Neumann(),
+    boundary_ψ::AbstractBoundaryCondition = Dirichlet(),
 ) where {N,T<:AbstractFloat,G<:AbstractGeometry{T}}
     size(u) == (size_tuple(grid)..., N) ||
         throw(DimensionMismatch("velocity array size $(size(u)) does not match (dims..., N) = $((size_tuple(grid)..., N))"))
@@ -232,7 +232,7 @@ function helmholtz_decompose!(
     # 2. Divergence balancing — only for the homogeneous Neumann χ problem, where the
     #    Fredholm solvability condition ∫δ dV = 0 must hold (subtracting a nonzero mean
     #    under an inhomogeneous BC would corrupt the field).
-    if boundary_χ === :neumann
+    if boundary_χ isa Neumann
         _subtract_weighted_mean!(div_f, grid)
     end
 
