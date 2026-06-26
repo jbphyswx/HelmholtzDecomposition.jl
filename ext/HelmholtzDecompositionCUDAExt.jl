@@ -33,11 +33,11 @@ function _gpu_wavenumbers(::Type{T}, dims::NTuple{N,Int}, spacing::NTuple{N,T}) 
     end
 end
 
-function HD._decompose_spectral(
-    ::HD.CartesianGeometry,
+function HD._spectral_dispatch(
     U::CUDA.CuArray{T},
     grid::HD.StructuredGrid{N,<:HD.CartesianGeometry{N,T}};
     output::Symbol = :coefficients,
+    solver = nothing,
     kwargs...,
 ) where {T,N}
     dims = HD.size_tuple(grid)

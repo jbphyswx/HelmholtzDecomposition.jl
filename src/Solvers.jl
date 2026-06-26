@@ -86,14 +86,24 @@ Pick a concrete solver. Spectral solvers are selected only when the domain is fu
 active (`all(mask)`), because they assume periodic/whole-domain boundary conditions and
 cannot honor a mask. With a mask present, fall back to SOR.
 """
+# A spherical grid is Clenshaw–Curtis-compatible (usable by FastSphericalHarmonics) when
+# `Nlon == 2·Nlat − 1`.
+_is_cc_grid(grid::StructuredGrid{2,<:SphericalGeometry}) = (size_tuple(grid)[1] == 2 * size_tuple(grid)[2] - 1)
+_is_cc_grid(::StructuredGrid) = false
+
 function _resolve_auto_solver(grid::StructuredGrid{N,G}) where {N,G<:AbstractGeometry}
     if all(grid.mask)
         if G <: SphericalGeometry
-            for key in (:spherical_irregular, :spherical_regular)
+            # Prefer the regular SHT (FSH) on a Clenshaw–Curtis grid; else the non-uniform
+            # transform (NUFSHT), which handles arbitrary grids.
+            keys = _is_cc_grid(grid) ? (:spherical_regular, :spherical_irregular) :
+                   (:spherical_irregular, :spherical_regular)
+            for key in keys
                 haskey(_SPECTRAL_SOLVERS, key) && return _SPECTRAL_SOLVERS[key]()
             end
         elseif G <: CartesianGeometry
-            for key in (:cartesian_irregular, :cartesian_regular)
+            # Structured Cartesian grids are uniform → prefer the regular FFT.
+            for key in (:cartesian_regular, :cartesian_irregular)
                 haskey(_SPECTRAL_SOLVERS, key) && return _SPECTRAL_SOLVERS[key]()
             end
         end

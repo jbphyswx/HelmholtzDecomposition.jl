@@ -50,6 +50,7 @@ function HD.solve_poisson!(
 end
 
 function HD._decompose_spectral(
+    ::CartesianSpectralSolver,
     ::HD.CartesianGeometry,
     U::AbstractArray{T,M},
     grid::HD.StructuredGrid{N,<:HD.CartesianGeometry{N,T}};

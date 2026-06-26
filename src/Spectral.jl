@@ -216,18 +216,41 @@ appropriate extension to be loaded (`using FFTW`, `using FastSphericalHarmonics`
 `:coefficients` (the spectral result type), or `:both`.
 """
 function helmholtz_decompose_spectral(u::AbstractArray, grid::AbstractGrid; kwargs...)
-    return _decompose_spectral(grid.geometry, u, grid; kwargs...)
+    return _spectral_dispatch(u, grid; kwargs...)
 end
 
 function helmholtz_decompose_spectral(u::AbstractArray{<:Any,N}, v::AbstractArray{<:Any,N}, grid::AbstractGrid; kwargs...) where {N}
-    return _decompose_spectral(grid.geometry, _stack_components(grid, u, v), grid; kwargs...)
+    return _spectral_dispatch(_stack_components(grid, u, v), grid; kwargs...)
 end
 
 function helmholtz_decompose_spectral(u::AbstractArray{<:Any,N}, v::AbstractArray{<:Any,N}, w::AbstractArray{<:Any,N}, grid::AbstractGrid; kwargs...) where {N}
-    return _decompose_spectral(grid.geometry, _stack_components(grid, u, v, w), grid; kwargs...)
+    return _spectral_dispatch(_stack_components(grid, u, v, w), grid; kwargs...)
 end
 
-# Hook implemented by geometry/solver extensions.
+"""
+    _spectral_dispatch(u, grid; solver=AutoSolver(), kwargs...)
+
+Resolve a spectral solver (extensions register them; `AutoSolver` picks the best available)
+and dispatch to the extension's `_decompose_spectral(solver, geometry, u, grid; …)`.
+Dispatching on the solver *type* lets several spectral backends (FFTW + FINUFFT, FSH +
+NUFSHT) coexist for the same geometry without method clashes. The CUDA extension overrides
+this for `CuArray` inputs to take the CUFFT path directly.
+"""
+function _spectral_dispatch(u::AbstractArray, grid::AbstractGrid; solver::AbstractPoissonSolver = AutoSolver(), kwargs...)
+    s = _resolve_spectral_solver(grid, solver)
+    return _decompose_spectral(s, grid.geometry, u, grid; kwargs...)
+end
+
+function _resolve_spectral_solver(grid::StructuredGrid, solver::AbstractPoissonSolver)
+    solver isa AutoSolver || return solver
+    s = _resolve_auto_solver(grid)
+    s isa SORSolver && throw(ArgumentError(
+        "helmholtz_decompose_spectral requires a spectral extension for this geometry " *
+        "(`using FFTW`/`FINUFFT` for Cartesian, `FastSphericalHarmonics`/`NUFSHT` for spherical)."))
+    return s
+end
+
+# Hook implemented by spectral extensions: dispatch on the solver type.
 function _decompose_spectral end
 
 """

@@ -71,12 +71,13 @@ function HD.solve_poisson!(
 end
 
 function HD._decompose_spectral(
+    solver::CartesianNUFFTSolver,
     ::HD.CartesianGeometry,
     U::AbstractArray{T},
     grid::HD.StructuredGrid{2,<:HD.CartesianGeometry{2,T}};
-    Nk_x::Int = HD.size_tuple(grid)[1],
-    Nk_y::Int = HD.size_tuple(grid)[2],
-    tol::Real = 1e-8,
+    Nk_x::Int = solver.Nk_x,
+    Nk_y::Int = solver.Nk_y,
+    tol::Real = solver.tol,
     kwargs...,
 ) where {T}
     Nx, Ny = HD.size_tuple(grid)

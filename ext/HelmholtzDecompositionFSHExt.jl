@@ -56,6 +56,7 @@ function HD.solve_poisson!(
 end
 
 function HD._decompose_spectral(
+    ::SphericalSpectralSolver,
     ::HD.SphericalGeometry,
     U::AbstractArray{T},
     grid::HD.StructuredGrid{2,<:HD.SphericalGeometry{T}};

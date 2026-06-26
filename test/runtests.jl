@@ -7,6 +7,8 @@ using LinearAlgebra: LinearAlgebra
 using FFTW: FFTW
 using OhMyThreads: OhMyThreads
 using Distributed: Distributed
+using FastSphericalHarmonics: FastSphericalHarmonics
+using NUFSHT: NUFSHT
 
 # Component-last helpers for tests.
 comp(A, c) = selectdim(A, ndims(A), c)
@@ -239,6 +241,40 @@ relnorm(x) = sqrt(sum(abs2, x))
         grid = HD.StructuredGrid(HD.CartesianGeometry(0.1, 0.1),
             collect(0.0:0.1:1.5), collect(0.0:0.1:1.5); mask = mask)
         @test HD._resolve_auto_solver(grid) isa HD.SORSolver
+    end
+
+    @testset "Spherical decomposition" begin
+        lons = collect(range(0, 2π, length = 49)[1:48])   # periodic longitude
+        lats = collect(range(-1.3, 1.3, length = 40))
+        grid = HD.StructuredGrid(HD.SphericalGeometry(1.0), lons, lats)
+        solver = HD.SORSolver(; max_iter = 30_000, tol = 1e-9, boundary = :dirichlet)
+
+        # Purely rotational Rossby wave → divergent part is small.
+        u, v, = HD.rossby_wave(grid; n = 3, m = 2)
+        res = HD.helmholtz_decompose(u, v, grid; solver = solver, boundary_χ = :neumann, boundary_ψ = :dirichlet)
+        U = cat(u, v; dims = 3)
+        @test relnorm(res.u_div) / relnorm(U) < 0.05
+        @test maximum(abs.(res.u_rot .+ res.u_div .+ res.u_harm .- U)) < 1e-8
+        @test size(HD.streamfunction(res)) == (48, 40)
+
+        # Select the spectral backends explicitly (both FSH + NUFSHT are loaded).
+        fsh = HD._SPECTRAL_SOLVERS[:spherical_regular]()
+        nusht = HD._SPECTRAL_SOLVERS[:spherical_irregular]()
+
+        # FSH spectral path (Clenshaw–Curtis grid Nlon = 2·Nlat − 1) returns SH coefficients.
+        Nlat = 24; Nlon = 2 * Nlat - 1
+        cclons = collect(range(0, 2π, length = Nlon + 1)[1:Nlon])
+        cclats = collect(range(-1.2, 1.2, length = Nlat))
+        ccgrid = HD.StructuredGrid(HD.SphericalGeometry(1.0), cclons, cclats)
+        us, vs, = HD.rossby_wave(ccgrid; n = 2, m = 1)
+        sres = HD.helmholtz_decompose_spectral(us, vs, ccgrid; solver = fsh)
+        @test sres isa HD.SpectralSphericalResult
+        @test all(isfinite, sres.ψ) && all(isfinite, sres.χ)
+
+        # FSH grid validation rejects a non-CC grid; NUFSHT handles arbitrary grids.
+        @test_throws ArgumentError HD.helmholtz_decompose_spectral(u, v, grid; solver = fsh)
+        nres = HD.helmholtz_decompose_spectral(u, v, grid; solver = nusht)
+        @test nres isa HD.SpectralSphericalResult
     end
 
     @testset "Batch decomposition (serial/threaded/distributed)" begin

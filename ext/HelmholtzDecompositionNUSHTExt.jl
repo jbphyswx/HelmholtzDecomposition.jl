@@ -81,11 +81,12 @@ function HD.solve_poisson!(
 end
 
 function HD._decompose_spectral(
+    solver::SphericalNUSHTSolver,
     ::HD.SphericalGeometry,
     U::AbstractArray{T},
     grid::HD.StructuredGrid{2,<:HD.SphericalGeometry{T}};
-    lmax::Int = 128,
-    tol::Real = 1e-8,
+    lmax::Int = solver.lmax,
+    tol::Real = solver.tol,
     kwargs...,
 ) where {T}
     Nlon, Nlat = HD.size_tuple(grid)
