@@ -50,6 +50,20 @@ part vanishes.
 
 ![3-D Decomposition](docs/assets/three_dimensional_decomposition.png)
 
+### 3-D mixed field (`z` mid-slice)
+
+A 3-D field with **both** components (solenoidal ABC + a gradient): the decomposition
+splits `uₓ` into a nonzero rotational and a nonzero divergent part.
+
+![3-D Mixed Decomposition](docs/assets/three_dimensional_mixed_decomposition.png)
+
+### Spherical mixed flow (Kelvin–Ekman, NUFSHT)
+
+Decomposition on a longitude–latitude grid via the non-uniform spherical-harmonic
+transform: a rotational core plus a smaller divergent (Ekman-like) part.
+
+![Spherical Decomposition](docs/assets/spherical_decomposition.png)
+
 ## Solver Extensions ⚠️
 
 The base package includes only an iterative SOR solver (Red-Black Successive Over-Relaxation). While correct, it is **orders of magnitude slower** than spectral solvers for large grids.

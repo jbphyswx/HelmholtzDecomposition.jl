@@ -22,6 +22,14 @@
 
 ![3-D Decomposition](../assets/three_dimensional_decomposition.png)
 
+### 3-D mixed field — `z` mid-slice
+
+![3-D Mixed Decomposition](../assets/three_dimensional_mixed_decomposition.png)
+
+### Spherical mixed flow (Kelvin–Ekman, NUFSHT)
+
+![Spherical Decomposition](../assets/spherical_decomposition.png)
+
 Velocity-like result fields use a component-last layout `(dims..., N)`; index the last
 axis (or use `cat(u, v; dims=3)` to build inputs). Runnable scripts live in `examples/`.
 
