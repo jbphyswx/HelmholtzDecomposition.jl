@@ -9,7 +9,7 @@ the spherical metric, periodic longitude, and pole guarding.
 Spectral solvers (FFTW, FINUFFT, FastSphericalHarmonics, NUFSHT) are provided via package
 extensions and are **strongly recommended** for performance. They assume *periodic* (whole
 torus / whole sphere) boundary conditions and an unmasked domain; `AutoSolver` therefore
-falls back to SOR whenever a land mask is present.
+falls back to SOR whenever a mask is present.
 
 See the README "Solver Extensions" section for setup instructions.
 """
@@ -59,7 +59,7 @@ end
     AutoSolver()
 
 Sentinel for automatic solver selection. `solve_poisson!` chooses the best available
-solver based on grid geometry, the presence of a land mask, and which extension packages
+solver based on grid geometry, the presence of a mask, and which extension packages
 are loaded. Falls back to `SORSolver()` when no spectral extension applies (or a mask is
 present), emitting a `@debug` recommendation.
 """
@@ -84,7 +84,7 @@ end
 
 Pick a concrete solver. Spectral solvers are selected only when the domain is fully
 active (`all(mask)`), because they assume periodic/whole-domain boundary conditions and
-cannot honor a land mask. With a mask present, fall back to SOR.
+cannot honor a mask. With a mask present, fall back to SOR.
 """
 function _resolve_auto_solver(grid::StructuredGrid{N,G}) where {N,G<:AbstractGeometry}
     if all(grid.mask)
@@ -100,7 +100,7 @@ function _resolve_auto_solver(grid::StructuredGrid{N,G}) where {N,G<:AbstractGeo
     end
 
     if !all(grid.mask)
-        @debug "Land mask present — using SORSolver (spectral solvers assume an unmasked, periodic domain)."
+        @debug "Mask present — using SORSolver (spectral solvers assume an unmasked, periodic domain)."
     else
         @debug """No spectral solver extension loaded — falling back to SORSolver which may be \
         orders of magnitude slower. Load a spectral extension for your geometry: \
@@ -155,7 +155,7 @@ SORSolver(; max_iter::Int = 10_000, tol::Float64 = 1e-6, ω::Float64 = 1.85, bou
 """
     solve_poisson!(Φ, RHS, grid::StructuredGrid{N,<:CartesianGeometry}, solver::SORSolver; boundary=nothing)
 
-Solve `∇²Φ = RHS` on the wet cells of an `N`-dimensional Cartesian grid via Red-Black SOR.
+Solve `∇²Φ = RHS` on the active cells of an `N`-dimensional Cartesian grid via Red-Black SOR.
 """
 function solve_poisson!(
     Φ::AbstractArray{T,N},
@@ -187,8 +187,8 @@ function solve_poisson!(
                 acc = zero(T)
                 for d in 1:N
                     e = _unit(Val(N), d)
-                    Jp = _wet_neighbor(grid, I, e, +1)
-                    Jm = _wet_neighbor(grid, I, e, -1)
+                    Jp = _active_neighbor(grid, I, e, +1)
+                    Jm = _active_neighbor(grid, I, e, -1)
                     Φp = Jp == I ? (dirichlet ? zero(T) : Φ[I]) : Φ[Jp]
                     Φm = Jm == I ? (dirichlet ? zero(T) : Φ[I]) : Φ[Jm]
                     acc += inv_h2[d] * (Φp + Φm)
@@ -251,11 +251,11 @@ function solve_poisson!(
                 sinφ = sin(lat[j])
                 for i in 1:Nlon
                     ((i + j) % 2) == color || continue
-                    iswet(grid, i, j) || continue
+                    isactive(grid, i, j) || continue
 
                     ip, im = _lon_neighbors(i, Nlon, grid, j, periodic_lon)
-                    jp = j < Nlat && iswet(grid, i, j + 1) ? j + 1 : j
-                    jm = j > 1 && iswet(grid, i, j - 1) ? j - 1 : j
+                    jp = j < Nlat && isactive(grid, i, j + 1) ? j + 1 : j
+                    jm = j > 1 && isactive(grid, i, j - 1) ? j - 1 : j
 
                     Φ_ip = ip == i && !periodic_lon ? (dirichlet ? zero(T) : Φ[i, j]) : Φ[ip, j]
                     Φ_im = im == i && !periodic_lon ? (dirichlet ? zero(T) : Φ[i, j]) : Φ[im, j]
@@ -290,12 +290,12 @@ end
     if periodic
         ip = i == Nlon ? 1 : i + 1
         im = i == 1 ? Nlon : i - 1
-        ip = iswet(grid, ip, j) ? ip : i
-        im = iswet(grid, im, j) ? im : i
+        ip = isactive(grid, ip, j) ? ip : i
+        im = isactive(grid, im, j) ? im : i
         return ip, im
     else
-        ip = i < Nlon && iswet(grid, i + 1, j) ? i + 1 : i
-        im = i > 1 && iswet(grid, i - 1, j) ? i - 1 : i
+        ip = i < Nlon && isactive(grid, i + 1, j) ? i + 1 : i
+        im = i > 1 && isactive(grid, i - 1, j) ? i - 1 : i
         return ip, im
     end
 end

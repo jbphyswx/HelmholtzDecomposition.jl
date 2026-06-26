@@ -53,8 +53,8 @@ relnorm(x) = sqrt(sum(abs2, x))
             mask = trues(10, 10); mask[1, 1] = false
             grid = HD.StructuredGrid(HD.CartesianGeometry(100.0, 100.0),
                 collect(0.0:100.0:900.0), collect(0.0:100.0:900.0); mask = mask)
-            @test !HD.iswet(grid, 1, 1)
-            @test HD.iswet(grid, 2, 2)
+            @test !HD.isactive(grid, 1, 1)
+            @test HD.isactive(grid, 2, 2)
         end
         @testset "spherical areas vary with latitude" begin
             grid = HD.StructuredGrid(HD.SphericalGeometry(),
@@ -187,7 +187,7 @@ relnorm(x) = sqrt(sum(abs2, x))
         base = HD.StructuredGrid(HD.CartesianGeometry(h, h), xs, ys)
         mask = HD.disk_mask(base; center = (0.0, 0.0), radius = 0.3)
         grid = HD.StructuredGrid(HD.CartesianGeometry(h, h), xs, ys; mask = mask)
-        @test HD.count_islands(grid) == 1
+        @test HD.count_holes(grid) == 1
         @test HD.betti1_estimate(grid) == 1
 
         # Pure circulation about the hole: harmonic (div-free AND curl-free in the annulus).
@@ -199,17 +199,36 @@ relnorm(x) = sqrt(sum(abs2, x))
         @test res.harmonic_fraction > 0.9
         @test relnorm(res.u_rot) / relnorm(U) < 0.1
         @test relnorm(res.u_div) / relnorm(U) < 0.1
-        # Exact reconstruction by construction, on wet cells (the hole is masked out).
-        wet = repeat(mask, 1, 1, 2)
-        @test maximum(abs.((res.u_rot .+ res.u_div .+ res.u_harm .- U)[wet])) < 1e-8
+        # Exact reconstruction by construction, on active cells (the hole is masked out).
+        active = repeat(mask, 1, 1, 2)
+        @test maximum(abs.((res.u_rot .+ res.u_div .+ res.u_harm .- U)[active])) < 1e-8
 
         # Pure source (flux mode) is likewise harmonic on the annulus.
         us, vs = HD.harmonic_source(grid; q = 1.0)
         ress = HD.helmholtz_decompose(us, vs, grid; solver = solver, boundary_χ = :dirichlet, boundary_ψ = :dirichlet)
         @test ress.harmonic_fraction > 0.9
 
-        # A fully wet rectangle is simply-connected.
-        @test HD.count_islands(base) == 0
+        # A fully active rectangle is simply-connected.
+        @test HD.count_holes(base) == 0
+    end
+
+    @testset "Execution backends" begin
+        @test HD.local_backend(HD.MPIBackend(HD.SerialBackend())) isa HD.SerialBackend
+        @test HD.is_distributed(HD.MPIBackend())
+        @test !HD.is_distributed(HD.SerialBackend())
+        @test HD.local_backend(HD.GPUBackend(:dummy)) isa HD.GPUBackend
+        # backend= kwarg routes; SerialBackend reproduces the default result.
+        grid = HD.StructuredGrid(HD.CartesianGeometry(0.05, 0.05),
+            collect(range(0.05, 0.95, length = 19)), collect(range(0.05, 0.95, length = 19)))
+        U = zeros(19, 19, 2)
+        for j in 1:19, i in 1:19
+            U[i, j, 1] = -π * sin(π * (0.05i)) * cos(π * (0.05j))
+            U[i, j, 2] = π * cos(π * (0.05i)) * sin(π * (0.05j))
+        end
+        solver = HD.SORSolver(; max_iter = 5_000, tol = 1e-8, boundary = :dirichlet)
+        ra = HD.helmholtz_decompose(U, grid; solver = solver, boundary_χ = :dirichlet, boundary_ψ = :dirichlet)
+        rb = HD.helmholtz_decompose(U, grid; backend = HD.SerialBackend(), solver = solver, boundary_χ = :dirichlet, boundary_ψ = :dirichlet)
+        @test ra.u_rot == rb.u_rot
     end
 
     @testset "AutoSolver is mask-aware" begin

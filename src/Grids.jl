@@ -9,7 +9,7 @@ dependencies on other packages beyond `StaticArrays`.
 using StaticArrays: StaticArrays, SVector
 
 export AbstractGrid, StructuredGrid
-export coords, area, cellmeasure, iswet, grid_geometry, size_tuple
+export coords, area, cellmeasure, isactive, grid_geometry, size_tuple
 
 """
     AbstractGrid{G<:AbstractGeometry, T<:AbstractFloat}
@@ -35,7 +35,7 @@ Cartesian, or regular longitude–latitude when `N == 2`).
 - `coords_axes::C` — `NTuple{N}` of 1-D coordinate vectors, one per axis. For spherical
   grids these are `(lon, lat)`.
 - `cell_measures::A` — `N`-dimensional array of per-cell measures (area in 2D, volume in 3D).
-- `mask::B` — `N`-dimensional boolean active mask (`true` = wet/active, `false` = land/inactive).
+- `mask::B` — `N`-dimensional boolean active mask (`true` = active, `false` = inactive).
 """
 struct StructuredGrid{
     N,
@@ -74,11 +74,11 @@ The `N`-dimensional cell measure (area/volume) at index `I`.
 @inline area(grid::StructuredGrid{N}, I::Vararg{Integer,N}) where {N} = cellmeasure(grid, I...)
 
 """
-    iswet(grid, I...) -> Bool
+    isactive(grid, I...) -> Bool
 
 Whether the cell at index `I` is active (`true`) or masked out (`false`).
 """
-@inline iswet(grid::StructuredGrid{N}, I::Vararg{Integer,N}) where {N} = grid.mask[I...]
+@inline isactive(grid::StructuredGrid{N}, I::Vararg{Integer,N}) where {N} = grid.mask[I...]
 
 # Convenience accessors for the 2-D spherical/longitude–latitude case.
 @inline _axis(grid::StructuredGrid, d::Integer) = grid.coords_axes[d]
@@ -91,7 +91,7 @@ Whether the cell at index `I` is active (`true`) or masked out (`false`).
     StructuredGrid(geometry, axes...; mask=trues(map(length, axes)))
 
 Construct a `StructuredGrid` from per-axis coordinate vectors, computing cell measures
-from the geometry. Pass `mask` to mark land/inactive cells.
+from the geometry. Pass `mask` to mark inactive cells.
 
 For `SphericalGeometry`, supply exactly two axes `(lon, lat)`; cell areas vary with
 latitude as `R²·cos(lat)·dλ·dφ`. For `CartesianGeometry{N}`, supply `N` axes; cell

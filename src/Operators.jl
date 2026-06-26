@@ -57,12 +57,12 @@ Unit offset along axis `d`.
 @inline _unit(::Val{N}, d::Integer) where {N} = CartesianIndex(ntuple(i -> i == d ? 1 : 0, Val(N)))
 
 """
-    _wet_neighbor(grid, I, e, dir) -> CartesianIndex
+    _active_neighbor(grid, I, e, dir) -> CartesianIndex
 
 Neighbor of `I` offset by `dir * e`, clamped back to `I` when out of bounds or masked
-out (one-sided/no-flux behavior at boundaries and land).
+out (one-sided/no-flux behavior at boundaries and masked cells).
 """
-@inline function _wet_neighbor(grid, I::CartesianIndex{N}, e::CartesianIndex{N}, dir::Integer) where {N}
+@inline function _active_neighbor(grid, I::CartesianIndex{N}, e::CartesianIndex{N}, dir::Integer) where {N}
     J = I + dir * e
     return (checkbounds(Bool, grid.mask, J) && @inbounds grid.mask[J]) ? J : I
 end
@@ -71,13 +71,13 @@ end
     _deriv(field, grid, I, d, spacing_d) -> T
 
 Masked centered finite difference `∂field/∂x_d` at index `I` on a Cartesian grid.
-Falls back to a one-sided difference at boundaries/land and returns zero when no
+Falls back to a one-sided difference at boundaries/masked cells and returns zero when no
 valid stencil exists.
 """
 @inline function _deriv(field, grid, I::CartesianIndex{N}, d::Integer, spacing_d::T) where {N,T}
     e = _unit(Val(N), d)
-    Ip = _wet_neighbor(grid, I, e, +1)
-    Im = _wet_neighbor(grid, I, e, -1)
+    Ip = _active_neighbor(grid, I, e, +1)
+    Im = _active_neighbor(grid, I, e, -1)
     step = (Ip[d] - Im[d]) * spacing_d
     step == 0 && return zero(T)
     return (field[Ip] - field[Im]) / step

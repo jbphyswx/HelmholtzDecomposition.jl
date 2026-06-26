@@ -140,9 +140,28 @@ arrays for convenience.
 
 Returns a [`HelmholtzResult`](@ref).
 """
-function helmholtz_decompose(u::AbstractArray, grid::StructuredGrid; kwargs...)
-    result = HelmholtzResult(grid)
-    return helmholtz_decompose!(result, u, grid; kwargs...)
+function helmholtz_decompose(u::AbstractArray, grid::StructuredGrid; backend::AbstractExecutionBackend = AutoBackend(), kwargs...)
+    return _decompose_backend(_resolve_backend(backend, u), u, grid; kwargs...)
+end
+
+"""
+    _resolve_backend(backend, u) -> AbstractExecutionBackend
+
+Resolve an `AutoBackend` to a concrete execution backend from the array type. The default
+is `SerialBackend`; the CUDA extension specializes this on GPU array types.
+"""
+_resolve_backend(b::AbstractExecutionBackend, ::AbstractArray) = b
+_resolve_backend(::AutoBackend, ::AbstractArray) = SerialBackend()
+
+"""
+    _decompose_backend(backend, u, grid; kwargs...) -> HelmholtzResult
+
+Execution-backend dispatch. The default (serial / threaded / GPU — where the arrays
+themselves carry the compute) runs the in-place core; the MPI/Distributed extensions
+specialize this to partition the domain, decompose locally, and gather.
+"""
+function _decompose_backend(::AbstractExecutionBackend, u::AbstractArray, grid::StructuredGrid; kwargs...)
+    return helmholtz_decompose!(HelmholtzResult(grid), u, grid; kwargs...)
 end
 
 function helmholtz_decompose(u::AbstractArray{<:Any,N}, v::AbstractArray{<:Any,N}, grid::StructuredGrid{N}; kwargs...) where {N}
@@ -252,10 +271,10 @@ function _compute_div_rot!(div_f, vort, u, grid::StructuredGrid{2,<:SphericalGeo
         cosφ = cos(lat[j])
         abs(cosφ) < sqrt(eps(T)) && continue
         for i in 1:Nlon
-            iswet(grid, i, j) || continue
+            isactive(grid, i, j) || continue
             ip, im = _lon_neighbors(i, Nlon, grid, j, periodic)
-            jp = j < Nlat && iswet(grid, i, j + 1) ? j + 1 : j
-            jm = j > 1 && iswet(grid, i, j - 1) ? j - 1 : j
+            jp = j < Nlat && isactive(grid, i, j + 1) ? j + 1 : j
+            jm = j > 1 && isactive(grid, i, j - 1) ? j - 1 : j
 
             h_λ = _lon_step(i, ip, im, Nlon, dλ, periodic)
             h_φ = (jp - jm) * dφ
@@ -292,10 +311,10 @@ function _reconstruct!(u_div, u_rot, χ, Rpot, grid::StructuredGrid{2,<:Spherica
         cosφ = cos(lat[j])
         abs(cosφ) < sqrt(eps(T)) && continue
         for i in 1:Nlon
-            iswet(grid, i, j) || continue
+            isactive(grid, i, j) || continue
             ip, im = _lon_neighbors(i, Nlon, grid, j, periodic)
-            jp = j < Nlat && iswet(grid, i, j + 1) ? j + 1 : j
-            jm = j > 1 && iswet(grid, i, j - 1) ? j - 1 : j
+            jp = j < Nlat && isactive(grid, i, j + 1) ? j + 1 : j
+            jm = j > 1 && isactive(grid, i, j - 1) ? j - 1 : j
             h_λ = _lon_step(i, ip, im, Nlon, dλ, periodic)
             h_φ = (jp - jm) * dφ
 
@@ -349,7 +368,7 @@ end
     _velocity_norm(U, grid) -> T
 
 Measure-weighted L² norm `sqrt(∫ |U|² dV)` of a component-last velocity array over the
-wet cells of `grid`.
+active cells of `grid`.
 """
 function _velocity_norm(U, grid::StructuredGrid{N}) where {N}
     T = real(eltype(U))

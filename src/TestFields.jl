@@ -228,8 +228,8 @@ end
 """
     disk_mask(grid; center=domain center, radius) -> Array{Bool}
 
-Boolean active mask (`true` = wet) for a 2-D Cartesian grid with a circular disk of the
-given `radius` masked out (set to land), producing an annulus / domain-with-island. Useful
+Boolean active mask (`true` = active) for a 2-D Cartesian grid with a circular disk of the
+given `radius` masked out (marked inactive), producing an annulus / domain-with-hole. Useful
 for constructing multiply-connected domains that carry a nonzero harmonic component.
 """
 function disk_mask(
