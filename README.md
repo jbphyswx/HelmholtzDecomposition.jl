@@ -36,6 +36,20 @@ Then for coarse-graining: filter ψ̄, χ̄ as scalars → reconstruct velocity 
 
 ![Point Source Decomposition](docs/assets/point_source_decomposition.png)
 
+### Harmonic circulation on an annulus (multiply-connected domain, issue #1)
+
+A pure circulation around a masked hole is **harmonic** — `u_rot ≈ 0`, `u_div ≈ 0`, and the
+whole field lands in `u_harm` (`harmonic_fraction ≈ 1`, `count_holes = 1`).
+
+![Harmonic Annulus Decomposition](docs/assets/harmonic_annulus_decomposition.png)
+
+### 3-D ABC (Beltrami) flow (`z` mid-slice)
+
+A fully solenoidal 3-D field: the rotational part recovers the original and the divergent
+part vanishes.
+
+![3-D Decomposition](docs/assets/three_dimensional_decomposition.png)
+
 ## Solver Extensions ⚠️
 
 The base package includes only an iterative SOR solver (Red-Black Successive Over-Relaxation). While correct, it is **orders of magnitude slower** than spectral solvers for large grids.

@@ -14,6 +14,14 @@
 
 ![Point Source Decomposition](../assets/point_source_decomposition.png)
 
+### Harmonic circulation on an annulus (multiply-connected)
+
+![Harmonic Annulus Decomposition](../assets/harmonic_annulus_decomposition.png)
+
+### 3-D ABC (Beltrami) flow — `z` mid-slice
+
+![3-D Decomposition](../assets/three_dimensional_decomposition.png)
+
 Velocity-like result fields use a component-last layout `(dims..., N)`; index the last
 axis (or use `cat(u, v; dims=3)` to build inputs). Runnable scripts live in `examples/`.
 
