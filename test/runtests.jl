@@ -282,6 +282,35 @@ relnorm(x) = sqrt(sum(abs2, x))
         @test_throws ArgumentError HD.helmholtz_decompose_spectral(u, v, grid; solver = fsh)
     end
 
+    @testset "Scattered Cartesian (FINUFFT, accurate inverse)" begin
+        Random.seed!(7)
+        L = 2π
+        M = 1500
+        X = L .* rand(M, 2)
+        pts = HD.ScatteredPoints(HD.CartesianGeometry(1.0, 1.0), X; box = (L, L))
+        @test HD.npoints(pts) == M
+        solver = HD._SPECTRAL_SOLVERS[:cartesian_irregular](16, 16, 1e-10)
+
+        # Pure rotational (Taylor–Green) sampled at scattered points → divergent part ≈ 0.
+        u = cos.(X[:, 1]) .* sin.(X[:, 2])
+        v = -sin.(X[:, 1]) .* cos.(X[:, 2])
+        U = hcat(u, v)
+        res = HD.helmholtz_decompose_spectral(U, pts; solver = solver)
+        @test relnorm(res.u_div) / relnorm(U) < 1e-6
+        @test maximum(abs.(res.u_rot .+ res.u_div .+ res.u_harm .- U)) < 1e-8
+
+        # Pure divergent sampled at scattered points → rotational part ≈ 0.
+        U2 = hcat(-sin.(X[:, 1]) .* cos.(X[:, 2]), -cos.(X[:, 1]) .* sin.(X[:, 2]))
+        res2 = HD.helmholtz_decompose_spectral(U2, pts; solver = solver)
+        @test relnorm(res2.u_rot) / relnorm(U2) < 1e-6
+
+        # Mixed: both parts present, exact reconstruction.
+        U3 = U .+ 0.5 .* U2
+        res3 = HD.helmholtz_decompose_spectral(U3, pts; solver = solver)
+        @test maximum(abs.(res3.u_rot .+ res3.u_div .+ res3.u_harm .- U3)) < 1e-8
+        @test relnorm(res3.u_rot) > 1 && relnorm(res3.u_div) > 1
+    end
+
     @testset "Batch decomposition (serial/threaded/distributed)" begin
         grid = HD.StructuredGrid(HD.CartesianGeometry(0.05, 0.05),
             collect(range(0.05, 0.95, length = 19)), collect(range(0.05, 0.95, length = 19)))

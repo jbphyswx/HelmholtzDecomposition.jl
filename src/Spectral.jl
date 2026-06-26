@@ -242,7 +242,7 @@ function _spectral_dispatch(u::AbstractArray, grid::AbstractGrid; solver::Abstra
     return _decompose_spectral(s, grid.geometry, u, grid; kwargs...)
 end
 
-function _resolve_spectral_solver(grid::StructuredGrid, solver::AbstractPoissonSolver)
+function _resolve_spectral_solver(grid::AbstractGrid, solver::AbstractPoissonSolver)
     solver isa AutoSolver || return solver
     s = _resolve_auto_solver(grid)
     s isa SORSolver && throw(ArgumentError(
