@@ -85,10 +85,14 @@ function HD._decompose_spectral(
     ::HD.SphericalGeometry,
     U::AbstractArray{T},
     grid::HD.StructuredGrid{2,<:HD.SphericalGeometry{T}};
+    output::Symbol = :physical,
     lmax::Int = solver.lmax,
     tol::Real = solver.tol,
     kwargs...,
 ) where {T}
+    # Physical output: solve via the nuSHT Poisson solver, then reconstruct.
+    output === :physical && return HD.helmholtz_decompose(U, grid; solver = solver)
+
     Nlon, Nlat = HD.size_tuple(grid)
     R = grid.geometry.R
 

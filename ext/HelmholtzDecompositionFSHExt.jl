@@ -56,14 +56,19 @@ function HD.solve_poisson!(
 end
 
 function HD._decompose_spectral(
-    ::SphericalSpectralSolver,
+    solver::SphericalSpectralSolver,
     ::HD.SphericalGeometry,
     U::AbstractArray{T},
     grid::HD.StructuredGrid{2,<:HD.SphericalGeometry{T}};
+    output::Symbol = :physical,
     kwargs...,
 ) where {T}
     Nlon, Nlat = HD.size_tuple(grid)
     _validate_fsh_grid(Nlon, Nlat)
+    # Physical output: solve the potentials with the SHT Poisson solver, then run the
+    # standard reconstruction pipeline (FD div/vort → SHT solve → spherical reconstruct).
+    output === :physical && return HD.helmholtz_decompose(U, grid; solver = solver)
+
     R = grid.geometry.R
     lmax = Nlat - 1
 

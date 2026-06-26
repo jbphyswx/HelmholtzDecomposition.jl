@@ -261,20 +261,25 @@ relnorm(x) = sqrt(sum(abs2, x))
         fsh = HD._SPECTRAL_SOLVERS[:spherical_regular]()
         nusht = HD._SPECTRAL_SOLVERS[:spherical_irregular]()
 
-        # FSH spectral path (Clenshaw–Curtis grid Nlon = 2·Nlat − 1) returns SH coefficients.
+        # FSH spectral path (Clenshaw–Curtis grid Nlon = 2·Nlat − 1).
         Nlat = 24; Nlon = 2 * Nlat - 1
         cclons = collect(range(0, 2π, length = Nlon + 1)[1:Nlon])
         cclats = collect(range(-1.2, 1.2, length = Nlat))
         ccgrid = HD.StructuredGrid(HD.SphericalGeometry(1.0), cclons, cclats)
         us, vs, = HD.rossby_wave(ccgrid; n = 2, m = 1)
+        # Default :physical returns a HelmholtzResult; :coefficients returns SH coefficients.
         sres = HD.helmholtz_decompose_spectral(us, vs, ccgrid; solver = fsh)
-        @test sres isa HD.SpectralSphericalResult
-        @test all(isfinite, sres.ψ) && all(isfinite, sres.χ)
+        @test sres isa HD.HelmholtzResult
+        cres = HD.helmholtz_decompose_spectral(us, vs, ccgrid; solver = fsh, output = :coefficients)
+        @test cres isa HD.SpectralSphericalResult
+        @test all(isfinite, cres.ψ) && all(isfinite, cres.χ)
 
-        # FSH grid validation rejects a non-CC grid; NUFSHT handles arbitrary grids.
-        @test_throws ArgumentError HD.helmholtz_decompose_spectral(u, v, grid; solver = fsh)
+        # NUFSHT returns a physical result on an arbitrary grid.
         nres = HD.helmholtz_decompose_spectral(u, v, grid; solver = nusht)
-        @test nres isa HD.SpectralSphericalResult
+        @test nres isa HD.HelmholtzResult
+
+        # FSH grid validation rejects a non-CC grid (coefficients path hits the validator).
+        @test_throws ArgumentError HD.helmholtz_decompose_spectral(u, v, grid; solver = fsh, output = :coefficients)
     end
 
     @testset "Batch decomposition (serial/threaded/distributed)" begin
