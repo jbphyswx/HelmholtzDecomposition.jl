@@ -25,12 +25,13 @@ Taylor-Green vortex on a Cartesian grid. Purely non-divergent (rotational only).
 The divergent component is exactly zero.
 """
 function taylor_green_vortex(
-    grid::StructuredGrid{G,T};
+    grid::StructuredGrid{2,G,T};
     A::Real = one(T),
-    kx::Real = T(2π) / (grid.lon[end] - grid.lon[1] + grid.lon[2] - grid.lon[1]),
-    ky::Real = T(2π) / (grid.lat[end] - grid.lat[1] + grid.lat[2] - grid.lat[1])
-) where {T<:AbstractFloat, G<:CartesianGeometry{T}}
+    kx::Real = T(2π) / (grid.coords_axes[1][end] - grid.coords_axes[1][1] + grid.coords_axes[1][2] - grid.coords_axes[1][1]),
+    ky::Real = T(2π) / (grid.coords_axes[2][end] - grid.coords_axes[2][1] + grid.coords_axes[2][2] - grid.coords_axes[2][1])
+) where {T<:AbstractFloat, G<:CartesianGeometry{2,T}}
     Nlon, Nlat = size_tuple(grid)
+    xs, ys = grid.coords_axes
     A_T = T(A)
     kx_T = T(kx)
     ky_T = T(ky)
@@ -39,9 +40,9 @@ function taylor_green_vortex(
     v = Matrix{T}(undef, Nlon, Nlat)
 
     for j in 1:Nlat
-        y = grid.lat[j]
+        y = ys[j]
         for i in 1:Nlon
-            x = grid.lon[i]
+            x = xs[i]
             u[i, j] =  A_T * ky_T * cos(kx_T * x) * sin(ky_T * y)
             v[i, j] = -A_T * kx_T * sin(kx_T * x) * cos(ky_T * y)
         end
@@ -67,12 +68,13 @@ Purely divergent field on a Cartesian grid (irrotational, zero vorticity).
 The rotational component is exactly zero.
 """
 function point_source_sink(
-    grid::StructuredGrid{G,T};
+    grid::StructuredGrid{2,G,T};
     A::Real = one(T),
-    kx::Real = T(2π) / (grid.lon[end] - grid.lon[1] + grid.lon[2] - grid.lon[1]),
-    ky::Real = T(2π) / (grid.lat[end] - grid.lat[1] + grid.lat[2] - grid.lat[1])
-) where {T<:AbstractFloat, G<:CartesianGeometry{T}}
+    kx::Real = T(2π) / (grid.coords_axes[1][end] - grid.coords_axes[1][1] + grid.coords_axes[1][2] - grid.coords_axes[1][1]),
+    ky::Real = T(2π) / (grid.coords_axes[2][end] - grid.coords_axes[2][1] + grid.coords_axes[2][2] - grid.coords_axes[2][1])
+) where {T<:AbstractFloat, G<:CartesianGeometry{2,T}}
     Nlon, Nlat = size_tuple(grid)
+    xs, ys = grid.coords_axes
     A_T = T(A)
     kx_T = T(kx)
     ky_T = T(ky)
@@ -81,9 +83,9 @@ function point_source_sink(
     v = Matrix{T}(undef, Nlon, Nlat)
 
     for j in 1:Nlat
-        y = grid.lat[j]
+        y = ys[j]
         for i in 1:Nlon
-            x = grid.lon[i]
+            x = xs[i]
             u[i, j] = A_T * kx_T * cos(kx_T * x) * sin(ky_T * y)
             v[i, j] = A_T * ky_T * sin(kx_T * x) * cos(ky_T * y)
         end
@@ -104,12 +106,12 @@ Mixed field: sum of Taylor-Green vortex (rotational) and source/sink (divergent)
 on a Cartesian grid.
 """
 function rankine_vortex_with_source(
-    grid::StructuredGrid{G,T};
+    grid::StructuredGrid{2,G,T};
     A_rot::Real = one(T),
     A_div::Real = T(0.5),
-    kx::Real = T(2π) / (grid.lon[end] - grid.lon[1] + grid.lon[2] - grid.lon[1]),
-    ky::Real = T(2π) / (grid.lat[end] - grid.lat[1] + grid.lat[2] - grid.lat[1])
-) where {T<:AbstractFloat, G<:CartesianGeometry{T}}
+    kx::Real = T(2π) / (grid.coords_axes[1][end] - grid.coords_axes[1][1] + grid.coords_axes[1][2] - grid.coords_axes[1][1]),
+    ky::Real = T(2π) / (grid.coords_axes[2][end] - grid.coords_axes[2][1] + grid.coords_axes[2][2] - grid.coords_axes[2][1])
+) where {T<:AbstractFloat, G<:CartesianGeometry{2,T}}
     u_r, v_r, u_rot, v_rot, _, _ = taylor_green_vortex(grid; A=A_rot, kx=kx, ky=ky)
     u_d, v_d, _, _, u_div, v_div = point_source_sink(grid; A=A_div, kx=kx, ky=ky)
 
@@ -134,12 +136,13 @@ Uses spherical harmonic-like stream function:
 The velocity is derived from ψ so the divergent component is exactly zero.
 """
 function rossby_wave(
-    grid::StructuredGrid{G,T};
+    grid::StructuredGrid{2,G,T};
     n::Int = 3,
     m::Int = 2,
     A::Real = one(T)
 ) where {T<:AbstractFloat, G<:SphericalGeometry{T}}
     Nlon, Nlat = size_tuple(grid)
+    lons, lats = grid.coords_axes
     R = grid.geometry.R
     A_T = T(A)
 
@@ -147,11 +150,11 @@ function rossby_wave(
     v = Matrix{T}(undef, Nlon, Nlat)
 
     for j in 1:Nlat
-        φ = grid.lat[j]
+        φ = lats[j]
         cosφ = cos(φ)
         sinφ = sin(φ)
         for i in 1:Nlon
-            λ = grid.lon[i]
+            λ = lons[i]
             # ψ = A cos(mλ) cosⁿ(φ)
             # u = -(1/R) ∂ψ/∂φ = (A n / R) cos(mλ) cosⁿ⁻¹(φ) sin(φ)
             # v = 1/(R cosφ) ∂ψ/∂λ = -(A m / (R cosφ)) sin(mλ) cosⁿ(φ)
@@ -178,7 +181,7 @@ The divergent part uses velocity potential:
     χ = A_div · sin(q·λ) · cosᵖ(φ)
 """
 function kelvin_ekman_flow(
-    grid::StructuredGrid{G,T};
+    grid::StructuredGrid{2,G,T};
     A_rot::Real = one(T),
     A_div::Real = T(0.3),
     n::Int = 3,
@@ -187,6 +190,7 @@ function kelvin_ekman_flow(
     q::Int = 1
 ) where {T<:AbstractFloat, G<:SphericalGeometry{T}}
     Nlon, Nlat = size_tuple(grid)
+    lons, lats = grid.coords_axes
     R = grid.geometry.R
     A_div_T = T(A_div)
 
@@ -198,11 +202,11 @@ function kelvin_ekman_flow(
     v_div = Matrix{T}(undef, Nlon, Nlat)
 
     for j in 1:Nlat
-        φ = grid.lat[j]
+        φ = lats[j]
         cosφ = cos(φ)
         sinφ = sin(φ)
         for i in 1:Nlon
-            λ = grid.lon[i]
+            λ = lons[i]
             # u_div = 1/(R cosφ) ∂χ/∂λ = A_div q / (R cosφ) cos(qλ) cosᵖ(φ)
             u_div[i, j] = A_div_T * q / (R * cosφ) * cos(q * λ) * cosφ^p
             # v_div = (1/R) ∂χ/∂φ = -A_div p / R sin(qλ) cosᵖ⁻¹(φ) sin(φ)

@@ -1,283 +1,380 @@
 """
-    Decomposition.jl — Helmholtz decomposition of 2D velocity fields.
+    Decomposition.jl — Physical-space Helmholtz(-Hodge) decomposition.
 
-Decomposes a horizontal velocity field (u, v) into rotational (non-divergent) and
-divergent (irrotational) components by solving Poisson equations for the stream
-function ψ and velocity potential χ:
+Decomposes a velocity field `u` (component-last array of size `(dims..., N)`) into
 
-    ∇²ψ = ζ   (vorticity)
-    ∇²χ = δ   (divergence)
+    u = u_div  ⊕  u_rot  ⊕  u_harm
 
-    u_rot = -∂ψ/∂y,   v_rot = ∂ψ/∂x       (Cartesian)
-    u_div =  ∂χ/∂x,   v_div = ∂χ/∂y       (Cartesian)
+where `u_div = ∇χ` is curl-free (divergent), `u_rot` is divergence-free (rotational),
+and `u_harm` is the harmonic remainder (both div- and curl-free) carried by domain
+topology / boundaries. The potentials solve Poisson equations:
 
-On the sphere:
-    u_rot = -(1/R) ∂ψ/∂φ,       v_rot = 1/(R cosφ) ∂ψ/∂λ
-    u_div = 1/(R cosφ) ∂χ/∂λ,   v_div = (1/R) ∂χ/∂φ
+    Δχ      = δ = ∇·u                       (scalar velocity potential)
+    ΔR_ab   = W_ab = ∂_a u_b − ∂_b u_a      (rotation-potential matrix, a < b)
 
-# Why this matters for coarse-graining on the sphere
-Aluie (2019, doi:10.1007/s13137-019-0123-9) proves that filtering the scalar
-potentials (ψ, χ) separately and reconstructing the velocity is equivalent to
-the generalized convolution that commutes with differential operators on S².
-Simply filtering Cartesian velocity components does NOT commute with ∇ on S².
+In 2D the single rotation component `R_12` is the streamfunction `ψ`; in 3D the three
+components are the Hodge dual of the vector potential `A`. On the sphere the rotational
+and divergent parts are reconstructed with the spherical metric (Δ on S² has eigenvalues
+`−ℓ(ℓ+1)/R²`); filtering the scalar potentials commutes with `∇` on S² (Aluie 2019),
+which is the package's reason for existing.
 
 # References
-- Aluie (2019): Convolutions on the sphere. Section 7, Proposition 2.
-- Buzzicotti et al. (2023): doi:10.1126/sciadv.adi7420
+- Aluie (2019): Convolutions on the sphere, doi:10.1007/s13137-019-0123-9.
+- Glötzl & Richters (2023): n-dimensional Helmholtz potentials, doi:10.1016/j.jmaa.2023.127138.
+- Bhatia et al. (2013): The Helmholtz-Hodge Decomposition — A Survey.
 """
 
 export HelmholtzResult, helmholtz_decompose!, helmholtz_decompose
+export streamfunction, velocity_potential, vector_potential
 
 """
-    HelmholtzResult{T}
+    HelmholtzResult{N,T,AV,AS}
 
-Result of a Helmholtz decomposition, containing both the decomposed velocity
-components and the scalar potentials.
+Result of an `N`-dimensional Helmholtz-Hodge decomposition. Velocity-like fields use the
+component-last layout `(dims..., N)`; potentials and scalar diagnostics are `(dims...)`.
 
 # Fields
-- `u_rot::Matrix{T}` — Rotational (non-divergent) u-component
-- `v_rot::Matrix{T}` — Rotational (non-divergent) v-component
-- `u_div::Matrix{T}` — Divergent (irrotational) u-component
-- `v_div::Matrix{T}` — Divergent (irrotational) v-component
-- `ψ::Matrix{T}` — Stream function (vorticity potential)
-- `χ::Matrix{T}` — Velocity potential (divergence potential)
-- `vorticity::Matrix{T}` — Computed vorticity field ζ = ∂v/∂x - ∂u/∂y
-- `divergence::Matrix{T}` — Computed divergence field δ = ∂u/∂x + ∂v/∂y
-- `ψ_solve::SolverResult{T}` — Convergence info for ψ Poisson solve
-- `χ_solve::SolverResult{T}` — Convergence info for χ Poisson solve
+- `u_rot::AV` — rotational (divergence-free) velocity, `(dims..., N)`.
+- `u_div::AV` — divergent (curl-free) velocity, `(dims..., N)`.
+- `u_harm::AV` — harmonic remainder `u − u_div − u_rot`, `(dims..., N)`.
+- `χ::AS` — scalar velocity potential, `(dims...)`.
+- `rotation_potential::AV` — rotation-potential components `(dims..., P)`, `P = N(N-1)/2`
+  (the streamfunction `ψ` in 2D; the Hodge dual of `A` in 3D).
+- `vorticity::AV` — rotation-tensor components `W_ab`, `(dims..., P)`.
+- `divergence::AS` — divergence field `δ`, `(dims...)`.
+- `harmonic_fraction::T` — `‖u_harm‖ / ‖u‖` (measure-weighted), a diagnostic of how much
+  of the field lives in the harmonic (topological/boundary) subspace.
+- `χ_solve::SolverResult{T}` — convergence info for the `χ` solve.
+- `rot_solve::Vector{SolverResult{T}}` — convergence info for each rotation-potential solve.
 """
-struct HelmholtzResult{T<:AbstractFloat}
-    u_rot::Matrix{T}
-    v_rot::Matrix{T}
-    u_div::Matrix{T}
-    v_div::Matrix{T}
-    ψ::Matrix{T}
-    χ::Matrix{T}
-    vorticity::Matrix{T}
-    divergence::Matrix{T}
-    ψ_solve::SolverResult{T}
+struct HelmholtzResult{N,T<:AbstractFloat,AV<:AbstractArray{T},AS<:AbstractArray{T,N}}
+    u_rot::AV
+    u_div::AV
+    u_harm::AV
+    χ::AS
+    rotation_potential::AV
+    vorticity::AV
+    divergence::AS
+    harmonic_fraction::T
     χ_solve::SolverResult{T}
+    rot_solve::Vector{SolverResult{T}}
 end
 
-"""
-    HelmholtzResult(grid::StructuredGrid{G,T}) where {G,T}
+@inline Base.ndims(::HelmholtzResult{N}) where {N} = N
 
-Pre-allocate a `HelmholtzResult` for the given grid dimensions.
 """
-function HelmholtzResult(grid::StructuredGrid{G,T}) where {T<:AbstractFloat, G<:AbstractGeometry{T}}
-    Nlon, Nlat = size_tuple(grid)
-    dummy_solve = SolverResult{T}(false, 0, zero(T))
-    return HelmholtzResult{T}(
-        zeros(T, Nlon, Nlat), zeros(T, Nlon, Nlat),
-        zeros(T, Nlon, Nlat), zeros(T, Nlon, Nlat),
-        zeros(T, Nlon, Nlat), zeros(T, Nlon, Nlat),
-        zeros(T, Nlon, Nlat), zeros(T, Nlon, Nlat),
-        dummy_solve, dummy_solve
+    streamfunction(result::HelmholtzResult{2})
+
+The 2-D streamfunction `ψ` (the single rotation-potential component). Only defined in 2D.
+"""
+streamfunction(r::HelmholtzResult{2}) = _component(r.rotation_potential, 1, Val(2))
+streamfunction(::HelmholtzResult{N}) where {N} =
+    throw(ArgumentError("streamfunction is only defined in 2D (got N=$N); use `vector_potential` in 3D or `rotation_potential` generally"))
+
+"""
+    velocity_potential(result)
+
+The scalar velocity potential `χ` (defined in any dimension).
+"""
+velocity_potential(r::HelmholtzResult) = r.χ
+
+"""
+    vector_potential(result::HelmholtzResult{3}) -> (A1, A2, A3)
+
+The 3-D vector potential `A`, the Hodge dual of the rotation potential:
+`A1 = R_23`, `A2 = -R_13`, `A3 = R_12`. Only defined in 3D.
+"""
+function vector_potential(r::HelmholtzResult{3})
+    R12 = _component(r.rotation_potential, 1, Val(3))  # pair (1,2)
+    R13 = _component(r.rotation_potential, 2, Val(3))  # pair (1,3)
+    R23 = _component(r.rotation_potential, 3, Val(3))  # pair (2,3)
+    return (R23, -1 .* R13, R12)
+end
+vector_potential(::HelmholtzResult{N}) where {N} =
+    throw(ArgumentError("vector_potential is only defined in 3D (got N=$N)"))
+
+# ---------------------------------------------------------------------------
+# Allocation
+# ---------------------------------------------------------------------------
+
+"""
+    HelmholtzResult(grid::StructuredGrid{N,G,T})
+
+Pre-allocate a zeroed `HelmholtzResult` matching the grid dimensions.
+"""
+function HelmholtzResult(grid::StructuredGrid{N,G,T}) where {N,T<:AbstractFloat,G<:AbstractGeometry{T}}
+    dims = size_tuple(grid)
+    P = n_rotation_components(N)
+    dummy = SolverResult{T}(false, 0, zero(T))
+    return HelmholtzResult{N,T,Array{T,N + 1},Array{T,N}}(
+        zeros(T, dims..., N),       # u_rot
+        zeros(T, dims..., N),       # u_div
+        zeros(T, dims..., N),       # u_harm
+        zeros(T, dims...),          # χ
+        zeros(T, dims..., P),       # rotation_potential
+        zeros(T, dims..., P),       # vorticity
+        zeros(T, dims...),          # divergence
+        zero(T),
+        dummy,
+        [dummy for _ in 1:P],
     )
 end
 
+# ---------------------------------------------------------------------------
+# Top-level API
+# ---------------------------------------------------------------------------
+
 """
-    helmholtz_decompose!(result, u, v, grid; solver=AutoSolver(), boundary_χ=:neumann, boundary_ψ=:dirichlet)
+    helmholtz_decompose(u, grid; kwargs...) -> HelmholtzResult
+    helmholtz_decompose(u, v, grid; kwargs...)         # 2D convenience
+    helmholtz_decompose(u, v, w, grid; kwargs...)      # 3D convenience
 
-In-place Helmholtz decomposition: decompose velocity (u, v) into rotational and
-divergent components, writing results into `result::HelmholtzResult`.
-
-# Arguments
-- `result::HelmholtzResult{T}` — Pre-allocated result (modified in-place)
-- `u::AbstractMatrix` — Zonal velocity (u_east or u_x)
-- `v::AbstractMatrix` — Meridional velocity (v_north or v_y)
-- `grid::StructuredGrid` — Grid with geometry and mask
+Decompose a velocity field on `grid`. The primary method takes a single component-last
+array `u` of size `(dims..., N)`. The 2- and 3-argument forms stack scalar component
+arrays for convenience.
 
 # Keyword Arguments
-- `solver::AbstractPoissonSolver` — Poisson solver (default: `AutoSolver()`)
-- `boundary_χ::Symbol` — BC for velocity potential (default: `:neumann`)
-- `boundary_ψ::Symbol` — BC for stream function (default: `:dirichlet`)
+- `solver::AbstractPoissonSolver = AutoSolver()` — Poisson solver.
+- `boundary_χ::Symbol = :neumann` — boundary condition for the velocity potential `χ`.
+- `boundary_ψ::Symbol = :dirichlet` — boundary condition for the rotation potential.
 
-# Returns
-The modified `result` struct.
+Returns a [`HelmholtzResult`](@ref).
 """
-function helmholtz_decompose!(
-    result::HelmholtzResult{T},
-    u::AbstractMatrix,
-    v::AbstractMatrix,
-    grid::StructuredGrid{G,T};
-    solver::AbstractPoissonSolver = AutoSolver(),
-    boundary_χ::Symbol = :neumann,
-    boundary_ψ::Symbol = :dirichlet
-) where {T<:AbstractFloat, G<:AbstractGeometry{T}}
-    Nlon, Nlat = size_tuple(grid)
+function helmholtz_decompose(u::AbstractArray, grid::StructuredGrid; kwargs...)
+    result = HelmholtzResult(grid)
+    return helmholtz_decompose!(result, u, grid; kwargs...)
+end
 
-    div_f = result.divergence
-    vort_f = result.vorticity
-    χ = result.χ
-    ψ = result.ψ
+function helmholtz_decompose(u::AbstractArray{<:Any,N}, v::AbstractArray{<:Any,N}, grid::StructuredGrid{N}; kwargs...) where {N}
+    U = _stack_components(grid, u, v)
+    return helmholtz_decompose(U, grid; kwargs...)
+end
 
-    fill!(div_f, zero(T))
-    fill!(vort_f, zero(T))
+function helmholtz_decompose(u::AbstractArray{<:Any,N}, v::AbstractArray{<:Any,N}, w::AbstractArray{<:Any,N}, grid::StructuredGrid{N}; kwargs...) where {N}
+    U = _stack_components(grid, u, v, w)
+    return helmholtz_decompose(U, grid; kwargs...)
+end
 
-    # Precompute grid spacings
-    if G <: CartesianGeometry{T}
-        dx = grid.geometry.dx
-        dy = grid.geometry.dy
-    else
-        R = grid.geometry.R
-        dλ = Nlon > 1 ? grid.lon[2] - grid.lon[1] : T(0)
-        dφ = Nlat > 1 ? grid.lat[2] - grid.lat[1] : T(0)
+function _stack_components(grid::StructuredGrid{N,G,T}, comps::Vararg{AbstractArray,M}) where {N,G,T,M}
+    dims = size_tuple(grid)
+    U = Array{T,N + 1}(undef, dims..., M)
+    for c in 1:M
+        copyto!(_component(U, c, Val(N)), comps[c])
     end
-
-    # 1. Compute divergence and vorticity
-    for j in 1:Nlat
-        for i in 1:Nlon
-            iswet(grid, i, j) || continue
-
-            ip = i < Nlon && iswet(grid, i+1, j) ? i+1 : i
-            im = i > 1    && iswet(grid, i-1, j) ? i-1 : i
-            jp = j < Nlat && iswet(grid, i, j+1) ? j+1 : j
-            jm = j > 1    && iswet(grid, i, j-1) ? j-1 : j
-
-            if G <: CartesianGeometry{T}
-                h_x = ip == im ? dx : (ip - im) * dx
-                h_y = jp == jm ? dy : (jp - jm) * dy
-
-                dudx = (u[ip, j] - u[im, j]) / h_x
-                dvdy = (v[i, jp] - v[i, jm]) / h_y
-                div_f[i, j] = dudx + dvdy
-
-                dvdx = (v[ip, j] - v[im, j]) / h_x
-                dudy = (u[i, jp] - u[i, jm]) / h_y
-                vort_f[i, j] = dvdx - dudy
-            else
-                φ = grid.lat[j]
-                cosφ = cos(φ)
-
-                h_λ = (ip - im) * dλ
-                h_φ = (jp - jm) * dφ
-
-                dudλ = ip == im ? zero(T) : (u[ip, j] - u[im, j]) / h_λ
-                v_cos_jp = v[i, jp] * cos(grid.lat[jp])
-                v_cos_jm = v[i, jm] * cos(grid.lat[jm])
-                d_vcos_dφ = jp == jm ? zero(T) : (v_cos_jp - v_cos_jm) / h_φ
-                div_f[i, j] = (dudλ + d_vcos_dφ) / (R * cosφ)
-
-                dvdλ = ip == im ? zero(T) : (v[ip, j] - v[im, j]) / h_λ
-                u_cos_jp = u[i, jp] * cos(grid.lat[jp])
-                u_cos_jm = u[i, jm] * cos(grid.lat[jm])
-                d_ucos_dφ = jp == jm ? zero(T) : (u_cos_jp - u_cos_jm) / h_φ
-                vort_f[i, j] = (dvdλ - d_ucos_dφ) / (R * cosφ)
-            end
-        end
-    end
-
-    # 2. Divergence balancing (Fredholm solvability condition for Neumann BCs)
-    total_div = zero(T)
-    total_area = zero(T)
-    for j in 1:Nlat
-        for i in 1:Nlon
-            if iswet(grid, i, j)
-                total_div += div_f[i, j] * area(grid, i, j)
-                total_area += area(grid, i, j)
-            end
-        end
-    end
-
-    mean_div = total_div / total_area
-    for j in 1:Nlat
-        for i in 1:Nlon
-            if iswet(grid, i, j)
-                div_f[i, j] -= mean_div
-            end
-        end
-    end
-
-    # 3. Solve Poisson equations
-    χ_solver = solver isa AutoSolver ? solver : (
-        solver isa SORSolver ? SORSolver(; max_iter=solver.max_iter, tol=solver.tol, ω=solver.ω, boundary=boundary_χ) : solver
-    )
-    ψ_solver = solver isa AutoSolver ? solver : (
-        solver isa SORSolver ? SORSolver(; max_iter=solver.max_iter, tol=solver.tol, ω=solver.ω, boundary=boundary_ψ) : solver
-    )
-
-    χ_result = solve_poisson!(χ, div_f, grid, χ_solver)
-    ψ_result = solve_poisson!(ψ, vort_f, grid, ψ_solver)
-
-    # 4. Reconstruct velocities from potentials
-    u_rot = result.u_rot
-    v_rot = result.v_rot
-    u_div = result.u_div
-    v_div = result.v_div
-
-    for j in 1:Nlat
-        for i in 1:Nlon
-            if !iswet(grid, i, j)
-                u_div[i, j] = zero(T)
-                v_div[i, j] = zero(T)
-                u_rot[i, j] = zero(T)
-                v_rot[i, j] = zero(T)
-                continue
-            end
-
-            ip = i < Nlon && iswet(grid, i+1, j) ? i+1 : i
-            im = i > 1    && iswet(grid, i-1, j) ? i-1 : i
-            jp = j < Nlat && iswet(grid, i, j+1) ? j+1 : j
-            jm = j > 1    && iswet(grid, i, j-1) ? j-1 : j
-
-            if G <: CartesianGeometry{T}
-                h_x = ip == im ? dx : (ip - im) * dx
-                h_y = jp == jm ? dy : (jp - jm) * dy
-
-                # u_div = ∇χ
-                u_div[i, j] = (χ[ip, j] - χ[im, j]) / h_x
-                v_div[i, j] = (χ[i, jp] - χ[i, jm]) / h_y
-
-                # u_rot = ∇ × (ψ ẑ) = [-∂ψ/∂y, ∂ψ/∂x]
-                u_rot[i, j] = -(ψ[i, jp] - ψ[i, jm]) / h_y
-                v_rot[i, j] = (ψ[ip, j] - ψ[im, j]) / h_x
-            else
-                φ = grid.lat[j]
-                cosφ = cos(φ)
-                h_λ = (ip - im) * dλ
-                h_φ = (jp - jm) * dφ
-
-                # u_div_λ = 1/(R cosφ) ∂χ/∂λ,  v_div_φ = 1/R ∂χ/∂φ
-                u_div[i, j] = ip == im ? zero(T) : (χ[ip, j] - χ[im, j]) / (h_λ * R * cosφ)
-                v_div[i, j] = jp == jm ? zero(T) : (χ[i, jp] - χ[i, jm]) / (h_φ * R)
-
-                # u_rot_λ = -1/R ∂ψ/∂φ,  v_rot_φ = 1/(R cosφ) ∂ψ/∂λ
-                u_rot[i, j] = jp == jm ? zero(T) : -(ψ[i, jp] - ψ[i, jm]) / (h_φ * R)
-                v_rot[i, j] = ip == im ? zero(T) : (ψ[ip, j] - ψ[im, j]) / (h_λ * R * cosφ)
-            end
-        end
-    end
-
-    # Build final result with solver diagnostics
-    return HelmholtzResult{T}(
-        u_rot, v_rot, u_div, v_div, ψ, χ,
-        vort_f, div_f, ψ_result, χ_result
-    )
+    return U
 end
 
 """
-    helmholtz_decompose(u, v, grid; solver=AutoSolver(), kwargs...)
+    helmholtz_decompose!(result, u, grid; kwargs...) -> result
 
-Allocating version of [`helmholtz_decompose!`](@ref). Returns a new `HelmholtzResult`.
-
-# Example
-```julia
-using HelmholtzDecomposition: HelmholtzDecomposition
-
-geom = HelmholtzDecomposition.CartesianGeometry(1000.0, 1000.0)
-grid = HelmholtzDecomposition.StructuredGrid(geom, collect(0.0:1000.0:99000.0), collect(0.0:1000.0:99000.0))
-result = HelmholtzDecomposition.helmholtz_decompose(u, v, grid)
-# result.u_rot, result.v_rot, result.u_div, result.v_div
-# result.ψ (stream function), result.χ (velocity potential)
-```
+In-place decomposition writing into a pre-allocated [`HelmholtzResult`](@ref). `u` is a
+component-last array of size `(dims..., N)`.
 """
-function helmholtz_decompose(
-    u::AbstractMatrix,
-    v::AbstractMatrix,
-    grid::StructuredGrid{G,T};
-    kwargs...
-) where {T<:AbstractFloat, G<:AbstractGeometry{T}}
-    result = HelmholtzResult(grid)
-    return helmholtz_decompose!(result, u, v, grid; kwargs...)
+function helmholtz_decompose!(
+    result::HelmholtzResult{N,T},
+    u::AbstractArray,
+    grid::StructuredGrid{N,G,T};
+    solver::AbstractPoissonSolver = AutoSolver(),
+    boundary_χ::Symbol = :neumann,
+    boundary_ψ::Symbol = :dirichlet,
+) where {N,T<:AbstractFloat,G<:AbstractGeometry{T}}
+    size(u) == (size_tuple(grid)..., N) ||
+        throw(DimensionMismatch("velocity array size $(size(u)) does not match (dims..., N) = $((size_tuple(grid)..., N))"))
+
+    div_f = result.divergence
+    vort = result.vorticity
+    χ = result.χ
+    Rpot = result.rotation_potential
+
+    # 1. Divergence and rotation tensor.
+    _compute_div_rot!(div_f, vort, u, grid)
+
+    # 2. Divergence balancing — only for the homogeneous Neumann χ problem, where the
+    #    Fredholm solvability condition ∫δ dV = 0 must hold (subtracting a nonzero mean
+    #    under an inhomogeneous BC would corrupt the field).
+    if boundary_χ === :neumann
+        _subtract_weighted_mean!(div_f, grid)
+    end
+
+    # 3. Solve the Poisson equations.
+    χ_result = solve_poisson!(χ, div_f, grid, solver; boundary = boundary_χ)
+    P = n_rotation_components(N)
+    rot_results = result.rot_solve
+    for p in 1:P
+        Rp = _component(Rpot, p, Val(N))
+        Wp = _component(vort, p, Val(N))
+        rot_results[p] = solve_poisson!(Rp, Wp, grid, solver; boundary = boundary_ψ)
+    end
+
+    # 4. Reconstruct velocities from the potentials.
+    _reconstruct!(result.u_div, result.u_rot, χ, Rpot, grid)
+
+    # 5. Harmonic remainder and diagnostic.
+    hfrac = _harmonic_residual!(result.u_harm, u, result.u_div, result.u_rot, grid)
+
+    return HelmholtzResult{N,T,typeof(result.u_rot),typeof(χ)}(
+        result.u_rot, result.u_div, result.u_harm, χ, Rpot, vort, div_f,
+        hfrac, χ_result, rot_results,
+    )
+end
+
+# ---------------------------------------------------------------------------
+# Geometry-dispatched operators
+# ---------------------------------------------------------------------------
+
+# Cartesian (dimension-generic) — delegate to Operators.jl.
+function _compute_div_rot!(div_f, vort, u, grid::StructuredGrid{N,<:CartesianGeometry}) where {N}
+    cartesian_divergence!(div_f, u, grid)
+    cartesian_rotation_tensor!(vort, u, grid)
+    return nothing
+end
+
+function _reconstruct!(u_div, u_rot, χ, Rpot, grid::StructuredGrid{N,<:CartesianGeometry}) where {N}
+    cartesian_reconstruct_div!(u_div, χ, grid)
+    cartesian_reconstruct_rot!(u_rot, Rpot, grid)
+    return nothing
+end
+
+# Spherical (N == 2) — uses the spherical metric with periodic longitude.
+function _compute_div_rot!(div_f, vort, u, grid::StructuredGrid{2,<:SphericalGeometry{T}}) where {T}
+    Nlon, Nlat = size_tuple(grid)
+    lon, lat = grid.coords_axes
+    R = grid.geometry.R
+    dλ = Nlon > 1 ? lon[2] - lon[1] : one(T)
+    dφ = Nlat > 1 ? lat[2] - lat[1] : one(T)
+    periodic = _is_periodic_longitude(lon, dλ)
+    uc = _component(u, 1, Val(2))
+    vc = _component(u, 2, Val(2))
+    fill!(div_f, zero(T))
+    fill!(vort, zero(T))
+    ζ = _component(vort, 1, Val(2))
+    @inbounds for j in 1:Nlat
+        cosφ = cos(lat[j])
+        abs(cosφ) < sqrt(eps(T)) && continue
+        for i in 1:Nlon
+            iswet(grid, i, j) || continue
+            ip, im = _lon_neighbors(i, Nlon, grid, j, periodic)
+            jp = j < Nlat && iswet(grid, i, j + 1) ? j + 1 : j
+            jm = j > 1 && iswet(grid, i, j - 1) ? j - 1 : j
+
+            h_λ = _lon_step(i, ip, im, Nlon, dλ, periodic)
+            h_φ = (jp - jm) * dφ
+
+            dudλ = h_λ == 0 ? zero(T) : (uc[ip, j] - uc[im, j]) / h_λ
+            dvdλ = h_λ == 0 ? zero(T) : (vc[ip, j] - vc[im, j]) / h_λ
+            vcos_jp = vc[i, jp] * cos(lat[jp])
+            vcos_jm = vc[i, jm] * cos(lat[jm])
+            ucos_jp = uc[i, jp] * cos(lat[jp])
+            ucos_jm = uc[i, jm] * cos(lat[jm])
+            d_vcos_dφ = h_φ == 0 ? zero(T) : (vcos_jp - vcos_jm) / h_φ
+            d_ucos_dφ = h_φ == 0 ? zero(T) : (ucos_jp - ucos_jm) / h_φ
+
+            div_f[i, j] = (dudλ + d_vcos_dφ) / (R * cosφ)
+            ζ[i, j] = (dvdλ - d_ucos_dφ) / (R * cosφ)
+        end
+    end
+    return nothing
+end
+
+function _reconstruct!(u_div, u_rot, χ, Rpot, grid::StructuredGrid{2,<:SphericalGeometry{T}}) where {T}
+    Nlon, Nlat = size_tuple(grid)
+    lon, lat = grid.coords_axes
+    R = grid.geometry.R
+    dλ = Nlon > 1 ? lon[2] - lon[1] : one(T)
+    dφ = Nlat > 1 ? lat[2] - lat[1] : one(T)
+    periodic = _is_periodic_longitude(lon, dλ)
+    ψ = _component(Rpot, 1, Val(2))
+    u_divc = _component(u_div, 1, Val(2)); v_divc = _component(u_div, 2, Val(2))
+    u_rotc = _component(u_rot, 1, Val(2)); v_rotc = _component(u_rot, 2, Val(2))
+    fill!(u_div, zero(T))
+    fill!(u_rot, zero(T))
+    @inbounds for j in 1:Nlat
+        cosφ = cos(lat[j])
+        abs(cosφ) < sqrt(eps(T)) && continue
+        for i in 1:Nlon
+            iswet(grid, i, j) || continue
+            ip, im = _lon_neighbors(i, Nlon, grid, j, periodic)
+            jp = j < Nlat && iswet(grid, i, j + 1) ? j + 1 : j
+            jm = j > 1 && iswet(grid, i, j - 1) ? j - 1 : j
+            h_λ = _lon_step(i, ip, im, Nlon, dλ, periodic)
+            h_φ = (jp - jm) * dφ
+
+            dχdλ = h_λ == 0 ? zero(T) : (χ[ip, j] - χ[im, j]) / h_λ
+            dχdφ = h_φ == 0 ? zero(T) : (χ[i, jp] - χ[i, jm]) / h_φ
+            dψdλ = h_λ == 0 ? zero(T) : (ψ[ip, j] - ψ[im, j]) / h_λ
+            dψdφ = h_φ == 0 ? zero(T) : (ψ[i, jp] - ψ[i, jm]) / h_φ
+
+            u_divc[i, j] = dχdλ / (R * cosφ)
+            v_divc[i, j] = dχdφ / R
+            u_rotc[i, j] = -dψdφ / R
+            v_rotc[i, j] = dψdλ / (R * cosφ)
+        end
+    end
+    return nothing
+end
+
+@inline function _lon_step(i, ip, im, Nlon, dλ::T, periodic) where {T}
+    if periodic
+        # Across the seam the index jumps by Nlon-1 but the physical step is one cell.
+        return (ip == i || im == i) ? (ip == im ? zero(T) : dλ) : T(2) * dλ
+    else
+        return (ip - im) * dλ
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+function _subtract_weighted_mean!(field, grid::StructuredGrid{N}) where {N}
+    T = eltype(field)
+    total = zero(T)
+    weight = zero(T)
+    @inbounds for I in CartesianIndices(grid.mask)
+        grid.mask[I] || continue
+        w = cellmeasure(grid, Tuple(I)...)
+        total += field[I] * w
+        weight += w
+    end
+    weight == 0 && return field
+    m = total / weight
+    @inbounds for I in CartesianIndices(grid.mask)
+        grid.mask[I] || continue
+        field[I] -= m
+    end
+    return field
+end
+
+"""
+    _velocity_norm(U, grid) -> T
+
+Measure-weighted L² norm `sqrt(∫ |U|² dV)` of a component-last velocity array over the
+wet cells of `grid`.
+"""
+function _velocity_norm(U, grid::StructuredGrid{N}) where {N}
+    T = real(eltype(U))
+    acc = zero(T)
+    comps = ntuple(c -> _component(U, c, Val(N)), Val(N))
+    @inbounds for I in CartesianIndices(grid.mask)
+        grid.mask[I] || continue
+        w = cellmeasure(grid, Tuple(I)...)
+        for c in 1:N
+            acc += w * abs2(comps[c][I])
+        end
+    end
+    return sqrt(acc)
+end
+
+function _harmonic_residual!(u_harm, u, u_div, u_rot, grid::StructuredGrid{N}) where {N}
+    T = eltype(u_harm)
+    @. u_harm = u - u_div - u_rot
+    # Zero masked-out cells.
+    @inbounds for I in CartesianIndices(grid.mask)
+        grid.mask[I] && continue
+        for c in 1:N
+            _component(u_harm, c, Val(N))[I] = zero(T)
+        end
+    end
+    den = _velocity_norm(u, grid)
+    return den == 0 ? zero(T) : _velocity_norm(u_harm, grid) / den
 end

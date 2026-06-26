@@ -1,8 +1,15 @@
 """
-    Spectral.jl — Spectral-space Helmholtz decomposition.
+    Spectral.jl — Spectral-space Helmholtz decomposition (dimension-generic).
 
-Provides types and methods for decomposing velocity fields directly in Fourier
-or Spherical Harmonic coefficient space.
+The Helmholtz (Leray) projection in Fourier space is dimension-trivial: for every
+wavevector `k`,
+
+    û_div(k) = (k̂ ⊗ k̂) û(k)        (curl-free / divergent)
+    û_rot(k) = (I − k̂ ⊗ k̂) û(k)    (divergence-free / rotational)
+
+with the `k = 0` mode (the mean) left untouched. This is implemented with fused
+broadcasts over the component-last spectral array, so the same code runs on CPU and GPU
+arrays and in any number of dimensions.
 """
 
 export AbstractSpectralHelmholtzResult, SpectralCartesianResult, SpectralSphericalResult
@@ -16,30 +23,28 @@ Abstract supertype for spectral decomposition results.
 abstract type AbstractSpectralHelmholtzResult{T} end
 
 """
-    SpectralCartesianResult{T, A}
+    SpectralCartesianResult{T,A}
 
-Result of a Cartesian spectral Helmholtz decomposition, containing the complex
-Fourier coefficients of the rotational and divergent velocity components.
+Cartesian spectral decomposition result holding the component-last complex Fourier
+coefficients of the rotational and divergent velocity (`(kdims..., N)`).
 """
-struct SpectralCartesianResult{T, A} <: AbstractSpectralHelmholtzResult{T}
+struct SpectralCartesianResult{T,A} <: AbstractSpectralHelmholtzResult{T}
     u_rot::A
-    v_rot::A
     u_div::A
-    v_div::A
 end
 
-function SpectralCartesianResult(u_rot::A, v_rot::A, u_div::A, v_div::A) where {A}
+function SpectralCartesianResult(u_rot::A, u_div::A) where {A}
     T = real(eltype(A))
-    return SpectralCartesianResult{T, A}(u_rot, v_rot, u_div, v_div)
+    return SpectralCartesianResult{T,A}(u_rot, u_div)
 end
 
 """
-    SpectralSphericalResult{T, V}
+    SpectralSphericalResult{T,V}
 
-Result of a Spherical spectral Helmholtz decomposition, containing the Spherical
-Harmonic coefficients of the streamfunction ψ and velocity potential χ.
+Spherical spectral decomposition result holding the spherical-harmonic coefficients of
+the streamfunction `ψ` and velocity potential `χ`, up to degree `lmax`.
 """
-struct SpectralSphericalResult{T, V} <: AbstractSpectralHelmholtzResult{T}
+struct SpectralSphericalResult{T,V} <: AbstractSpectralHelmholtzResult{T}
     ψ::V
     χ::V
     lmax::Int
@@ -47,127 +52,244 @@ end
 
 function SpectralSphericalResult(ψ::V, χ::V, lmax::Int) where {V}
     T = real(eltype(V))
-    return SpectralSphericalResult{T, V}(ψ, χ, lmax)
+    return SpectralSphericalResult{T,V}(ψ, χ, lmax)
 end
 
 # ---------------------------------------------------------------------------
-# Direct Fourier algebraic projections (Cartesian)
+# Generic Fourier-space Leray projection
 # ---------------------------------------------------------------------------
 
+# Reshape an axis wavenumber vector to broadcast along spectral dimension `d` of an
+# `N`-dimensional spectral grid.
+@inline function _reshape_k(k::AbstractVector, d::Integer, ::Val{N}) where {N}
+    return reshape(k, ntuple(i -> i == d ? length(k) : 1, Val(N)))
+end
+
 """
-    helmholtz_project_spectral(u_hat, v_hat, kx, ky; kwargs...)
+    helmholtz_project_spectral!(û_rot, û_div, velocity_hat, ks::NTuple{N})
 
-Perform Cartesian Helmholtz decomposition directly in Fourier space given the
-velocity coefficients `u_hat`, `v_hat` and the wavenumber vectors `kx`, `ky`.
-
-This function uses hardware-agnostic fused broadcasting, making it fully GPU compatible.
+In-place Leray projection. `velocity_hat`, `û_rot`, `û_div` are component-last spectral
+arrays of size `(kdims..., N)`; `ks` holds the per-axis wavenumber vectors. Writes the
+rotational (divergence-free) part into `û_rot` and the divergent (curl-free) part into
+`û_div`. GPU-compatible (pure broadcast).
 """
-function helmholtz_project_spectral(
-    u_hat::AbstractMatrix,
-    v_hat::AbstractMatrix,
-    kx::AbstractVector,
-    ky::AbstractVector;
-    kwargs...
-)
-    T = real(eltype(u_hat))
-    kx_2d = reshape(T.(kx), :, 1)
-    ky_2d = reshape(T.(ky), 1, :)
+function helmholtz_project_spectral!(û_rot, û_div, velocity_hat, ks::NTuple{N,Any}) where {N}
+    T = real(eltype(velocity_hat))
+    K = ntuple(d -> _reshape_k(T.(ks[d]), d, Val(N)), Val(N))
 
-    k2 = @. kx_2d^2 + ky_2d^2
+    k2 = K[1] .^ 2
+    for d in 2:N
+        k2 = k2 .+ K[d] .^ 2
+    end
     inv_k2 = @. ifelse(k2 == zero(T), zero(T), one(T) / k2)
 
-    u_rot = @. (-kx_2d * ky_2d * v_hat + ky_2d^2 * u_hat) * inv_k2
-    v_rot = @. (kx_2d^2 * v_hat - kx_2d * ky_2d * u_hat) * inv_k2
-    u_div = @. (kx_2d^2 * u_hat + kx_2d * ky_2d * v_hat) * inv_k2
-    v_div = @. (kx_2d * ky_2d * u_hat + ky_2d^2 * v_hat) * inv_k2
+    comp(A, c) = _component(A, c, Val(N))
 
-    return SpectralCartesianResult(u_rot, v_rot, u_div, v_div)
-end
-
-"""
-    helmholtz_project_spectral(u_hat, v_hat, grid::StructuredGrid{<:CartesianGeometry}; kwargs...)
-
-Perform Cartesian spectral projection directly in Fourier space given the
-velocity coefficients `u_hat`, `v_hat` and a Cartesian structured grid.
-Automatically reconstructs the appropriate wavenumber vectors `kx`, `ky` based on the
-dimensions and spacing of the grid.
-"""
-function helmholtz_project_spectral(
-    u_hat::AbstractMatrix,
-    v_hat::AbstractMatrix,
-    grid::StructuredGrid{<:CartesianGeometry};
-    kwargs...
-)
-    T = real(eltype(u_hat))
-    Nx, Ny = size_tuple(grid)
-    dx = grid.geometry.dx
-    dy = grid.geometry.dy
-
-    Nk_x = size(u_hat, 1)
-    Nk_y = size(u_hat, 2)
-
-    if Nk_x == Nx ÷ 2 + 1
-        kx = T[T(2π) * (i - 1) / (Nx * dx) for i in 1:Nk_x]
-    else
-        Lx = Nx * dx
-        kx = T[T(2π) * (i - 1 <= Nx ÷ 2 ? i - 1 : i - 1 - Nx) / Lx for i in 1:Nk_x]
+    # k·û  (sum over components, broadcast over the spectral grid).
+    kdotu = K[1] .* comp(velocity_hat, 1)
+    for b in 2:N
+        kdotu = kdotu .+ K[b] .* comp(velocity_hat, b)
     end
 
-    Ly = Ny * dy
-    ky = T[T(2π) * (j - 1 <= Ny ÷ 2 ? j - 1 : j - 1 - Ny) / Ly for j in 1:Nk_y]
+    for a in 1:N
+        ûa = comp(velocity_hat, a)
+        diva = comp(û_div, a)
+        rota = comp(û_rot, a)
+        @. diva = K[a] * kdotu * inv_k2
+        @. rota = ûa - diva
+    end
+    return nothing
+end
 
-    return helmholtz_project_spectral(u_hat, v_hat, kx, ky; kwargs...)
+"""
+    helmholtz_potentials_spectral(velocity_hat, ks::NTuple{N}) -> (χ_hat, R_hat)
+
+Compute the spectral scalar velocity potential `χ_hat` (size `(kdims...)`) and the
+rotation-potential components `R_hat` (component-last, size `(kdims..., P)`, `P = N(N-1)/2`)
+from a component-last spectral velocity array. Uses the spectral Poisson inverses
+`χ̂ = −i (k·û)/k²` and `R̂_ab = −i (k_a û_b − k_b û_a)/k²`, with the `k = 0` mode set to zero.
+"""
+function helmholtz_potentials_spectral(velocity_hat::AbstractArray, ks::NTuple{N,Any}) where {N}
+    T = real(eltype(velocity_hat))
+    CT = Complex{T}
+    K = ntuple(d -> _reshape_k(T.(ks[d]), d, Val(N)), Val(N))
+    k2 = K[1] .^ 2
+    for d in 2:N
+        k2 = k2 .+ K[d] .^ 2
+    end
+    inv_k2 = @. ifelse(k2 == zero(T), zero(T), one(T) / k2)
+    comp(A, c) = _component(A, c, Val(N))
+
+    kdotu = K[1] .* comp(velocity_hat, 1)
+    for b in 2:N
+        kdotu = kdotu .+ K[b] .* comp(velocity_hat, b)
+    end
+    χ_hat = @. -im * kdotu * inv_k2
+
+    kdims = size(velocity_hat)[1:N]
+    P = n_rotation_components(N)
+    R_hat = Array{CT,N + 1}(undef, kdims..., P)
+    pairs = rotation_pairs(Val(N))
+    for (p, (a, b)) in enumerate(pairs)
+        ûa = comp(velocity_hat, a)
+        ûb = comp(velocity_hat, b)
+        Rp = comp(R_hat, p)
+        @. Rp = -im * (K[a] * ûb - K[b] * ûa) * inv_k2
+    end
+    return χ_hat, R_hat
+end
+
+"""
+    helmholtz_project_spectral(velocity_hat, ks::NTuple) -> SpectralCartesianResult
+
+Allocating Leray projection from a component-last spectral array.
+"""
+function helmholtz_project_spectral(velocity_hat::AbstractArray, ks::NTuple{N,Any}) where {N}
+    û_rot = similar(velocity_hat)
+    û_div = similar(velocity_hat)
+    helmholtz_project_spectral!(û_rot, û_div, velocity_hat, ks)
+    return SpectralCartesianResult(û_rot, û_div)
+end
+
+# 2-D convenience: separate (u_hat, v_hat) with explicit wavenumber vectors.
+function helmholtz_project_spectral(u_hat::AbstractMatrix, v_hat::AbstractMatrix, kx::AbstractVector, ky::AbstractVector; kwargs...)
+    velocity_hat = _stack_spectral(u_hat, v_hat)
+    return helmholtz_project_spectral(velocity_hat, (kx, ky))
+end
+
+# Convenience: separate component arrays + grid (builds wavenumbers from the grid).
+function helmholtz_project_spectral(velocity_hat::AbstractArray, grid::StructuredGrid{N,<:CartesianGeometry}; kwargs...) where {N}
+    ks = _grid_wavenumbers(velocity_hat, grid)
+    return helmholtz_project_spectral(velocity_hat, ks)
+end
+
+function helmholtz_project_spectral(u_hat::AbstractMatrix, v_hat::AbstractMatrix, grid::StructuredGrid{2,<:CartesianGeometry}; kwargs...)
+    velocity_hat = _stack_spectral(u_hat, v_hat)
+    return helmholtz_project_spectral(velocity_hat, grid)
+end
+
+function _stack_spectral(comps::Vararg{AbstractArray{<:Complex},M}) where {M}
+    sz = size(comps[1])
+    out = Array{eltype(comps[1])}(undef, sz..., M)
+    N = length(sz)
+    for c in 1:M
+        copyto!(_component(out, c, Val(N)), comps[c])
+    end
+    return out
+end
+
+"""
+    _grid_wavenumbers(velocity_hat, grid) -> NTuple{N}
+
+Reconstruct the per-axis angular wavenumber vectors for a component-last spectral array
+on a Cartesian grid. Axis 1 is treated as an `rfft` axis when its spectral length equals
+`N₁÷2 + 1`, otherwise as a full `fft` axis.
+"""
+function _grid_wavenumbers(velocity_hat::AbstractArray{<:Complex}, grid::StructuredGrid{N,<:CartesianGeometry{N,T}}) where {N,T}
+    dims = size_tuple(grid)
+    spacing = grid.geometry.spacing
+    kdims = size(velocity_hat)[1:N]
+    return ntuple(Val(N)) do d
+        Nd = dims[d]
+        L = Nd * spacing[d]
+        if d == 1 && kdims[1] == Nd ÷ 2 + 1
+            T[T(2π) * (i - 1) / L for i in 1:kdims[1]]
+        else
+            T[T(2π) * (i - 1 <= Nd ÷ 2 ? i - 1 : i - 1 - Nd) / L for i in 1:kdims[d]]
+        end
+    end
 end
 
 # ---------------------------------------------------------------------------
-# Unified physical-input spectral entry points and geometry dispatch
+# Unified physical-input entry points and geometry dispatch
 # ---------------------------------------------------------------------------
 
 """
-    helmholtz_decompose_spectral(u, v, grid; kwargs...)
+    helmholtz_decompose_spectral(u, grid; output=:physical, kwargs...)
+    helmholtz_decompose_spectral(u, v, grid; kwargs...)        # 2D convenience
+    helmholtz_decompose_spectral(u, v, w, grid; kwargs...)     # 3D convenience
 
-Decompose a physical velocity field `(u, v)` on the given `grid` spectrally,
-returning the spectral coefficients (either Fourier coefficients `SpectralCartesianResult`
-or Spherical Harmonic coefficients `SpectralSphericalResult`).
+Decompose a physical velocity field on `grid` using a spectral transform. Requires the
+appropriate extension to be loaded (`using FFTW`, `using FastSphericalHarmonics`, …).
 
-Requires the appropriate spectral solver extension to be loaded (e.g. `using FFTW`,
-`using FastSphericalHarmonics`, etc.).
+`output` selects what the extension returns: `:physical` (a [`HelmholtzResult`](@ref)),
+`:coefficients` (the spectral result type), or `:both`.
 """
-function helmholtz_decompose_spectral(u, v, grid::AbstractGrid; kwargs...)
-    return _decompose_spectral(grid.geometry, u, v, grid; kwargs...)
+function helmholtz_decompose_spectral(u::AbstractArray, grid::AbstractGrid; kwargs...)
+    return _decompose_spectral(grid.geometry, u, grid; kwargs...)
 end
 
-# Hook implemented by geometry/solver extensions
+function helmholtz_decompose_spectral(u::AbstractArray{<:Any,N}, v::AbstractArray{<:Any,N}, grid::AbstractGrid; kwargs...) where {N}
+    return _decompose_spectral(grid.geometry, _stack_components(grid, u, v), grid; kwargs...)
+end
+
+function helmholtz_decompose_spectral(u::AbstractArray{<:Any,N}, v::AbstractArray{<:Any,N}, w::AbstractArray{<:Any,N}, grid::AbstractGrid; kwargs...) where {N}
+    return _decompose_spectral(grid.geometry, _stack_components(grid, u, v, w), grid; kwargs...)
+end
+
+# Hook implemented by geometry/solver extensions.
 function _decompose_spectral end
 
 """
-    helmholtz_project_spectral!(û_rot, û_div, velocity_hat, ks::Tuple)
+    build_cartesian_result(grid, U, velocity_hat, ks, inverse) -> HelmholtzResult
 
-In-place Cartesian spectral projection. Decomposes the spectral velocity field
-`velocity_hat` along the wavenumbers `ks`, writing the rotational component into `û_rot`
-and the divergent component into `û_div`.
+Assemble a complete physical [`HelmholtzResult`](@ref) from a component-last spectral
+velocity array. `inverse(spectral_scalar)` must map a single spectral scalar field
+(`(kdims...)`) back to a physical scalar field (`(dims...)`). All decomposition fields
+(rotational/divergent/harmonic velocity, potentials, vorticity, divergence) are computed
+spectrally and inverse-transformed. Used by the regular-grid spectral extensions (FFTW).
 """
-function helmholtz_project_spectral!(û_rot, û_div, velocity_hat, ks::Tuple)
-    T = real(eltype(velocity_hat))
-    kx_2d = reshape(T.(ks[1]), :, 1)
-    ky_2d = reshape(T.(ks[2]), 1, :)
+function build_cartesian_result(grid::StructuredGrid{N,<:CartesianGeometry,T}, U, velocity_hat, ks::NTuple{N,Any}, inverse) where {N,T}
+    proj = helmholtz_project_spectral(velocity_hat, ks)
+    χ_hat, R_hat = helmholtz_potentials_spectral(velocity_hat, ks)
 
-    k2 = @. kx_2d^2 + ky_2d^2
-    inv_k2 = @. ifelse(k2 == zero(T), zero(T), one(T) / k2)
+    # δ_hat = i k·û ; W_hat_ab = i(k_a û_b − k_b û_a)
+    K = ntuple(d -> _reshape_k(T.(ks[d]), d, Val(N)), Val(N))
+    comp(A, c) = _component(A, c, Val(N))
+    δ_hat = K[1] .* comp(velocity_hat, 1)
+    for b in 2:N
+        δ_hat = δ_hat .+ K[b] .* comp(velocity_hat, b)
+    end
+    δ_hat = δ_hat .* im
 
-    u_hat = @view velocity_hat[:, :, 1]
-    v_hat = @view velocity_hat[:, :, 2]
+    _inv_components(spec, M) = begin
+        out = nothing
+        for c in 1:M
+            phys = inverse(comp(spec, c))
+            if out === nothing
+                out = Array{eltype(phys),N + 1}(undef, size(phys)..., M)
+            end
+            copyto!(_component(out, c, Val(N)), phys)
+        end
+        out
+    end
 
-    u_rot = @view û_rot[:, :, 1]
-    v_rot = @view û_rot[:, :, 2]
+    P = n_rotation_components(N)
+    u_rot = _inv_components(proj.u_rot, N)
+    u_div = _inv_components(proj.u_div, N)
+    χ = inverse(χ_hat)
+    Rpot = P == 0 ? Array{T,N + 1}(undef, size_tuple(grid)..., 0) : _inv_components(R_hat, P)
+    divergence = inverse(δ_hat)
 
-    u_div = @view û_div[:, :, 1]
-    v_div = @view û_div[:, :, 2]
+    # Rotation tensor components in spectral space then inverse.
+    vorticity = if P == 0
+        Array{T,N + 1}(undef, size_tuple(grid)..., 0)
+    else
+        W_hat = similar(R_hat)
+        for (p, (a, b)) in enumerate(rotation_pairs(Val(N)))
+            Wp = comp(W_hat, p)
+            ûa = comp(velocity_hat, a)
+            ûb = comp(velocity_hat, b)
+            @. Wp = im * (K[a] * ûb - K[b] * ûa)
+        end
+        _inv_components(W_hat, P)
+    end
 
-    @. u_rot = (-kx_2d * ky_2d * v_hat + ky_2d^2 * u_hat) * inv_k2
-    @. v_rot = (kx_2d^2 * v_hat - kx_2d * ky_2d * u_hat) * inv_k2
-    @. u_div = (kx_2d^2 * u_hat + kx_2d * ky_2d * v_hat) * inv_k2
-    @. v_div = (kx_2d * ky_2d * u_hat + ky_2d^2 * v_hat) * inv_k2
-
-    return nothing
+    u_harm = similar(u_rot)
+    @. u_harm = U - u_rot - u_div
+    hfrac = _velocity_norm(u_harm, grid) / max(_velocity_norm(U, grid), eps(T))
+    ok = SolverResult{T}(true, 1, zero(T))
+    return HelmholtzResult{N,T,typeof(u_rot),typeof(χ)}(
+        u_rot, u_div, u_harm, χ, Rpot, vorticity, divergence, hfrac, ok, [ok for _ in 1:P],
+    )
 end

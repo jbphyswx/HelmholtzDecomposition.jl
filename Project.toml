@@ -24,6 +24,13 @@ HelmholtzDecompositionFINUFFTExt = ["FINUFFT"]
 HelmholtzDecompositionFSHExt = ["FastSphericalHarmonics"]
 HelmholtzDecompositionNUSHTExt = ["NUFSHT"]
 
+[extras]
+NUFSHT = "e99b67a3-9706-455a-90e2-85b195a33206"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["NUFSHT", "Test"]
+
 [compat]
 CairoMakie = "0.15"
 FFTW = "1"
@@ -32,5 +39,10 @@ FastSphericalHarmonics = "1"
 LinearAlgebra = "1"
 NUFSHT = "0.1"
 StaticArrays = "1.9"
-julia = "1.9"
+Test = "1"
+# Floor is 1.11: the package uses Project.toml `[sources]` + `[workspace]` (both added in
+# Julia 1.11) to pull in the as-yet-unregistered NUFSHT.jl.
+julia = "1.11"
 
+[sources]
+NUFSHT = { url = "https://github.com/jbphyswx/NUFSHT.jl.git" }

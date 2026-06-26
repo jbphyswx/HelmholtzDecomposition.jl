@@ -41,6 +41,7 @@ module HelmholtzDecomposition
 
 include("Geometry.jl")
 include("Grids.jl")
+include("Operators.jl")
 include("Solvers.jl")
 include("Decomposition.jl")
 include("Spectral.jl")
@@ -51,6 +52,6 @@ function plot_decomposition end
 export plot_decomposition
 
 export AbstractSpectralHelmholtzResult, SpectralCartesianResult, SpectralSphericalResult
-export helmholtz_decompose_spectral, helmholtz_project_spectral!
+export helmholtz_decompose_spectral, helmholtz_project_spectral, helmholtz_project_spectral!
 
 end # module HelmholtzDecomposition
