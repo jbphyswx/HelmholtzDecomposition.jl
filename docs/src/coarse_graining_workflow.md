@@ -61,7 +61,7 @@ result = HelmholtzDecomposition.helmholtz_decompose(u, v, grid)
 
 # Step 2: Filter the scalar potentials
 # (CoarseGrainingEnergyFluxes provides the filtering machinery)
-ψ_bar = filter_scalar(result.ψ, grid, ℓ)
+ψ_bar = filter_scalar(HelmholtzDecomposition.streamfunction(result), grid, ℓ)
 χ_bar = filter_scalar(result.χ, grid, ℓ)
 
 # Step 3: Compute energy flux from filtered Helmholtz scalars
