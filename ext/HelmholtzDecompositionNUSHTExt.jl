@@ -91,6 +91,25 @@ function HD._decompose_spectral(
     return HD.helmholtz_decompose(U, grid; solver = solver)
 end
 
+# Genuinely scattered spherical points: blocked on upstream NUFSHT primitives. Erroring
+# clearly rather than returning a quasi-uniform approximation that pretends to be exact.
+function HD._decompose_spectral(
+    ::SphericalNUSHTSolver,
+    ::HD.SphericalGeometry,
+    ::AbstractArray,
+    ::HD.ScatteredPoints;
+    kwargs...,
+)
+    throw(ArgumentError("""
+    Accurate Helmholtz decomposition of a velocity field at genuinely scattered points on the
+    sphere is not yet supported. It requires two primitives NUFSHT does not yet expose:
+    (1) vector / spin-weighted (∂θ) spherical-harmonic synthesis to relate the velocity field
+    to the scalar potentials without a finite-difference stencil, and (2) its true scattered
+    Euclidean adjoint (used privately by `nusht_solve!`) to form a correct least-squares solve.
+    Scattered *Cartesian* points (FINUFFT) are fully supported; structured spherical grids use
+    `StructuredGrid`. Tracking: this needs the NUFSHT spin-1 / adjoint feature."""))
+end
+
 function __init__()
     HD.register_spectral_solver!(:spherical_irregular, SphericalNUSHTSolver)
 end

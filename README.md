@@ -115,6 +115,25 @@ res_gpu = HD.helmholtz_decompose_spectral(CUDA.cu(U), grid)
 results = HD.helmholtz_decompose_batch(grid, fields; backend = HD.ThreadedBackend())
 ```
 
+### Scattered / unstructured data
+
+For data sampled at arbitrary point locations (not a grid — observation networks, floats,
+tracks), use `ScatteredPoints`. It routes through the non-uniform transforms: an accurate
+inverse NUFFT (conjugate-gradient least-squares, not the naive adjoint) → exact Leray
+projection → synthesis back to the points.
+
+```julia
+using FINUFFT: FINUFFT
+pts = HD.ScatteredPoints(HD.CartesianGeometry(1.0, 1.0), X; box = (Lx, Ly))   # X is (M, 2)
+res = HD.helmholtz_decompose_spectral(U, pts)   # U is (M, 2) → (; u_rot, u_div, u_harm)
+```
+
+Scattered **Cartesian** (FINUFFT) is fully supported and accurate for arbitrary point sets.
+Scattered **spherical** (NUFSHT) is not yet available — it needs vector/spin-weighted
+spherical-harmonic synthesis and a public scattered adjoint from NUFSHT (tracked upstream);
+it raises a clear error rather than returning an approximation. Structured spherical grids
+are fully supported.
+
 ### Multiply-connected domains (the harmonic part)
 
 ```julia

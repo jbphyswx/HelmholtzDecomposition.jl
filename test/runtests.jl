@@ -309,6 +309,11 @@ relnorm(x) = sqrt(sum(abs2, x))
         res3 = HD.helmholtz_decompose_spectral(U3, pts; solver = solver)
         @test maximum(abs.(res3.u_rot .+ res3.u_div .+ res3.u_harm .- U3)) < 1e-8
         @test relnorm(res3.u_rot) > 1 && relnorm(res3.u_div) > 1
+
+        # Scattered spherical is not yet supported and must error clearly (not fake a result).
+        spts = HD.ScatteredPoints(HD.SphericalGeometry(1.0), 2π .* rand(50), (rand(50) .- 0.5))
+        nusht = HD._SPECTRAL_SOLVERS[:spherical_irregular](16, 1e-8)
+        @test_throws ArgumentError HD.helmholtz_decompose_spectral(zeros(50, 2), spts; solver = nusht)
     end
 
     @testset "Batch decomposition (serial/threaded/distributed)" begin
