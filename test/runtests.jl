@@ -5,6 +5,8 @@ using Statistics: Statistics
 using Random: Random
 using LinearAlgebra: LinearAlgebra
 using FFTW: FFTW
+using OhMyThreads: OhMyThreads
+using Distributed: Distributed
 
 # Component-last helpers for tests.
 comp(A, c) = selectdim(A, ndims(A), c)
@@ -237,6 +239,40 @@ relnorm(x) = sqrt(sum(abs2, x))
         grid = HD.StructuredGrid(HD.CartesianGeometry(0.1, 0.1),
             collect(0.0:0.1:1.5), collect(0.0:0.1:1.5); mask = mask)
         @test HD._resolve_auto_solver(grid) isa HD.SORSolver
+    end
+
+    @testset "Batch decomposition (serial/threaded/distributed)" begin
+        grid = HD.StructuredGrid(HD.CartesianGeometry(0.05, 0.05),
+            collect(range(0.05, 0.95, length = 19)), collect(range(0.05, 0.95, length = 19)))
+        mkfield(s) = begin
+            U = zeros(19, 19, 2)
+            for j in 1:19, i in 1:19
+                U[i, j, 1] = -π * s * sin(π * (0.05i)) * cos(π * (0.05j))
+                U[i, j, 2] = π * s * cos(π * (0.05i)) * sin(π * (0.05j))
+            end
+            U
+        end
+        fields = [mkfield(s) for s in (1.0, 2.0, 0.5, 1.5)]
+        solver = HD.SORSolver(; max_iter = 3_000, tol = 1e-8, boundary = :dirichlet)
+        kw = (; solver = solver, boundary_χ = :dirichlet, boundary_ψ = :dirichlet)
+
+        serial = HD.helmholtz_decompose_batch(grid, fields; kw...)
+        @test length(serial) == 4
+        @test serial[2].u_rot == HD.helmholtz_decompose(fields[2], grid; kw...).u_rot
+
+        # Threaded (OhMyThreads ext) reproduces the serial batch.
+        threaded = HD.helmholtz_decompose_batch(grid, fields; backend = HD.ThreadedBackend(), kw...)
+        @test all(threaded[i].u_rot == serial[i].u_rot for i in 1:4)
+
+        # Distributed (Distributed ext) reproduces the serial batch.
+        Distributed.addprocs(2)
+        try
+            Distributed.@everywhere using HelmholtzDecomposition
+            dist = HD.helmholtz_decompose_batch(grid, fields; backend = HD.DistributedBackend(), kw...)
+            @test all(dist[i].u_rot == serial[i].u_rot for i in 1:4)
+        finally
+            Distributed.rmprocs(Distributed.workers())
+        end
     end
 
     @testset "TestFields generation" begin

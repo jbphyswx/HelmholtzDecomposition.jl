@@ -24,7 +24,7 @@ which is the package's reason for existing.
 - Bhatia et al. (2013): The Helmholtz-Hodge Decomposition — A Survey.
 """
 
-export HelmholtzResult, helmholtz_decompose!, helmholtz_decompose
+export HelmholtzResult, helmholtz_decompose!, helmholtz_decompose, helmholtz_decompose_batch
 export streamfunction, velocity_potential, vector_potential
 
 """
@@ -172,6 +172,27 @@ end
 function helmholtz_decompose(u::AbstractArray{<:Any,N}, v::AbstractArray{<:Any,N}, w::AbstractArray{<:Any,N}, grid::StructuredGrid{N}; kwargs...) where {N}
     U = _stack_components(grid, u, v, w)
     return helmholtz_decompose(U, grid; kwargs...)
+end
+
+"""
+    helmholtz_decompose_batch(grid, fields; backend=AutoBackend(), kwargs...) -> Vector{HelmholtzResult}
+
+Decompose a collection of velocity fields on the same `grid` (each a component-last array
+of size `(dims..., N)`). This is the natural unit of parallelism for coarse-graining
+workflows — many independent snapshots — and is parallelized by the execution backend:
+`ThreadedBackend` (OhMyThreads ext), `DistributedBackend` (Distributed ext), and
+`MPIBackend` (MPI ext) each spread the batch across their workers; `SerialBackend` maps
+sequentially. Results are returned in input order.
+"""
+function helmholtz_decompose_batch(grid::StructuredGrid, fields; backend::AbstractExecutionBackend = AutoBackend(), kwargs...)
+    b = isempty(fields) ? SerialBackend() : _resolve_backend(backend, first(fields))
+    return _decompose_batch(b, grid, fields; kwargs...)
+end
+
+# Default (serial / GPU — arrays carry compute): sequential map. Threaded/Distributed/MPI
+# extensions specialize this.
+function _decompose_batch(::AbstractExecutionBackend, grid::StructuredGrid, fields; kwargs...)
+    return [helmholtz_decompose(f, grid; backend = SerialBackend(), kwargs...) for f in fields]
 end
 
 function _stack_components(grid::StructuredGrid{N,G,T}, comps::Vararg{AbstractArray,M}) where {N,G,T,M}
