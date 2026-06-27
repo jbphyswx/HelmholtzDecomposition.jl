@@ -39,9 +39,18 @@ result = HelmholtzDecomposition.helmholtz_decompose(u, v, grid)
 """
 module HelmholtzDecomposition
 
+include("Backends.jl")
+using .Backends: Backends, AbstractExecutionBackend, SerialBackend, ThreadedBackend,
+    GPUBackend, AutoBackend, DistributedBackend, MPIBackend, local_backend, is_distributed
+export AbstractExecutionBackend, SerialBackend, ThreadedBackend, GPUBackend, AutoBackend
+export DistributedBackend, MPIBackend, local_backend, is_distributed
+
 include("Geometry.jl")
 include("Grids.jl")
+include("Operators.jl")
+include("Topology.jl")
 include("Solvers.jl")
+include("Scattered.jl")
 include("Decomposition.jl")
 include("Spectral.jl")
 include("TestFields.jl")
@@ -51,6 +60,6 @@ function plot_decomposition end
 export plot_decomposition
 
 export AbstractSpectralHelmholtzResult, SpectralCartesianResult, SpectralSphericalResult
-export helmholtz_decompose_spectral, helmholtz_project_spectral!
+export helmholtz_decompose_spectral, helmholtz_project_spectral, helmholtz_project_spectral!
 
 end # module HelmholtzDecomposition

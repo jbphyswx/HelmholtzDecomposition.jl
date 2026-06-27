@@ -1,39 +1,35 @@
 """
 Cartesian Pure Rotational Field (Taylor-Green Vortex)
 
-Demonstrates that a purely rotational field is correctly identified:
-the divergent component should be ≈ 0.
+A purely rotational field should decompose with a near-zero divergent component.
+Uses the FFTW spectral path (periodic Cartesian grid).
 """
 
-using HelmholtzDecomposition: HelmholtzDecomposition
+using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using FFTW: FFTW
 using Statistics: Statistics
 
-# Setup grid
+speed(U) = sqrt.(U[:, :, 1] .^ 2 .+ U[:, :, 2] .^ 2)
+
 N = 64
 L = 1.0
 dx = L / N
-geom = HelmholtzDecomposition.CartesianGeometry(dx, dx)
-xs = collect(range(0.0, L - dx, length=N))
-ys = collect(range(0.0, L - dx, length=N))
-grid = HelmholtzDecomposition.StructuredGrid(geom, xs, ys)
+grid = HD.StructuredGrid(HD.CartesianGeometry(dx, dx),
+    collect(range(0.0, L - dx, length = N)), collect(range(0.0, L - dx, length = N)))
 
-# Generate Taylor-Green vortex (purely rotational)
-u, v, u_rot_exact, v_rot_exact, u_div_exact, v_div_exact =
-    HelmholtzDecomposition.taylor_green_vortex(grid)
+u, v, = HD.taylor_green_vortex(grid)
+U = cat(u, v; dims = 3)
 
-# Decompose
-result = HelmholtzDecomposition.helmholtz_decompose(u, v, grid)
+# Spectral decomposition → physical HelmholtzResult.
+result = HD.helmholtz_decompose_spectral(u, v, grid)
 
-# Verify
-div_mag = Statistics.mean(sqrt.(result.u_div.^2 .+ result.v_div.^2))
-rot_mag = Statistics.mean(sqrt.(result.u_rot.^2 .+ result.v_rot.^2))
-recon_err = maximum(abs.(result.u_rot .+ result.u_div .- u))
+rot_mag = Statistics.mean(speed(result.u_rot))
+div_mag = Statistics.mean(speed(result.u_div))
+recon_err = maximum(abs.(result.u_rot .+ result.u_div .+ result.u_harm .- U))
 
-println("=== Cartesian Pure Rotational (Taylor-Green) ===")
-println("Mean |u_rot|: $(round(rot_mag, sigdigits=4))")
-println("Mean |u_div|: $(round(div_mag, sigdigits=4))  (should be ≈ 0)")
-println("Div/Rot ratio: $(round(div_mag/rot_mag, sigdigits=4))")
-println("Reconstruction error: $(round(recon_err, sigdigits=4))")
-println("ψ solve converged: $(result.ψ_solve.converged) ($(result.ψ_solve.iterations) iters)")
-println("χ solve converged: $(result.χ_solve.converged) ($(result.χ_solve.iterations) iters)")
+println("=== Cartesian Pure Rotational (Taylor-Green), FFTW spectral ===")
+println("Mean |u_rot|:          $(round(rot_mag, sigdigits = 4))")
+println("Mean |u_div|:          $(round(div_mag, sigdigits = 4))  (should be ≈ 0)")
+println("Div/Rot ratio:         $(round(div_mag / rot_mag, sigdigits = 4))")
+println("Reconstruction error:  $(round(recon_err, sigdigits = 4))")
+println("Harmonic fraction:     $(round(result.harmonic_fraction, sigdigits = 4))")

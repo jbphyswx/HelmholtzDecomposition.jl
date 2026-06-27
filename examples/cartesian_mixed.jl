@@ -1,40 +1,33 @@
 """
 Cartesian Mixed Rotational + Divergent Field
 
-Demonstrates decomposition of a field with both rotational and divergent components.
-Verifies that reconstruction u_rot + u_div ≈ u.
+Decomposition of a field with both rotational and divergent components, verifying that
+`u_rot + u_div + u_harm ≈ u`. Uses the FFTW spectral path.
 """
 
-using HelmholtzDecomposition: HelmholtzDecomposition
+using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using FFTW: FFTW
 using Statistics: Statistics
 
-# Setup grid
+speed(U) = sqrt.(U[:, :, 1] .^ 2 .+ U[:, :, 2] .^ 2)
+
 N = 64
 L = 1.0
 dx = L / N
-geom = HelmholtzDecomposition.CartesianGeometry(dx, dx)
-xs = collect(range(0.0, L - dx, length=N))
-ys = collect(range(0.0, L - dx, length=N))
-grid = HelmholtzDecomposition.StructuredGrid(geom, xs, ys)
+grid = HD.StructuredGrid(HD.CartesianGeometry(dx, dx),
+    collect(range(0.0, L - dx, length = N)), collect(range(0.0, L - dx, length = N)))
 
-# Generate mixed field
-u, v, u_rot_exact, v_rot_exact, u_div_exact, v_div_exact =
-    HelmholtzDecomposition.rankine_vortex_with_source(grid)
+u, v, = HD.rankine_vortex_with_source(grid)
+U = cat(u, v; dims = 3)
 
-# Decompose
-result = HelmholtzDecomposition.helmholtz_decompose(u, v, grid)
+result = HD.helmholtz_decompose_spectral(u, v, grid)
 
-# Verify
-rot_mag = Statistics.mean(sqrt.(result.u_rot.^2 .+ result.v_rot.^2))
-div_mag = Statistics.mean(sqrt.(result.u_div.^2 .+ result.v_div.^2))
-recon_err_u = maximum(abs.(result.u_rot .+ result.u_div .- u))
-recon_err_v = maximum(abs.(result.v_rot .+ result.v_div .- v))
+rot_mag = Statistics.mean(speed(result.u_rot))
+div_mag = Statistics.mean(speed(result.u_div))
+recon_err = maximum(abs.(result.u_rot .+ result.u_div .+ result.u_harm .- U))
 
-println("=== Cartesian Mixed Field ===")
-println("Mean |u_rot|: $(round(rot_mag, sigdigits=4))")
-println("Mean |u_div|: $(round(div_mag, sigdigits=4))")
-println("Reconstruction error (u): $(round(recon_err_u, sigdigits=4))")
-println("Reconstruction error (v): $(round(recon_err_v, sigdigits=4))")
-println("ψ solve: $(result.ψ_solve.converged), $(result.ψ_solve.iterations) iters")
-println("χ solve: $(result.χ_solve.converged), $(result.χ_solve.iterations) iters")
+println("=== Cartesian Mixed Field, FFTW spectral ===")
+println("Mean |u_rot|:          $(round(rot_mag, sigdigits = 4))")
+println("Mean |u_div|:          $(round(div_mag, sigdigits = 4))")
+println("Reconstruction error:  $(round(recon_err, sigdigits = 4))")
+println("Both components non-negligible: $(rot_mag > 0.01 && div_mag > 0.01)")

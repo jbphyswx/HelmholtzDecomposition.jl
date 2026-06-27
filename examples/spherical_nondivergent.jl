@@ -1,39 +1,34 @@
 """
 Spherical Non-divergent Field (Rossby Wave)
 
-Demonstrates Helmholtz decomposition on a spherical grid with a purely
-rotational field. The divergent component should be ≈ 0.
-
-Note: Without a spectral spherical extension (FastSphericalHarmonics or NUFSHT),
-this will fall back to SOR which may be slow.
+Helmholtz decomposition on a spherical grid with a purely rotational field; the divergent
+component should be ≈ 0. Uses the SOR solver (load `FastSphericalHarmonics` or `NUFSHT`
+for an O(N log N) spectral solve).
 """
 
-using HelmholtzDecomposition: HelmholtzDecomposition
+using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using Statistics: Statistics
 
-# Setup spherical grid (unit sphere for simplicity)
-geom = HelmholtzDecomposition.SphericalGeometry(1.0)
+speed(U) = sqrt.(U[:, :, 1] .^ 2 .+ U[:, :, 2] .^ 2)
+
 Nlon = 72
 Nlat = 36
-lons = collect(range(0.0, 2π - 2π/Nlon, length=Nlon))
-lats = collect(range(-π/3, π/3, length=Nlat))
-grid = HelmholtzDecomposition.StructuredGrid(geom, lons, lats)
+grid = HD.StructuredGrid(HD.SphericalGeometry(1.0),
+    collect(range(0.0, 2π - 2π / Nlon, length = Nlon)), collect(range(-π / 3, π / 3, length = Nlat)))
 
-# Generate Rossby wave (purely rotational)
-u, v, u_rot_exact, v_rot_exact, u_div_exact, v_div_exact =
-    HelmholtzDecomposition.rossby_wave(grid)
+u, v, = HD.rossby_wave(grid)
+U = cat(u, v; dims = 3)
 
-# Decompose (will use SOR fallback without spherical spectral extension)
-solver = HelmholtzDecomposition.SORSolver(; max_iter=20_000, tol=1e-6)
-result = HelmholtzDecomposition.helmholtz_decompose(u, v, grid; solver=solver)
+solver = HD.SORSolver(; max_iter = 20_000, tol = 1e-6, boundary = HD.Dirichlet())
+result = HD.helmholtz_decompose(u, v, grid; solver = solver, boundary_χ = HD.Neumann(), boundary_ψ = HD.Dirichlet())
 
-# Verify
-div_mag = Statistics.mean(sqrt.(result.u_div.^2 .+ result.v_div.^2))
-rot_mag = Statistics.mean(sqrt.(result.u_rot.^2 .+ result.v_rot.^2))
+rot_mag = Statistics.mean(speed(result.u_rot))
+div_mag = Statistics.mean(speed(result.u_div))
 
-println("=== Spherical Non-divergent (Rossby Wave) ===")
-println("Mean |u_rot|: $(round(rot_mag, sigdigits=4))")
-println("Mean |u_div|: $(round(div_mag, sigdigits=4))  (should be ≈ 0)")
-println("Div/Rot ratio: $(round(div_mag/rot_mag, sigdigits=4))")
-println("ψ solve: $(result.ψ_solve.converged), $(result.ψ_solve.iterations) iters, res=$(round(result.ψ_solve.residual, sigdigits=3))")
-println("χ solve: $(result.χ_solve.converged), $(result.χ_solve.iterations) iters, res=$(round(result.χ_solve.residual, sigdigits=3))")
+println("=== Spherical Non-divergent (Rossby Wave), SOR ===")
+println("Mean |u_rot|:        $(round(rot_mag, sigdigits = 4))")
+println("Mean |u_div|:        $(round(div_mag, sigdigits = 4))  (should be ≈ 0)")
+println("Div/Rot ratio:       $(round(div_mag / rot_mag, sigdigits = 4))")
+println("Harmonic fraction:   $(round(result.harmonic_fraction, sigdigits = 4))")
+println("χ solve: converged=$(result.χ_solve.converged), $(result.χ_solve.iterations) iters")
+println("ψ solve: converged=$(result.rot_solve[1].converged), $(result.rot_solve[1].iterations) iters")

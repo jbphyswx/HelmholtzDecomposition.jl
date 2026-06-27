@@ -1,79 +1,82 @@
 """
-    HelmholtzDecompositionFFTWExt — CartesianSpectralSolver via FFTW.
+    HelmholtzDecompositionFFTWExt — Cartesian spectral solver via FFTW (any dimension).
 
-Provides O(N log N) spectral Poisson solve for regular periodic Cartesian grids
-using 2D FFT: forward FFT → divide by -(kx²+ky²) → inverse FFT.
+Provides `O(N log N)` spectral Poisson solves and full Helmholtz decomposition for regular
+periodic Cartesian grids in 1D/2D/3D/ND using the real FFT: forward `rfft` → divide by
+`-Σ k_d²` → inverse `irfft`. Returns physical-space fields via `build_cartesian_result`.
 """
 module HelmholtzDecompositionFFTWExt
 
-using HelmholtzDecomposition: HelmholtzDecomposition
+using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using FFTW: FFTW
 
 """
-    CartesianSpectralSolver <: HelmholtzDecomposition.AbstractPoissonSolver
+    CartesianSpectralSolver <: AbstractPoissonSolver
 
-Spectral Poisson solver for regular periodic Cartesian grids using FFTW.
-
-Solves ∇²Φ = RHS by:
-1. Forward 2D FFT of RHS → R̂(kx, ky)
-2. Divide: Φ̂ = R̂ / (kx² + ky²)  (skip k=0 mode)
-3. Inverse FFT → Φ
-
-O(N log N) — vastly faster than SOR for large grids.
+Spectral Poisson solver for regular periodic Cartesian grids (any dimension) using FFTW.
 """
-struct CartesianSpectralSolver <: HelmholtzDecomposition.AbstractPoissonSolver end
+struct CartesianSpectralSolver <: HD.AbstractPoissonSolver end
 
-function HelmholtzDecomposition.solve_poisson!(
-    Φ::AbstractMatrix{T},
-    RHS::AbstractMatrix{T},
-    grid::HelmholtzDecomposition.StructuredGrid{G,T},
-    ::CartesianSpectralSolver;
-    kwargs...
-) where {T<:AbstractFloat, G<:HelmholtzDecomposition.CartesianGeometry{T}}
-    Nx, Ny = HelmholtzDecomposition.size_tuple(grid)
-    dx = grid.geometry.dx
-    dy = grid.geometry.dy
-
-    # Forward FFT of RHS
-    RHS_hat = FFTW.rfft(RHS)
-
-    # Wavenumber arrays
-    kx = T(2π) .* FFTW.rfftfreq(Nx, one(T) / dx)
-    ky = T(2π) .* FFTW.fftfreq(Ny, one(T) / dy)
-
-    # Divide by -(kx² + ky²), skip k=0
-    Φ_hat = similar(RHS_hat)
-    for j in 1:length(ky)
-        for i in 1:length(kx)
-            k2 = kx[i]^2 + ky[j]^2
-            if k2 ≈ zero(T)
-                Φ_hat[i, j] = zero(eltype(RHS_hat))
-            else
-                Φ_hat[i, j] = RHS_hat[i, j] / (-k2)
-            end
+# Per-axis angular wavenumbers matching an rfft layout (axis 1 reduced).
+function _rfft_wavenumbers(::Type{T}, dims::NTuple{N,Int}, spacing::NTuple{N,T}) where {T,N}
+    return ntuple(Val(N)) do d
+        if d == 1
+            T(2π) .* FFTW.rfftfreq(dims[1], one(T) / spacing[1])
+        else
+            T(2π) .* FFTW.fftfreq(dims[d], one(T) / spacing[d])
         end
     end
-
-    # Inverse FFT
-    Φ .= FFTW.irfft(Φ_hat, Nx)
-
-    return HelmholtzDecomposition.SolverResult{T}(true, 1, zero(T))
 end
 
-function HelmholtzDecomposition._decompose_spectral(
-    ::HelmholtzDecomposition.CartesianGeometry,
-    u::AbstractMatrix,
-    v::AbstractMatrix,
-    grid::HelmholtzDecomposition.StructuredGrid;
-    kwargs...
-)
-    u_hat = FFTW.rfft(u)
-    v_hat = FFTW.rfft(v)
-    return HelmholtzDecomposition.helmholtz_project_spectral(u_hat, v_hat, grid; kwargs...)
+function HD.solve_poisson!(
+    Φ::AbstractArray{T,N},
+    RHS::AbstractArray{T,N},
+    grid::HD.StructuredGrid{N,<:HD.CartesianGeometry{N,T}},
+    ::CartesianSpectralSolver;
+    kwargs...,
+) where {T<:AbstractFloat,N}
+    dims = HD.size_tuple(grid)
+    spacing = grid.geometry.spacing
+    RHS_hat = FFTW.rfft(RHS)
+    ks = _rfft_wavenumbers(T, dims, spacing)
+    K = ntuple(d -> reshape(ks[d], ntuple(i -> i == d ? length(ks[d]) : 1, Val(N))), Val(N))
+    k2 = K[1] .^ 2
+    for d in 2:N
+        k2 = k2 .+ K[d] .^ 2
+    end
+    @. RHS_hat = ifelse(k2 == zero(T), zero(eltype(RHS_hat)), RHS_hat / (-k2))
+    Φ .= FFTW.irfft(RHS_hat, dims[1])
+    return HD.SolverResult{T}(true, 1, zero(T))
+end
+
+function HD._decompose_spectral(
+    ::CartesianSpectralSolver,
+    ::HD.CartesianGeometry,
+    U::AbstractArray{T,M},
+    grid::HD.StructuredGrid{N,<:HD.CartesianGeometry{N,T}};
+    kwargs...,
+) where {T,M,N}
+    dims = HD.size_tuple(grid)
+    spacing = grid.geometry.spacing
+    ks = _rfft_wavenumbers(T, dims, spacing)
+
+    # Forward transform each velocity component → component-last spectral array.
+    velocity_hat = nothing
+    for c in 1:N
+        ĉ = FFTW.rfft(HD._component(U, c, Val(N)))
+        if velocity_hat === nothing
+            velocity_hat = Array{eltype(ĉ),N + 1}(undef, size(ĉ)..., N)
+        end
+        copyto!(HD._component(velocity_hat, c, Val(N)), ĉ)
+    end
+
+    # Fully-spectral decomposition (exact derivatives) → physical HelmholtzResult.
+    inverse = x -> FFTW.irfft(x, dims[1])
+    return HD.build_cartesian_result(grid, U, velocity_hat, ks, inverse)
 end
 
 function __init__()
-    HelmholtzDecomposition.register_spectral_solver!(:cartesian_regular, CartesianSpectralSolver)
+    HD.register_spectral_solver!(:cartesian_regular, CartesianSpectralSolver)
 end
 
 end # module
