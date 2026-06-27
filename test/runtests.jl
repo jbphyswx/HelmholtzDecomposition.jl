@@ -310,10 +310,19 @@ relnorm(x) = sqrt(sum(abs2, x))
         @test maximum(abs.(res3.u_rot .+ res3.u_div .+ res3.u_harm .- U3)) < 1e-8
         @test relnorm(res3.u_rot) > 1 && relnorm(res3.u_div) > 1
 
-        # Scattered spherical is not yet supported and must error clearly (not fake a result).
-        spts = HD.ScatteredPoints(HD.SphericalGeometry(1.0), 2π .* rand(50), (rand(50) .- 0.5))
-        nusht = HD._SPECTRAL_SOLVERS[:spherical_irregular](16, 1e-8)
-        @test_throws ArgumentError HD.helmholtz_decompose_spectral(zeros(50, 2), spts; solver = nusht)
+        # Scattered spherical via NUFSHT spin-weighted transforms: a pure-rotational field
+        # decomposes with a near-zero divergent part.
+        Ms = 2000
+        λs = 2π .* rand(Ms); lats = 1.2 .* (2 .* rand(Ms) .- 1)
+        nn, mm = 3, 2
+        ues = [nn * cos(mm * λs[j]) * cos(lats[j])^(nn - 1) * sin(lats[j]) for j in 1:Ms]
+        uns = [-mm / cos(lats[j]) * sin(mm * λs[j]) * cos(lats[j])^nn for j in 1:Ms]
+        Us = hcat(ues, uns)
+        spts = HD.ScatteredPoints(HD.SphericalGeometry(1.0), λs, lats)
+        sphsolver = HD._SPECTRAL_SOLVERS[:spherical_irregular](28, 1e-10)
+        sres = HD.helmholtz_decompose_spectral(Us, spts; solver = sphsolver)
+        @test relnorm(sres.u_div) / relnorm(Us) < 0.05
+        @test maximum(abs.(sres.u_rot .+ sres.u_div .+ sres.u_harm .- Us)) < 1e-6
     end
 
     @testset "Batch decomposition (serial/threaded/distributed)" begin

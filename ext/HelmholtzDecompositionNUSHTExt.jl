@@ -91,23 +91,54 @@ function HD._decompose_spectral(
     return HD.helmholtz_decompose(U, grid; solver = solver)
 end
 
-# Genuinely scattered spherical points: blocked on upstream NUFSHT primitives. Erroring
-# clearly rather than returning a quasi-uniform approximation that pretends to be exact.
+# Genuinely scattered spherical points: vector Hodge/Helmholtz decomposition via NUFSHT's
+# spin-weighted (spin±1) scattered transforms. The complex tangent field V = u_θ + i u_φ is
+# spin-1; its E/B (gradient/curl) parts split the symmetric/antisymmetric combinations of the
+# spin(+1) and spin(−1) coefficients. Requires NUFSHT with spin support (make_spin_plan etc.).
 function HD._decompose_spectral(
-    ::SphericalNUSHTSolver,
+    solver::SphericalNUSHTSolver,
     ::HD.SphericalGeometry,
-    ::AbstractArray,
-    ::HD.ScatteredPoints;
+    U::AbstractMatrix,
+    pts::HD.ScatteredPoints{2,<:HD.SphericalGeometry};
+    rtol::Real = 1e-9,
+    maxiter::Int = 600,
     kwargs...,
 )
-    throw(ArgumentError("""
-    Accurate Helmholtz decomposition of a velocity field at genuinely scattered points on the
-    sphere is not yet supported. It requires two primitives NUFSHT does not yet expose:
-    (1) vector / spin-weighted (∂θ) spherical-harmonic synthesis to relate the velocity field
-    to the scalar potentials without a finite-difference stencil, and (2) its true scattered
-    Euclidean adjoint (used privately by `nusht_solve!`) to form a correct least-squares solve.
-    Scattered *Cartesian* points (FINUFFT) are fully supported; structured spherical grids use
-    `StructuredGrid`. Tracking: this needs the NUFSHT spin-1 / adjoint feature."""))
+    isdefined(NUFSHT, :make_spin_plan) || throw(ArgumentError(
+        "scattered-spherical decomposition needs NUFSHT spin support (make_spin_plan/nusht_solve_spin!); update NUFSHT."))
+    λ = collect(pts.coords[:, 1])
+    lat = collect(pts.coords[:, 2])
+    θ = (π / 2) .- lat                              # colatitude
+    uθ = -U[:, 2]                                   # θ̂ points south ⇒ u_θ = −u_north
+    uφ = U[:, 1]                                    # φ̂ points east  ⇒ u_φ = u_east
+    Vp = uθ .+ im .* uφ                             # spin +1
+    Vm = uθ .- im .* uφ                             # spin −1
+
+    lmax = solver.lmax
+    shp = (lmax + 1, 2lmax + 1)
+    planp = NUFSHT.make_spin_plan(θ, λ, lmax, +1; tol = solver.tol)
+    planm = NUFSHT.make_spin_plan(θ, λ, lmax, -1; tol = solver.tol)
+    ap = zeros(ComplexF64, shp); NUFSHT.nusht_solve_spin!(ap, Vp, planp; rtol = rtol, maxiter = maxiter)
+    am = zeros(ComplexF64, shp); NUFSHT.nusht_solve_spin!(am, Vm, planm; rtol = rtol, maxiter = maxiter)
+
+    sym = (ap .+ am) ./ 2          # rotational coefficients
+    anti = (ap .- am) ./ 2         # divergent coefficients
+
+    function _recon(a_plus, a_minus)
+        Vp1 = similar(Vp); NUFSHT.nusht_type2_spin!(Vp1, a_plus, planp)
+        Vm1 = similar(Vm); NUFSHT.nusht_type2_spin!(Vm1, a_minus, planm)
+        uθ1 = (Vp1 .+ Vm1) ./ 2
+        uφ1 = (Vp1 .- Vm1) ./ (2im)
+        return real.(uφ1), -real.(uθ1)             # (u_east, u_north)
+    end
+
+    T = real(eltype(U))
+    uer, unr = _recon(sym, sym)
+    ued, und = _recon(anti, .-anti)
+    u_rot = Matrix{T}(undef, HD.npoints(pts), 2); u_rot[:, 1] .= uer; u_rot[:, 2] .= unr
+    u_div = Matrix{T}(undef, HD.npoints(pts), 2); u_div[:, 1] .= ued; u_div[:, 2] .= und
+    u_harm = U .- u_rot .- u_div
+    return (; u_rot, u_div, u_harm)
 end
 
 function __init__()

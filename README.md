@@ -128,11 +128,12 @@ pts = HD.ScatteredPoints(HD.CartesianGeometry(1.0, 1.0), X; box = (Lx, Ly))   # 
 res = HD.helmholtz_decompose_spectral(U, pts)   # U is (M, 2) → (; u_rot, u_div, u_harm)
 ```
 
-Scattered **Cartesian** (FINUFFT) is fully supported and accurate for arbitrary point sets.
-Scattered **spherical** (NUFSHT) is not yet available — it needs vector/spin-weighted
-spherical-harmonic synthesis and a public scattered adjoint from NUFSHT (tracked upstream);
-it raises a clear error rather than returning an approximation. Structured spherical grids
-are fully supported.
+Scattered **Cartesian** (FINUFFT) and scattered **spherical** (NUFSHT) are both fully
+supported and accurate for arbitrary point sets. Scattered-spherical uses NUFSHT's
+spin-weighted (spin±1) scattered transforms: the tangent velocity `U = u_θ + i u_φ` is a
+spin-1 field, and the symmetric/antisymmetric parts of its spin(±1) coefficients give the
+rotational/divergent components (an exact Hodge split, no finite-difference stencil). For a
+spherical point cloud, build `ScatteredPoints(SphericalGeometry(R), lons, lats)`.
 
 ### Multiply-connected domains (the harmonic part)
 
