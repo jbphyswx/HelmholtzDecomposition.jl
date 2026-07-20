@@ -260,7 +260,7 @@ singular center this field is **both** divergence-free and curl-free — i.e. pu
 *harmonic*. On a domain with the center masked out (see [`disk_mask`](@ref)) it has net
 circulation `Γ` around the hole and cannot be represented by a single-valued streamfunction
 or velocity potential, so a Helmholtz decomposition must place essentially all of it in the
-harmonic component. The definitive test for issue #1.
+harmonic component.
 """
 function harmonic_vortex(
     grid::StructuredGrid{2,<:CartesianGeometry{2,T}};

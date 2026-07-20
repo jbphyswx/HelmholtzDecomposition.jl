@@ -4,7 +4,7 @@ Harmonic Component on a Multiply-Connected Domain (annulus)
 On a domain with a hole, a pure circulation around the hole is *harmonic* — both
 divergence-free and curl-free — and cannot be represented by a single-valued streamfunction
 or velocity potential. The decomposition places (essentially) all of it in `u_harm`, and
-`count_holes` detects the topology. This is the generalized Helmholtz-Hodge case (issue #1).
+`count_holes` detects the topology. This is the generalized Helmholtz-Hodge case.
 """
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD

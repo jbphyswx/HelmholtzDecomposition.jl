@@ -184,7 +184,7 @@ relnorm(x) = sqrt(sum(abs2, x))
         @test length(HD.vector_potential(res)) == 3
     end
 
-    @testset "Harmonic component (issue #1)" begin
+    @testset "Harmonic component" begin
         # Annulus: a central disk masked out → multiply-connected (b₁ = 1).
         n = 41; L = 2.0; h = L / (n - 1)
         xs = collect(range(-1.0, 1.0, length = n)); ys = copy(xs)
