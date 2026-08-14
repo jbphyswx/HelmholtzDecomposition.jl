@@ -7,6 +7,7 @@ field and its rotational, divergent, and harmonic components.
 module HelmholtzDecompositionCairoMakieExt
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
+using FlowGeometries: FlowGeometries as FG
 using CairoMakie: CairoMakie
 
 _speed(U) = sqrt.(view(U, :, :, 1) .^ 2 .+ view(U, :, :, 2) .^ 2)
@@ -20,10 +21,10 @@ supplied). Returns the `CairoMakie.Figure`.
 """
 function HD.plot_decomposition(
     result::HD.HelmholtzResult{2},
-    grid::HD.StructuredGrid{2};
+    grid::FG.Grids.StructuredGrid{G,T,2} where {G,T};
     orig::Union{Nothing,AbstractArray} = nothing,
 )
-    xs, ys = grid.coords_axes
+    xs, ys = FG.Grids.coordinates(grid)
     panels = Tuple{String,Any}[]
     orig === nothing || push!(panels, ("original |u|", _speed(orig)))
     push!(panels, ("rotational |u_rot|", _speed(result.u_rot)))
@@ -40,7 +41,7 @@ function HD.plot_decomposition(
 end
 
 # Backwards-friendly 4-arg form (original passed as separate components).
-HD.plot_decomposition(result::HD.HelmholtzResult{2}, grid::HD.StructuredGrid{2}, u_orig::AbstractMatrix, v_orig::AbstractMatrix; kwargs...) =
+HD.plot_decomposition(result::HD.HelmholtzResult{2}, grid::FG.Grids.StructuredGrid{G,T,2} where {G,T}, u_orig::AbstractMatrix, v_orig::AbstractMatrix; kwargs...) =
     HD.plot_decomposition(result, grid; orig = cat(u_orig, v_orig; dims = 3), kwargs...)
 
 end # module

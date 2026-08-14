@@ -1,8 +1,8 @@
 """
-    HelmholtzDecomposition.jl — Helmholtz decomposition of 2D velocity fields.
+    HelmholtzDecomposition.jl — Helmholtz–Hodge decomposition of velocity fields.
 
-Decomposes a horizontal velocity field into rotational (non-divergent, stream function ψ)
-and divergent (irrotational, velocity potential χ) components by solving Poisson equations.
+Decomposes a velocity field into rotational (divergence-free), divergent (curl-free) and
+harmonic parts, in any number of dimensions, on Cartesian and spherical grids.
 
 # Why this package exists
 On the sphere, filtering velocity Cartesian components does **not** commute with differential
@@ -21,45 +21,42 @@ The base package includes only the SOR iterative solver, which works on any grid
 
 # Quick Start
 ```julia
-using HelmholtzDecomposition: HelmholtzDecomposition
+using HelmholtzDecomposition: HelmholtzDecomposition as HD
+using FlowGeometries: FlowGeometries as FG
 using FFTW: FFTW  # load spectral extension for Cartesian grids
 
-geom = HelmholtzDecomposition.CartesianGeometry(1000.0, 1000.0)
-grid = HelmholtzDecomposition.StructuredGrid(geom, xs, ys)
-result = HelmholtzDecomposition.helmholtz_decompose(u, v, grid)
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, ys)
+result = HD.helmholtz_decompose(u, v, grid)
 # result.u_rot, result.v_rot  — rotational velocity
 # result.u_div, result.v_div  — divergent velocity
-# result.ψ, result.χ          — scalar potentials (filter these for coarse-graining!)
+# result.ψ, result.χ          — scalar potentials
 ```
+
+Nothing is exported: every name is reached as `HelmholtzDecomposition.name`.
 
 # References
 - Aluie (2019): doi:10.1007/s13137-019-0123-9 — Convolutions on the sphere
+- Glötzl & Richters (2023): doi:10.1016/j.jmaa.2023.127138 — n-dimensional Helmholtz potentials
 - Buzzicotti et al. (2023): doi:10.1126/sciadv.adi7420 — Global cascade of kinetic energy
 - Storer et al. (2022): doi:10.1038/s41467-022-33031-3 — Global energy spectrum
 """
 module HelmholtzDecomposition
 
-include("Backends.jl")
-using .Backends: Backends, AbstractExecutionBackend, SerialBackend, ThreadedBackend,
-    GPUBackend, AutoBackend, DistributedBackend, MPIBackend, local_backend, is_distributed
-export AbstractExecutionBackend, SerialBackend, ThreadedBackend, GPUBackend, AutoBackend
-export DistributedBackend, MPIBackend, local_backend, is_distributed
+using ComputationalBackends: ComputationalBackends
+using FlowGeometries: FlowGeometries
+using SpectralBackends: SpectralBackends
+using LinearAlgebra: LinearAlgebra
 
-include("Geometry.jl")
-include("Grids.jl")
+include("BoundaryConditions.jl")
+include("Staggering.jl")
 include("Operators.jl")
-include("Topology.jl")
 include("Solvers.jl")
-include("Scattered.jl")
+include("Multigrid.jl")
+include("DualGrid.jl")
 include("Decomposition.jl")
 include("Spectral.jl")
-include("TestFields.jl")
 
-# Extension point for CairoMakie visualization (implemented in ext/HelmholtzDecompositionCairoMakieExt.jl)
+# Implemented in ext/HelmholtzDecompositionCairoMakieExt.jl.
 function plot_decomposition end
-export plot_decomposition
-
-export AbstractSpectralHelmholtzResult, SpectralCartesianResult, SpectralSphericalResult
-export helmholtz_decompose_spectral, helmholtz_project_spectral, helmholtz_project_spectral!
 
 end # module HelmholtzDecomposition

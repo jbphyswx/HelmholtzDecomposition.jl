@@ -13,7 +13,10 @@ sequential `:dense` map.
 using CairoMakie: CairoMakie
 using FFTW: FFTW
 using NUFSHT: NUFSHT
+using FlowGeometries: FlowGeometries as FG
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
+
+include(joinpath(@__DIR__, "..", "..", "reference_flows", "reference_flows.jl"))
 
 const ASSETS_DIR = joinpath(@__DIR__, "..", "assets")
 mkpath(ASSETS_DIR)
@@ -44,13 +47,22 @@ function mag_panel!(fig, pos, data, xs, ys, title; colorrange = nothing)
     return ax
 end
 
-cartgrid(N, L) = HD.StructuredGrid(HD.CartesianGeometry(L / N, L / N),
-    collect(range(0.0, L - L / N, length = N)), collect(range(0.0, L - L / N, length = N)))
+function cartgrid(N, L)
+    axis = FG.Axes.UniformAxis(0.0, L / N, N)
+    return FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), axis, axis;
+                                   topology = (true, true), period = (L, L))
+end
+
+decompose(u, v, grid) = HD.helmholtz_decompose(cat(u, v; dims = 3), grid)
 
 # ─── Classic decompositions (signed components + potentials) ──────────────
 
 function decomposition_figure(title, u, v, result, grid, fname)
-    xs, ys = grid.coords_axes
+    xs, ys = FG.Grids.coordinates(grid)
+    # `ψ` lives on the corner (dual) grid, so it has its own axes.
+    ψ = HD.streamfunction(result)
+    ψx, ψy = range(first(xs), last(xs); length = size(ψ, 1)),
+             range(first(ys), last(ys); length = size(ψ, 2))
     fig = CairoMakie.Figure(; size = (1200, 820), fontsize = 14)
     CairoMakie.Label(fig[0, 1:6], title; fontsize = 18, font = :bold)
     signed_panel!(fig, (1, 1), u, xs, ys, "u (original)")
@@ -59,8 +71,8 @@ function decomposition_figure(title, u, v, result, grid, fname)
     signed_panel!(fig, (2, 1), v, xs, ys, "v (original)")
     signed_panel!(fig, (2, 3), comp(result.u_rot, 2), xs, ys, "v_rot (rotational)")
     signed_panel!(fig, (2, 5), comp(result.u_div, 2), xs, ys, "v_div (divergent)")
-    signed_panel!(fig, (3, 1), comp(result.vorticity, 1), xs, ys, "ζ (vorticity)")
-    signed_panel!(fig, (3, 3), HD.streamfunction(result), xs, ys, "ψ (stream function)")
+    signed_panel!(fig, (3, 1), result.divergence, xs, ys, "δ = ∇·u")
+    signed_panel!(fig, (3, 3), ψ, ψx, ψy, "ψ (stream function, corners)")
     signed_panel!(fig, (3, 5), result.χ, xs, ys, "χ (velocity potential)")
     out = joinpath(ASSETS_DIR, fname)
     CairoMakie.save(out, fig; px_per_unit = 2)
@@ -69,36 +81,37 @@ end
 
 function figure_taylor_green()
     grid = cartgrid(64, 1.0)
-    u, v, = HD.taylor_green_vortex(grid)
+    u, v, = ReferenceFlows.taylor_green_vortex(grid)
     decomposition_figure("Taylor–Green Vortex — Helmholtz Decomposition", u, v,
-        HD.helmholtz_decompose_spectral(u, v, grid), grid, "taylor_green_decomposition.png")
+        decompose(u, v, grid), grid, "taylor_green_decomposition.png")
 end
 
 function figure_mixed_field()
     grid = cartgrid(64, 1.0)
-    u, v, = HD.rankine_vortex_with_source(grid)
+    u, v, = ReferenceFlows.rankine_vortex_with_source(grid)
     decomposition_figure("Vortex + Source — Helmholtz Decomposition", u, v,
-        HD.helmholtz_decompose_spectral(u, v, grid), grid, "mixed_field_decomposition.png")
+        decompose(u, v, grid), grid, "mixed_field_decomposition.png")
 end
 
 function figure_point_source()
     grid = cartgrid(64, 1.0)
-    u, v, = HD.point_source_sink(grid)
+    u, v, = ReferenceFlows.point_source_sink(grid)
     decomposition_figure("Point Source — Helmholtz Decomposition", u, v,
-        HD.helmholtz_decompose_spectral(u, v, grid), grid, "point_source_decomposition.png")
+        decompose(u, v, grid), grid, "point_source_decomposition.png")
 end
 
 # ─── NEW: harmonic component on a multiply-connected domain (annulus) ─────
 
 function figure_harmonic_annulus()
     n = 81
-    xs = collect(range(-1.0, 1.0, length = n)); ys = copy(xs); h = xs[2] - xs[1]
-    base = HD.StructuredGrid(HD.CartesianGeometry(h, h), xs, ys)
-    mask = HD.disk_mask(base; center = (0.0, 0.0), radius = 0.3)
-    grid = HD.StructuredGrid(HD.CartesianGeometry(h, h), xs, ys; mask = mask)
-    u, v = HD.harmonic_vortex(grid; Γ = 1.0)
-    solver = HD.SORSolver(; max_iter = 20_000, tol = 1e-9, boundary = HD.Dirichlet())
-    res = HD.helmholtz_decompose(u, v, grid; solver = solver, boundary_χ = HD.Dirichlet(), boundary_ψ = HD.Dirichlet())
+    h = 2.0 / (n - 1)
+    xs = FG.Axes.UniformAxis(-1.0, h, n); ys = xs
+    cart = FG.Geometry.CartesianGeometry{Float64}()
+    base = FG.Grids.StructuredGrid(cart, xs, ys)
+    mask = ReferenceFlows.disk_mask(base; center = (0.0, 0.0), radius = 0.3)
+    grid = FG.Grids.StructuredGrid(cart, xs, ys; mask = mask)
+    u, v = ReferenceFlows.harmonic_vortex(grid; Γ = 1.0)
+    res = decompose(u, v, grid)
 
     blank(A) = (B = copy(A); B[.!mask] .= NaN; B)   # blank the masked hole
     U = cat(u, v; dims = 3)
@@ -122,8 +135,9 @@ end
 
 function figure_3d_abc()
     n = 48; L = 2π; h = L / n
-    ax = collect(range(0, L - h, length = n))
-    grid = HD.StructuredGrid(HD.CartesianGeometry(h, h, h), ax, ax, ax)
+    ax = FG.Axes.UniformAxis(0.0, h, n)
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), ax, ax, ax;
+                                   topology = (true, true, true), period = (L, L, L))
     U = zeros(n, n, n, 3)
     for k in 1:n, j in 1:n, i in 1:n
         x, y, z = ax[i], ax[j], ax[k]
@@ -131,7 +145,7 @@ function figure_3d_abc()
         U[i, j, k, 2] = sin(x) + cos(z)
         U[i, j, k, 3] = sin(y) + cos(x)
     end
-    res = HD.helmholtz_decompose_spectral(U, grid)
+    res = HD.helmholtz_decompose(U, grid)
     kz = n ÷ 2
     fig = CairoMakie.Figure(; size = (1200, 360), fontsize = 14)
     CairoMakie.Label(fig[0, 1:6], "3-D ABC (Beltrami) flow — z mid-slice of uₓ  (solenoidal: u_div ≈ 0)";
@@ -148,8 +162,9 @@ end
 
 function figure_3d_mixed()
     n = 48; L = 2π; h = L / n
-    ax = collect(range(0, L - h, length = n))
-    grid = HD.StructuredGrid(HD.CartesianGeometry(h, h, h), ax, ax, ax)
+    ax = FG.Axes.UniformAxis(0.0, h, n)
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), ax, ax, ax;
+                                   topology = (true, true, true), period = (L, L, L))
     U = zeros(n, n, n, 3)
     for k in 1:n, j in 1:n, i in 1:n
         x, y, z = ax[i], ax[j], ax[k]
@@ -158,7 +173,7 @@ function figure_3d_mixed()
         U[i, j, k, 2] = (sin(x) + cos(z)) - cos(x) * sin(y) * cos(z)
         U[i, j, k, 3] = (sin(y) + cos(x)) - cos(x) * cos(y) * sin(z)
     end
-    res = HD.helmholtz_decompose_spectral(U, grid)
+    res = HD.helmholtz_decompose(U, grid)
     kz = n ÷ 2
     fig = CairoMakie.Figure(; size = (1200, 360), fontsize = 14)
     CairoMakie.Label(fig[0, 1:6], "3-D mixed field (ABC + gradient) — z mid-slice of uₓ  (both parts nonzero)";
@@ -175,12 +190,16 @@ end
 
 function figure_spherical()
     Nlon, Nlat = 96, 48
-    lons = collect(range(0, 2π - 2π / Nlon, length = Nlon))
-    lats = collect(range(-1.3, 1.3, length = Nlat))
-    grid = HD.StructuredGrid(HD.SphericalGeometry(1.0), lons, lats)
-    u, v, = HD.kelvin_ekman_flow(grid)
-    nusht = HD._SPECTRAL_SOLVERS[:spherical_irregular](Nlat - 1, 1e-8)  # NUFSHT solver
-    res = HD.helmholtz_decompose_spectral(u, v, grid; solver = nusht)
+    # A COVERING node set. The previous ±1.3 rad band is a regional patch, and a spherical-harmonic
+    # transform does not determine the solution on one — analysis integrates over all of S².
+    lons = FG.Axes.UniformAxis(0.0, 2π / Nlon, Nlon)
+    lats = FG.Axes.UniformAxis(-π / 2 + π / (2Nlat), π / Nlat, Nlat)
+    grid = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(1.0), lons, lats;
+                                   topology = (true, false), period = (2π, nothing))
+    u, v, = ReferenceFlows.kelvin_ekman_flow(grid)
+    NUExt = Base.get_extension(HD, :HelmholtzDecompositionNUFSHTExt)
+    nusht = NUExt.SphericalNUSHTSolver(; lmax = Nlat - 1, tol = 1e-8)
+    res = HD.helmholtz_decompose(cat(u, v; dims = 3), grid; solver = nusht)
 
     fig = CairoMakie.Figure(; size = (1200, 760), fontsize = 14)
     CairoMakie.Label(fig[0, 1:6], "Spherical mixed flow (Kelvin–Ekman) — NUFSHT decomposition"; fontsize = 18, font = :bold)

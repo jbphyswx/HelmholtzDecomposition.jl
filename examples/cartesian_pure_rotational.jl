@@ -1,35 +1,30 @@
 """
-Cartesian Pure Rotational Field (Taylor-Green Vortex)
+Cartesian pure rotational field (Taylor–Green vortex).
 
-A purely rotational field should decompose with a near-zero divergent component.
-Uses the FFTW spectral path (periodic Cartesian grid).
+A purely rotational field decomposes with a near-zero divergent component. The residue that
+appears in `u_harm` is the two collocated↔staggered averaging hops, and it converges at second
+order — it is discretisation, not topology.
 """
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
+using FlowGeometries: FlowGeometries as FG
 using FFTW: FFTW
-using Statistics: Statistics
+
+include(joinpath(@__DIR__, "..", "reference_flows", "reference_flows.jl"))
 
 speed(U) = sqrt.(U[:, :, 1] .^ 2 .+ U[:, :, 2] .^ 2)
 
-N = 64
-L = 1.0
-dx = L / N
-grid = HD.StructuredGrid(HD.CartesianGeometry(dx, dx),
-    collect(range(0.0, L - dx, length = N)), collect(range(0.0, L - dx, length = N)))
+const L = 1.0
 
-u, v, = HD.taylor_green_vortex(grid)
-U = cat(u, v; dims = 3)
-
-# Spectral decomposition → physical HelmholtzResult.
-result = HD.helmholtz_decompose_spectral(u, v, grid)
-
-rot_mag = Statistics.mean(speed(result.u_rot))
-div_mag = Statistics.mean(speed(result.u_div))
-recon_err = maximum(abs.(result.u_rot .+ result.u_div .+ result.u_harm .- U))
-
-println("=== Cartesian Pure Rotational (Taylor-Green), FFTW spectral ===")
-println("Mean |u_rot|:          $(round(rot_mag, sigdigits = 4))")
-println("Mean |u_div|:          $(round(div_mag, sigdigits = 4))  (should be ≈ 0)")
-println("Div/Rot ratio:         $(round(div_mag / rot_mag, sigdigits = 4))")
-println("Reconstruction error:  $(round(recon_err, sigdigits = 4))")
-println("Harmonic fraction:     $(round(result.harmonic_fraction, sigdigits = 4))")
+println("=== Cartesian pure rotational (Taylor–Green) ===")
+for N in (32, 64, 128)
+    axis = range(0.0, L - L / N; length = N)
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), axis, axis;
+                                   topology = (true, true), period = (L, L))
+    u, v, = ReferenceFlows.taylor_green_vortex(grid)
+    U = cat(u, v; dims = 3)
+    result = HD.helmholtz_decompose(U, grid)
+    ratio = maximum(speed(result.u_div)) / maximum(speed(U))
+    println("N=$N  |u_div|/|u| = $(round(ratio, sigdigits = 3))   " *
+            "harmonic fraction = $(round(result.harmonic_fraction, sigdigits = 3))")
+end

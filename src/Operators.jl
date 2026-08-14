@@ -1,23 +1,108 @@
 """
-    Operators.jl — Dimension-generic finite-difference operators and rotation-tensor
-    bookkeeping for Cartesian grids.
+    Operators.jl — One consistent family of discrete operators.
 
-The rotational part of an `N`-dimensional Helmholtz decomposition is encoded by an
-antisymmetric rotation-potential matrix `R` with `N(N-1)/2` independent components
-(Glötzl & Richters, 2023). In 2D this single component is the streamfunction `ψ`; in
-3D the three components are the Hodge dual of the vector potential `A`. This file
-provides the dimension-generic machinery used by the physical-space decomposition:
+The rotational part of an `N`-dimensional Helmholtz decomposition is encoded by an antisymmetric
+rotation-potential matrix `R` with `N(N-1)/2` independent components (Glötzl & Richters, 2023).
+In 2D that component is the streamfunction `ψ`; in 3D the three are the Hodge dual of the vector
+potential `A`.
 
-- pair bookkeeping `(a, b)` with `a < b` indexing the independent components,
-- masked centered finite differences along an arbitrary axis,
-- divergence `δ = Σ_d ∂u_d/∂x_d`,
-- the antisymmetric rotation tensor `W_ab = ∂_a u_b − ∂_b u_a`,
-- reconstruction of `u_div = ∇χ` and `u_rot` from the potentials.
+# Why the operators are defined as adjoints of one another
 
-Conventions (verified against the 2D streamfunction and 3D vector-potential cases):
-`Δχ = δ`, `ΔR_ab = W_ab`, `u_div_k = ∂_k χ`, and `u_rot_k = −Σ_m ∂_m R_km`
-(i.e. each pair `(a,b)` contributes `u_rot_a -= ∂_b R_ab`, `u_rot_b += ∂_a R_ab`).
+A decomposition is a decomposition only if the operators around it agree. One gradient `G` is
+chosen — compact, cell centres to faces — and the rest are *defined* from it:
+
+    D = −G*        (adjoint under the cell-measure inner product)
+    L = D G        (so L = −G*G)
+
+Then, discretely and not to truncation order: `L` is symmetric negative-semidefinite, which is
+what makes conjugate gradients and multigrid applicable at all; `div(u_div) = L χ = D u` exactly;
+and `⟨u_div, u_rot⟩ = 0`, so `harmonic_fraction` measures domain topology rather than
+disagreement between three separately-chosen stencils.
+
+# The metric enters exactly once
+
+`d` is metric-free: `dχ` on an edge is `χ_head − χ_tail`, no division. `d∘d = 0` — and hence
+`curl(grad χ) = 0` — is an identity of *that* operator, so a difference already divided by a
+physical gap does not satisfy it wherever the metric varies along the differenced direction, as
+it does on any curved geometry. All metric therefore lives in one place, the Hodge factor
+`c_f = A_f / g_f`, with the areas and gaps taken from `FlowGeometries` and evaluated **at the
+face**: on a sphere `measure(I)/width(I)` is not the area of the face between two φ-neighbours.
+
+Storage and counts are in `Staggering.jl`.
 """
+
+# ---------------------------------------------------------------------------
+# Execution backend
+# ---------------------------------------------------------------------------
+
+"""
+    execution_backend(backend)
+
+The object `FlowGeometries.Execution` dispatches on, given a `ComputationalBackends` one.
+
+The two libraries answer different questions: `ComputationalBackends` names *what kind* of
+execution is wanted, while `Execution`'s device methods dispatch on the KernelAbstractions device
+object itself. A `GPUBackend` therefore hands over the device it names; serial and threaded
+backends pass through, FlowGeometries' own ComputationalBackends extension having methods for
+them. Anything else reaches `run_indices` unchanged and raises a `MethodError` there rather than
+running serially in silence.
+"""
+@inline execution_backend(b::ComputationalBackends.GPUBackend) = b.backend
+@inline execution_backend(b) = b
+
+"""
+    resolve_execution_backend(backend) -> concrete backend
+
+The backend a single decomposition's own loops run on, resolved once so nothing below has to ask.
+
+`AutoBackend` reads the thread count — the defect that made every documented parallel path dead
+at defaults was resolving it to serial unconditionally. A `GPUBackend` is checked here, at plan
+time, against whether FlowGeometries' KernelAbstractions extension is actually loaded, so the
+error names the package to load rather than surfacing as a `MethodError` from inside a loop.
+
+`DistributedBackend` and `MPIBackend` are refused: they spread *fields across processes*, which is
+[`helmholtz_decompose_batch`](@ref)'s axis, not the index space inside one field.
+"""
+resolve_execution_backend(b::ComputationalBackends.AbstractSerialBackend) = b
+resolve_execution_backend(b::ComputationalBackends.AbstractThreadedBackend) = b
+resolve_execution_backend(::ComputationalBackends.AbstractAutoBackend) =
+    Threads.nthreads() > 1 ? ComputationalBackends.ThreadedBackend() :
+                             ComputationalBackends.SerialBackend()
+
+function resolve_execution_backend(b::ComputationalBackends.AbstractGPUBackend)
+    Base.get_extension(FlowGeometries, :FlowGeometriesKernelAbstractionsExt) === nothing &&
+        throw(ArgumentError(
+            "$(typeof(b)) needs FlowGeometries' KernelAbstractions extension, which is not " *
+            "loaded. Run `using KernelAbstractions` first (plus the vendor package owning the " *
+            "device), or pass `backend = ComputationalBackends.SerialBackend()`."))
+    return b
+end
+
+resolve_execution_backend(b::ComputationalBackends.AbstractExecutionBackend) = throw(ArgumentError(
+    "$(typeof(b)) parallelises over fields, not over the index space within one field. Pass it " *
+    "to `helmholtz_decompose_batch` instead; `plan_helmholtz`'s `backend` selects how the loops " *
+    "inside a single decomposition run."))
+
+"""
+    allocate_zeros(backend, T, dims) -> zeroed array
+
+Every buffer this package owns goes through here, so that a device backend gets device memory
+rather than a host array a kernel cannot reach. The default is a host `Array`; the
+KernelAbstractions extension adds the device method.
+"""
+allocate_zeros(::Any, ::Type{T}, dims::Dims) where {T} = zeros(T, dims)
+
+"""
+    to_backend(backend, x) -> x on the backend's memory
+
+Move an already-built array — or a struct of them — to where `backend` executes.
+
+The plan's coefficients and face metrics are built by walking the grid's geometry, which is host
+work done once; only their *results* are read in the inner loops. So they are assembled on the
+host and moved here, rather than every geometry accessor being made device-callable to build them
+in place. Identity by default; the KernelAbstractions extension routes it through `Adapt`.
+"""
+to_backend(::Any, x) = x
 
 # ---------------------------------------------------------------------------
 # Rotation-component bookkeeping
@@ -26,16 +111,15 @@ Conventions (verified against the 2D streamfunction and 3D vector-potential case
 """
     n_rotation_components(N) -> Int
 
-Number of independent rotation-potential components `N(N-1)/2` for `N` spatial
-dimensions (0 in 1D, 1 in 2D, 3 in 3D, 6 in 4D, …).
+`N(N-1)/2`: 0 in 1D, 1 in 2D, 3 in 3D.
 """
 @inline n_rotation_components(N::Integer) = (N * (N - 1)) ÷ 2
 
 """
-    rotation_pairs(Val(N)) -> NTuple{P, Tuple{Int,Int}}
+    rotation_pairs(Val(N)) -> NTuple{P,Tuple{Int,Int}}
 
-Compile-time tuple of the `P = N(N-1)/2` index pairs `(a, b)` with `a < b`, in
-lexicographic order: `(1,2), (1,3), …, (1,N), (2,3), …`.
+The pairs `(a, b)`, `a < b`, lexicographically — the independent components of an antisymmetric
+2-tensor, and equally the directions each component is staggered in.
 """
 @generated function rotation_pairs(::Val{N}) where {N}
     pairs = Tuple{Int,Int}[]
@@ -45,145 +129,447 @@ lexicographic order: `(1,2), (1,3), …, (1,N), (2,3), …`.
     return Expr(:tuple, (Expr(:tuple, p[1], p[2]) for p in pairs)...)
 end
 
-# ---------------------------------------------------------------------------
-# Index helpers
-# ---------------------------------------------------------------------------
-
 """
-    _unit(Val(N), d) -> CartesianIndex{N}
+    rotation_terms(Val(N)) -> NTuple{N,NTuple{N-1,Tuple{Int,Int,Int}}}
 
-Unit offset along axis `d`.
+For each direction `c`, the `(e, p, s)` triples saying how `u_rot_c` is assembled: difference
+component `p` of `R` along direction `e` with sign `s`. Inverting `rotation_pairs` this way turns
+the accumulation `u_rot_a −= ∂_b R_ab`, `u_rot_b += ∂_a R_ab` — a *scatter*, where several pairs
+write the same face — into a gather, so each face is written exactly once and the loop can be
+handed to `Execution` unchanged. Homogeneous, so indexing it with a runtime direction is stable.
 """
-@inline _unit(::Val{N}, d::Integer) where {N} = CartesianIndex(ntuple(i -> i == d ? 1 : 0, Val(N)))
-
-"""
-    _active_neighbor(grid, I, e, dir) -> CartesianIndex
-
-Neighbor of `I` offset by `dir * e`, clamped back to `I` when out of bounds or masked
-out (one-sided/no-flux behavior at boundaries and masked cells).
-"""
-@inline function _active_neighbor(grid, I::CartesianIndex{N}, e::CartesianIndex{N}, dir::Integer) where {N}
-    J = I + dir * e
-    return (checkbounds(Bool, grid.mask, J) && @inbounds grid.mask[J]) ? J : I
+@generated function rotation_terms(::Val{N}) where {N}
+    pairs = Tuple{Int,Int}[]
+    for a in 1:(N - 1), b in (a + 1):N
+        push!(pairs, (a, b))
+    end
+    per_dir = map(1:N) do c
+        terms = Expr[]
+        for (p, (a, b)) in enumerate(pairs)
+            a == c && push!(terms, Expr(:tuple, b, p, -1))
+            b == c && push!(terms, Expr(:tuple, a, p, 1))
+        end
+        Expr(:tuple, terms...)
+    end
+    return Expr(:tuple, per_dir...)
 end
-
-"""
-    _deriv(field, grid, I, d, spacing_d) -> T
-
-Masked centered finite difference `∂field/∂x_d` at index `I` on a Cartesian grid.
-Falls back to a one-sided difference at boundaries/masked cells and returns zero when no
-valid stencil exists.
-"""
-@inline function _deriv(field, grid, I::CartesianIndex{N}, d::Integer, spacing_d::T) where {N,T}
-    e = _unit(Val(N), d)
-    Ip = _active_neighbor(grid, I, e, +1)
-    Im = _active_neighbor(grid, I, e, -1)
-    step = (Ip[d] - Im[d]) * spacing_d
-    step == 0 && return zero(T)
-    return (field[Ip] - field[Im]) / step
-end
-
-# ---------------------------------------------------------------------------
-# Component-array views (component-last layout: U has size (dims..., N))
-# ---------------------------------------------------------------------------
 
 @inline function _component(U::AbstractArray{<:Any,M}, c::Integer, ::Val{N}) where {M,N}
     return @view U[ntuple(_ -> Colon(), Val(N))..., c]
 end
 
 # ---------------------------------------------------------------------------
-# Divergence and rotation tensor (Cartesian, dimension-generic)
+# Face metrics
 # ---------------------------------------------------------------------------
 
-"""
-    cartesian_divergence!(div, U, grid)
+# Physical extent of cell `I` along `e`: coordinate width times that direction's scale factor —
+# `1` on a Cartesian grid, `R·cosφ` / `R` on a spherical one.
+@inline function _physical_width(grid, I::CartesianIndex{N}, e::Integer) where {N}
+    geo = FlowGeometries.Grids.grid_geometry(grid)
+    p = FlowGeometries.Grids.coords(Tuple, grid, Tuple(I)...)
+    h = FlowGeometries.Geometry.scale_factors(geo, p)[e]
+    return abs(h) * FlowGeometries.Grids.cell_width(grid, e, I[e])
+end
 
-Compute `δ = Σ_d ∂u_d/∂x_d` into the `N`-d array `div` from the component-last
-velocity array `U` (size `(dims..., N)`). Masked-out cells are set to zero.
-"""
-function cartesian_divergence!(div, U, grid::StructuredGrid{N,<:CartesianGeometry{N,T}}) where {N,T}
-    spacing = grid.geometry.spacing
-    comps = ntuple(c -> _component(U, c, Val(N)), Val(N))
-    fill!(div, zero(T))
-    @inbounds for I in CartesianIndices(grid.mask)
-        grid.mask[I] || continue
-        acc = zero(T)
-        for d in 1:N
-            acc += _deriv(comps[d], grid, I, d, spacing[d])
-        end
-        div[I] = acc
+@inline function _signed_half_gap(grid, xi::T, xj::T, d::Integer) where {T}
+    δ = xj - xi
+    if FlowGeometries.Grids.isperiodic(grid, d)
+        p = T(FlowGeometries.Grids.period(grid, d))
+        abs(δ) > p / 2 && (δ -= sign(δ) * p)   # across the seam the raw difference is the long way
     end
-    return div
+    return δ / 2
+end
+
+# Coordinates of face `F` along `d`: the midpoint of the two cells it separates, or half a cell
+# out from the only cell it has. The metric is read here, not at either cell, because on a curved
+# geometry the two disagree.
+@inline function _face_point(grid, Cl, Cu, d::Integer, ::Val{N}) where {N}
+    if Cl !== nothing && Cu !== nothing
+        xl = FlowGeometries.Grids.coords(Tuple, grid, Tuple(Cl)...)
+        xu = FlowGeometries.Grids.coords(Tuple, grid, Tuple(Cu)...)
+        return ntuple(e -> e == d ? (xl[e] + _signed_half_gap(grid, xl[e], xu[e], d)) : xl[e], Val(N))
+    end
+    C = Cu === nothing ? Cl : Cu
+    x = FlowGeometries.Grids.coords(Tuple, grid, Tuple(C)...)
+    w = FlowGeometries.Grids.cell_width(grid, d, C[d]) / 2
+    # The face lies below `Cu` and above `Cl`.
+    return ntuple(e -> e == d ? (Cu === nothing ? x[e] + w : x[e] - w) : x[e], Val(N))
 end
 
 """
-    cartesian_rotation_tensor!(W, U, grid)
+    geometric_face_area(grid, F, d, T) -> T
 
-Compute the independent components of the antisymmetric rotation tensor
-`W_ab = ∂_a u_b − ∂_b u_a` (for pairs `a < b`) into the component-last array `W`
-(size `(dims..., P)`, `P = N(N-1)/2`). Masked-out cells are set to zero.
+Area of face `F` normal to `d`: the product of the physical cell widths in every other
+direction, evaluated at the face. Purely geometric — whether flux crosses it is
+[`face_area`](@ref)'s question.
 """
-function cartesian_rotation_tensor!(W, U, grid::StructuredGrid{N,<:CartesianGeometry{N,T}}) where {N,T}
-    spacing = grid.geometry.spacing
-    pairs = rotation_pairs(Val(N))
-    comps = ntuple(c -> _component(U, c, Val(N)), Val(N))
-    fill!(W, zero(T))
-    @inbounds for (p, (a, b)) in enumerate(pairs)
-        ua = comps[a]
-        ub = comps[b]
-        Wp = _component(W, p, Val(N))
-        for I in CartesianIndices(grid.mask)
-            grid.mask[I] || continue
-            Wp[I] = _deriv(ub, grid, I, a, spacing[a]) - _deriv(ua, grid, I, b, spacing[b])
+@inline function geometric_face_area(grid, F::CartesianIndex{N}, d::Integer, ::Type{T}) where {N,T}
+    Cl = cell_below(grid, F, d)
+    Cu = cell_above(grid, F, d)
+    ref = Cu === nothing ? Cl : Cu
+    ref === nothing && return zero(T)
+    geo = FlowGeometries.Grids.grid_geometry(grid)
+    h = FlowGeometries.Geometry.scale_factors(geo, _face_point(grid, Cl, Cu, d, Val(N)))
+    return prod(ntuple(e -> e == d ? one(T) :
+                       abs(T(h[e])) * T(FlowGeometries.Grids.cell_width(grid, e, ref[e])), Val(N)))
+end
+
+"""
+    face_area(grid, F, d, bc, T) -> T
+
+The area that carries flux across face `F` — the coefficient the operators use, and where the
+boundary condition lives, because on a flux-form operator that is what a boundary condition *is*:
+
+- between two active cells → the geometric area;
+- against a masked-out cell → `0`. No flux crosses, which is at once the no-flux condition, the
+  mask treatment, and the reason `D = −G*` survives both;
+- at the outer edge of a bounded direction → `0` under [`Neumann`](@ref), the geometric area
+  under [`Dirichlet`](@ref), whose ghost value beyond the edge is zero.
+
+On a covering spherical grid the poles need no special case: the φ-face area carries the `cos φ`
+that vanishes there, so the metric closes the surface itself.
+"""
+@inline function face_area(grid, F::CartesianIndex{N}, d::Integer, bc, ::Type{T}) where {N,T}
+    Cl = cell_below(grid, F, d)
+    Cu = cell_above(grid, F, d)
+    Cl === nothing && Cu === nothing && return zero(T)
+    if Cl === nothing || Cu === nothing
+        C = Cu === nothing ? Cl : Cu
+        @inbounds FlowGeometries.Grids.isactive(grid, Tuple(C)...) || return zero(T)
+        return bc isa Dirichlet ? geometric_face_area(grid, F, d, T) : zero(T)
+    end
+    @inbounds (FlowGeometries.Grids.isactive(grid, Tuple(Cl)...) &&
+               FlowGeometries.Grids.isactive(grid, Tuple(Cu)...)) || return zero(T)
+    return geometric_face_area(grid, F, d, T)
+end
+
+"""
+    face_gap(grid, F, d, T) -> T
+
+Physical centre-to-centre distance across face `F`: the mean of the two cells' physical widths,
+or half a cell where the face has only one. Consistent with [`face_area`](@ref) — a great-circle
+distance would not be, being shorter than the coordinate line the area is built on.
+"""
+@inline function face_gap(grid, F::CartesianIndex{N}, d::Integer, ::Type{T}) where {N,T}
+    Cl = cell_below(grid, F, d)
+    Cu = cell_above(grid, F, d)
+    if Cl === nothing || Cu === nothing
+        C = Cu === nothing ? Cl : Cu
+        C === nothing && return one(T)
+        return T(_physical_width(grid, C, d)) / T(2)
+    end
+    return (T(_physical_width(grid, Cl, d)) + T(_physical_width(grid, Cu, d))) / T(2)
+end
+
+@inline cell_measure(grid, I::CartesianIndex, ::Type{T}) where {T} =
+    T(FlowGeometries.Grids.measure(grid, Tuple(I)...))
+
+# ---------------------------------------------------------------------------
+# Gradient, divergence, Laplacian
+# ---------------------------------------------------------------------------
+
+"""
+    FaceMetrics{N,T,A}
+
+Every face's flux-carrying area and centre-to-centre gap, evaluated once for a `(grid, boundary)`
+pair.
+
+[`face_area`](@ref) and [`face_gap`](@ref) each read the grid's coordinates and evaluate the
+geometry's scale factors *at the face* — on a curved grid, trigonometry per face per direction.
+None of it depends on the field, yet the operators call them inside their loops, so a decomposition
+recomputed the same metric `2N + 4P` times per field and again for every field of a batch. Reduced
+here to two array reads.
+"""
+struct FaceMetrics{N,T,A<:NTuple{N,AbstractArray{T,N}}}
+    area::A
+    gap::A
+end
+
+function face_metrics(grid::FlowGeometries.Grids.StructuredGrid{G,T,N}, bc) where {G,T,N}
+    area = ntuple(d -> zeros(T, face_dims(grid, d)), Val(N))
+    gap = ntuple(d -> zeros(T, face_dims(grid, d)), Val(N))
+    @inbounds for d in 1:N, F in CartesianIndices(face_dims(grid, d))
+        area[d][F] = face_area(grid, F, d, bc, T)
+        gap[d][F] = face_gap(grid, F, d, T)
+    end
+    return FaceMetrics{N,T,typeof(area)}(area, gap)
+end
+
+"""
+    gradient!(g, χ, grid, bc) -> g
+
+`g[d][F] = (χ_above − χ_below) / gap` on every face. A face with area but only one cell is a
+Dirichlet edge, whose ghost value is zero — which is exactly what the condition says.
+"""
+function gradient!(g::NTuple{N,<:AbstractArray}, χ, grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
+                  bc, fm::FaceMetrics{N,T} = face_metrics(grid, bc); backend = ComputationalBackends.SerialBackend()) where {G,T,N}
+    for d in 1:N
+        gd, ad, gpd = g[d], fm.area[d], fm.gap[d]
+        fcart = CartesianIndices(face_dims(grid, d))
+        FlowGeometries.Execution.run_indices(length(gd), backend) do lin
+            @inbounds begin
+                F = fcart[lin]
+                gd[F] = iszero(ad[F]) ? zero(T) :
+                        (_cell_value(χ, grid, F, d, true, T) -
+                         _cell_value(χ, grid, F, d, false, T)) / gpd[F]
+            end
+            return nothing
+        end
+    end
+    return g
+end
+
+# The value on one side of a face, or the zero ghost where that side has no cell — which is the
+# Dirichlet condition, and the only case where a face carries area without two neighbours.
+#
+# The `nothing` stays *inside* this function on purpose: both branches return `T`, so the small
+# union never escapes into the caller's loop, where it would be a type instability and, in a
+# kernel, an unsupported one.
+@inline function _cell_value(χ, grid, F::CartesianIndex{N}, d::Integer, upper::Bool,
+                             ::Type{T}) where {N,T}
+    C = upper ? cell_above(grid, F, d) : cell_below(grid, F, d)
+    C === nothing && return zero(T)
+    return @inbounds T(χ[C])
+end
+
+"""
+    divergence!(δ, v, grid, bc) -> δ
+
+`δ[I] = (1/V_I) Σ_d (A·v)[face above] − (A·v)[face below]` — the negative adjoint of
+[`gradient!`](@ref) under the cell-measure inner product, which is what makes `L = D G` symmetric.
+"""
+function divergence!(δ, v::NTuple{N,<:AbstractArray}, grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
+                     bc, fm::FaceMetrics{N,T} = face_metrics(grid, bc); backend = ComputationalBackends.SerialBackend()) where {G,T,N}
+    msk = FlowGeometries.Grids.mask(grid)
+    meas = FlowGeometries.Grids.measure(grid)
+    cart = CartesianIndices(size(grid))
+    area = fm.area
+    # One write per index, every direction accumulated inside it. That is the shape a device launch
+    # can express — with `KernelAbstractions` loaded, `run_indices` becomes a kernel — and it is
+    # also strictly less work than before: `N + 2` passes over the grid collapse to one, absorbing
+    # the `fill!` and the separate division by the measure.
+    #
+    # The grid is captured directly rather than unpacked into plain tuples: `FlowGeometries` adapts
+    # a `StructuredGrid` to a device (coordinates, measure and mask move; `SeparableMeasure` travels
+    # as its factors), and `isperiodic` is a type-parameter read, so `face_above` is already
+    # kernel-safe.
+    FlowGeometries.Execution.run_indices(length(δ), backend) do lin
+        @inbounds begin
+            I = cart[lin]
+            if msk[I]
+                acc = zero(T)
+                for d in 1:N
+                    vd, ad = v[d], area[d]
+                    Fhi = face_above(grid, I, d)
+                    acc += ad[Fhi] * vd[Fhi] - ad[I] * vd[I]
+                end
+                δ[I] = acc / meas[I]
+            end
+        end
+        return nothing
+    end
+    return δ
+end
+
+"""
+    laplacian!(out, χ, grid, bc, scratch) -> out
+
+`L χ = D G χ`, from exactly the two operators above, so a solver inverts the same `L` the
+decomposition differentiates with.
+"""
+function laplacian!(out, χ, grid::FlowGeometries.Grids.StructuredGrid, bc, scratch::NTuple)
+    gradient!(scratch, χ, grid, bc)
+    return divergence!(out, scratch, grid, bc)
+end
+
+# ---------------------------------------------------------------------------
+# Curl and the rotational reconstruction
+# ---------------------------------------------------------------------------
+
+"""
+    curl!(W, v, grid, bc) -> W
+
+`W_ab = ∂_a v_b − ∂_b v_a` on the `(a,b)` corner, from face-normal velocity.
+
+The circulation `v·g` is differenced rather than `v` itself, so what is differenced is the
+metric-free `d`; the metric re-enters once, in the division at the end. A corner is included only
+when all four faces bounding it are open — a loop running half through a mask edge has no zero
+circulation, and requiring only two faces is what previously broke `curl(grad χ) = 0` on a masked
+grid.
+"""
+function curl!(W::NTuple, v::NTuple{N,<:AbstractArray}, grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
+               bc, fm::FaceMetrics{N,T} = face_metrics(grid, bc); backend = ComputationalBackends.SerialBackend()) where {G,T,N}
+    for (p, (a, b)) in enumerate(rotation_pairs(Val(N)))
+        Wp = W[p]
+        va, vb = v[a], v[b]
+        aa, ab = fm.area[a], fm.area[b]
+        ga, gb_ = fm.gap[a], fm.gap[b]
+        qcart = CartesianIndices(corner_dims(grid, a, b))
+        FlowGeometries.Execution.run_indices(length(Wp), backend) do lin
+            @inbounds begin
+                # `Qc` indexes the corner array; `Q` is the face index it sits on, which is what
+                # the geometry is walked from.
+                Qc = qcart[lin]
+                Q = corner_to_face(grid, Qc, a, b)
+                Cla = cell_below(grid, Q, a)      # a-cells either side of the a-face at Q[a]
+                Cua = cell_above(grid, Q, a)
+                Clb = cell_below(grid, Q, b)
+                Cub = cell_above(grid, Q, b)
+                # A corner is in the complex only when all four faces bounding it are open;
+                # requiring two lets a circulation loop run half through a mask edge. Written as a
+                # branch rather than an early `continue` because the body is a closure.
+                if Cla === nothing || Cua === nothing || Clb === nothing || Cub === nothing
+                    Wp[Qc] = zero(T)
+                elseif iszero(ab[Cla]) || iszero(ab[Cua]) || iszero(aa[Clb]) || iszero(aa[Cub])
+                    Wp[Qc] = zero(T)
+                else
+                    # The dual cell's extent at the corner. Not `face_gap(grid, Q, …)`: `Q`'s other
+                    # staggered slot is a FACE index, so walking to cells from it lands out of range
+                    # on a bounded direction and half a cell off on a curved one. `Clb`/`Cla` already
+                    # carry a cell index in that slot while keeping the face index in the measured one.
+                    circ_b = vb[Cua] * gb_[Cua] - vb[Cla] * gb_[Cla]
+                    circ_a = va[Cub] * ga[Cub] - va[Clb] * ga[Clb]
+                    Wp[Qc] = (circ_b - circ_a) / (ga[Clb] * gb_[Cla])
+                end
+            end
+            return nothing
         end
     end
     return W
 end
 
-# ---------------------------------------------------------------------------
-# Reconstruction of velocity components from potentials
-# ---------------------------------------------------------------------------
-
 """
-    cartesian_reconstruct_div!(u_div, χ, grid)
+    rotational_velocity!(u_rot, R, grid, bc) -> u_rot
 
-Reconstruct the divergent (curl-free) velocity `u_div_k = ∂_k χ` into the component-last
-array `u_div` (size `(dims..., N)`). Masked-out cells are zeroed.
+`u_rot_a = −Σ_b ∂_b R_ab`, moving each component of `R` from its corner onto the `a`-faces. The
+adjoint of [`curl!`](@ref), so `div(u_rot) = 0` holds discretely.
 """
-function cartesian_reconstruct_div!(u_div, χ, grid::StructuredGrid{N,<:CartesianGeometry{N,T}}) where {N,T}
-    spacing = grid.geometry.spacing
-    fill!(u_div, zero(T))
-    @inbounds for k in 1:N
-        out = _component(u_div, k, Val(N))
-        for I in CartesianIndices(grid.mask)
-            grid.mask[I] || continue
-            out[I] = _deriv(χ, grid, I, k, spacing[k])
-        end
-    end
-    return u_div
-end
-
-"""
-    cartesian_reconstruct_rot!(u_rot, R, grid)
-
-Reconstruct the rotational (divergence-free) velocity from the rotation potential `R`
-(component-last, size `(dims..., P)`). Each pair `(a,b)` contributes
-`u_rot_a -= ∂_b R_ab` and `u_rot_b += ∂_a R_ab`. Masked-out cells are zeroed.
-"""
-function cartesian_reconstruct_rot!(u_rot, R, grid::StructuredGrid{N,<:CartesianGeometry{N,T}}) where {N,T}
-    spacing = grid.geometry.spacing
-    pairs = rotation_pairs(Val(N))
-    fill!(u_rot, zero(T))
-    out = ntuple(c -> _component(u_rot, c, Val(N)), Val(N))
-    @inbounds for (p, (a, b)) in enumerate(pairs)
-        Rp = _component(R, p, Val(N))
-        ua = out[a]
-        ub = out[b]
-        for I in CartesianIndices(grid.mask)
-            grid.mask[I] || continue
-            ua[I] -= _deriv(Rp, grid, I, b, spacing[b])
-            ub[I] += _deriv(Rp, grid, I, a, spacing[a])
+function rotational_velocity!(u_rot::NTuple{N,<:AbstractArray}, R::NTuple,
+                              grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
+                              bc, fm::FaceMetrics{N,T} = face_metrics(grid, bc);
+                              backend = ComputationalBackends.SerialBackend()) where {G,T,N}
+    all_terms = rotation_terms(Val(N))
+    for c in 1:N
+        uc, ac = u_rot[c], fm.area[c]
+        terms = all_terms[c]
+        fcart = CartesianIndices(face_dims(grid, c))
+        FlowGeometries.Execution.run_indices(length(uc), backend) do lin
+            @inbounds begin
+                F = fcart[lin]
+                if iszero(ac[F])
+                    uc[F] = zero(T)
+                else
+                    acc = zero(T)
+                    # `u_rot_c` sits on a c-face, whose e-index is a CELL index; the two corners it
+                    # reads are the e-FACES either side of that cell, and the distance between them
+                    # is that cell's own physical width along e.
+                    for (e, p, s) in terms
+                        Rp = R[p]
+                        # Face indices, then shifted into the corner array. A corner that lands
+                        # outside it is one of the dropped outer pair, where `R = 0` — which is
+                        # exactly the Dirichlet ghost the dual grid is solved with, so reading
+                        # nothing there is the condition rather than an omission.
+                        Qlo = face_to_corner(grid, face_below(F, e), c, e)
+                        Qhi = face_to_corner(grid, face_above(grid, F, e), c, e)
+                        lo = checkbounds(Bool, Rp, Qlo) ? Rp[Qlo] : zero(T)
+                        hi = checkbounds(Bool, Rp, Qhi) ? Rp[Qhi] : zero(T)
+                        acc += T(s) * (hi - lo) / _transverse_width(grid, F, c, e, T)
+                    end
+                    uc[F] = acc
+                end
+            end
+            return nothing
         end
     end
     return u_rot
+end
+
+# Physical width along `e` at face `F` normal to `d`. `F`'s own `d`-slot is a face index, not a
+# valid cell index, so the coordinate width is taken from a cell the face touches — but the scale
+# factor is evaluated **at the face**, for the same reason `geometric_face_area` does: on a curved
+# metric the two adjacent cells disagree, and reading either one is wrong by half a cell.
+@inline function _transverse_width(grid, F::CartesianIndex{N}, d::Integer, e::Integer, ::Type{T}) where {N,T}
+    Cl = cell_below(grid, F, d)
+    Cu = cell_above(grid, F, d)
+    ref = Cu === nothing ? Cl : Cu
+    ref === nothing && return one(T)
+    geo = FlowGeometries.Grids.grid_geometry(grid)
+    h = FlowGeometries.Geometry.scale_factors(geo, _face_point(grid, Cl, Cu, d, Val(N)))[e]
+    return abs(T(h)) * T(FlowGeometries.Grids.cell_width(grid, e, ref[e]))
+end
+
+# ---------------------------------------------------------------------------
+# Collocated <-> staggered
+# ---------------------------------------------------------------------------
+#
+# Velocity arrives and leaves at cell centres, because that is how fields are stored; the
+# projection happens on faces, where it is exact. These two are adjoint, so the round trip does
+# not bias the split.
+
+"""
+    to_faces!(vf, uc, grid, bc) -> vf
+
+Cell-centred velocity `(dims..., N)` to face-normal velocity, averaging the two cells a face
+separates. A face of zero area takes nothing; an open boundary face has only one cell to read.
+"""
+function to_faces!(vf::NTuple{N,<:AbstractArray}, uc, grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
+                   bc, fm::FaceMetrics{N,T} = face_metrics(grid, bc); backend = ComputationalBackends.SerialBackend()) where {G,T,N}
+    for d in 1:N
+        vd, ad = vf[d], fm.area[d]
+        ud = _component(uc, d, Val(N))
+        fcart = CartesianIndices(face_dims(grid, d))
+        FlowGeometries.Execution.run_indices(length(vd), backend) do lin
+            @inbounds begin
+                F = fcart[lin]
+                if iszero(ad[F])
+                    vd[F] = zero(T)
+                else
+                    # A face with only one cell — an open boundary — averages the one it has, so
+                    # the weight count is computed rather than assumed to be two.
+                    lo = _cell_present(grid, F, d, false)
+                    hi = _cell_present(grid, F, d, true)
+                    s = _cell_value(ud, grid, F, d, false, T) + _cell_value(ud, grid, F, d, true, T)
+                    w = T(lo + hi)
+                    vd[F] = iszero(w) ? zero(T) : s / w
+                end
+            end
+            return nothing
+        end
+    end
+    return vf
+end
+
+@inline _cell_present(grid, F::CartesianIndex, d::Integer, upper::Bool) =
+    (upper ? cell_above(grid, F, d) : cell_below(grid, F, d)) === nothing ? 0 : 1
+
+"""
+    to_centres!(uc, vf, grid, bc) -> uc
+
+Face-normal velocity back to cell centres, averaging a cell's two faces — the adjoint of
+[`to_faces!`](@ref). A cell against a closed face averages only the faces that carry flux.
+"""
+function to_centres!(uc, vf::NTuple{N,<:AbstractArray}, grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
+                     bc, fm::FaceMetrics{N,T} = face_metrics(grid, bc); backend = ComputationalBackends.SerialBackend()) where {G,T,N}
+    msk = FlowGeometries.Grids.mask(grid)
+    cart = CartesianIndices(size(grid))
+    for d in 1:N
+        vd, ad = vf[d], fm.area[d]
+        ud = _component(uc, d, Val(N))
+        FlowGeometries.Execution.run_indices(length(ud), backend) do lin
+            @inbounds begin
+                I = cart[lin]
+                if msk[I]
+                    Fhi = face_above(grid, I, d)
+                    lo = iszero(ad[I]) ? zero(T) : vd[I]
+                    hi = iszero(ad[Fhi]) ? zero(T) : vd[Fhi]
+                    w = T((iszero(ad[I]) ? 0 : 1) + (iszero(ad[Fhi]) ? 0 : 1))
+                    ud[I] = iszero(w) ? zero(T) : (lo + hi) / w
+                else
+                    ud[I] = zero(T)
+                end
+            end
+            return nothing
+        end
+    end
+    return uc
 end
