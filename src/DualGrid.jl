@@ -51,7 +51,7 @@ end
 function _face_axis(grid::FlowGeometries.Grids.StructuredGrid{G,T,N}, x, d::Integer,
                     nf::Int) where {G,T,N}
     n = length(x)
-    out = Vector{T}(undef, nf)
+    out = similar(x, T, nf)
     if FlowGeometries.Grids.isperiodic(grid, d)
         # Face 1 is the seam, between the last cell and the first. The gap there is whatever the
         # period leaves over after the samples, which is the one gap not visible in `x`.

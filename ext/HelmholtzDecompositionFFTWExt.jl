@@ -170,8 +170,8 @@ The Laplacian's eigenvalue along one direction, per mode index, for that directi
 - Dirichlet (`RODFT10`): `−(4/h²)·sin²(π(k+1)/2n)` — the sine transform's lowest mode sits one
   step up, which is exactly why Dirichlet has no null mode and Neumann does.
 """
-function _axis_symbol(::Type{T}, n::Int, h::T, bc, periodic::Bool) where {T}
-    λ = Vector{T}(undef, n)
+function _axis_symbol(proto, ::Type{T}, n::Int, h::T, bc, periodic::Bool) where {T}
+    λ = similar(proto, T, n)
     @inbounds for i in 1:n
         s = if periodic
             sin(T(π) * T(min(i - 1, n - i + 1)) / T(n))
@@ -185,10 +185,11 @@ function _axis_symbol(::Type{T}, n::Int, h::T, bc, periodic::Bool) where {T}
     return λ
 end
 
-function _bounded_symbol(::Type{T}, dims::NTuple{N,Int}, h::NTuple{N,T}, bc,
+function _bounded_symbol(proto, ::Type{T}, dims::NTuple{N,Int}, h::NTuple{N,T}, bc,
                          periodic::NTuple{N,Bool}) where {T,N}
-    per_axis = ntuple(d -> _axis_symbol(T, dims[d], h[d], bc, periodic[d]), Val(N))
-    λ = zeros(T, dims)
+    per_axis = ntuple(d -> _axis_symbol(proto, T, dims[d], h[d], bc, periodic[d]), Val(N))
+    λ = similar(proto, T, dims)
+    fill!(λ, zero(T))
     @inbounds for I in CartesianIndices(dims)
         acc = zero(T)
         for d in 1:N
@@ -228,12 +229,12 @@ function HD.prepare_solver(
     dims = size(grid)
     h = ntuple(d -> abs(FG.Grids.spacing(grid, d)), Val(N))
     per = ntuple(d -> FG.Grids.isperiodic(grid, d), Val(N))
-    scratch = zeros(T, dims)
+    scratch = HD.allocate_zeros(nothing, T, dims)
     fwd = FFTW.plan_r2r!(scratch, ntuple(d -> _forward_kind(boundary, per[d]), Val(N)))
     inv = FFTW.plan_r2r!(scratch, ntuple(d -> _inverse_kind(boundary, per[d]), Val(N)))
     norm = one(T) / prod(ntuple(d -> _kind_norm(T, dims[d], per[d]), Val(N)))
     return BoundedState{T,typeof(scratch),typeof(fwd),typeof(inv)}(
-        fwd, inv, _bounded_symbol(T, dims, h, boundary, per), scratch, norm,
+        fwd, inv, _bounded_symbol(scratch, T, dims, h, boundary, per), scratch, norm,
     )
 end
 

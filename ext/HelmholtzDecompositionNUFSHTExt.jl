@@ -78,8 +78,8 @@ function _nodes(grid::FG.Grids.StructuredGrid{G,T,2}) where {G,T}
     nlon, nlat = size(grid)
     λ = FG.Grids.coordinates(grid, 1)
     φ = FG.Grids.coordinates(grid, 2)
-    θ = Vector{T}(undef, nlon * nlat)
-    Λ = Vector{T}(undef, nlon * nlat)
+    θ = similar(φ, T, nlon * nlat)
+    Λ = similar(λ, T, nlon * nlat)
     k = 0
     @inbounds for j in 1:nlat, i in 1:nlon
         k += 1
@@ -113,7 +113,7 @@ function HD.solve_poisson!(
     nlon, nlat = size(grid)
     θ, Λ = _nodes(grid)
 
-    rhs = Vector{T}(undef, nlon * nlat)
+    rhs = similar(RHS, T, nlon * nlat)
     k = 0
     @inbounds for j in 1:nlat, i in 1:nlon
         k += 1

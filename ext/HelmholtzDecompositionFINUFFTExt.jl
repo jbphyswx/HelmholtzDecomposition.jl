@@ -101,7 +101,7 @@ end
 # Column-wise inner product: the components are independent systems sharing a plan, so each keeps
 # its own conjugate-gradient scalars.
 @inline function _coldot(A::AbstractArray{Complex{T},3}, B::AbstractArray{Complex{T},3},
-                         out::Vector{T}) where {T}
+                         out::AbstractVector{T}) where {T}
     nk1, nk2, nc = size(A)
     @inbounds for c in 1:nc
         acc = zero(T)
@@ -137,7 +137,7 @@ function inverse_nufft!(F::AbstractArray{Complex{T},3}, vals::AbstractMatrix{Com
     nc = size(F, 3)
     b = similar(F); analyze!(b, vals, p)
     r = copy(b); d = copy(b); Ap = similar(F)
-    scratch = Matrix{Complex{T}}(undef, p.npoints, nc)
+    scratch = similar(vals, Complex{T}, p.npoints, nc)
     fill!(F, zero(Complex{T}))
     rs = zeros(T, nc); rs_new = zeros(T, nc); den = zeros(T, nc); bn = zeros(T, nc)
     _coldot(r, r, rs)
