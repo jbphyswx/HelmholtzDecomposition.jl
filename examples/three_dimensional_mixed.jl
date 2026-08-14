@@ -1,33 +1,35 @@
 """
-3-D Mixed Helmholtz Decomposition (ABC + gradient)
+3-D mixed decomposition (ABC + gradient).
 
-A field with both a rotational (solenoidal ABC) and a divergent (gradient) part. Both
-components come out nonzero, and `u_rot + u_div + u_harm` reconstructs the field.
+A field with both a solenoidal (ABC) and a divergent (gradient) part. Both come out nonzero and
+`u_rot + u_div + u_harm` reconstructs the field.
 """
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
+using FlowGeometries: FlowGeometries as FG
 using FFTW: FFTW
 
-relnorm(x) = sqrt(sum(abs2, x))
+const N = 32
+const L = 2π
+axis = range(0.0, L - L / N; length = N)
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), axis, axis, axis;
+                               topology = (true, true, true), period = (L, L, L))
 
-n = 32
-L = 2π
-h = L / n
-ax = collect(range(0, L - h, length = n))
-grid = HD.StructuredGrid(HD.CartesianGeometry(h, h, h), ax, ax, ax)
-
-U = zeros(n, n, n, 3)
-for k in 1:n, j in 1:n, i in 1:n
-    x, y, z = ax[i], ax[j], ax[k]
-    U[i, j, k, 1] = (sin(z) + cos(y)) - sin(x) * cos(y) * cos(z)   # ABC + ∂φ/∂x
-    U[i, j, k, 2] = (sin(x) + cos(z)) - cos(x) * sin(y) * cos(z)
-    U[i, j, k, 3] = (sin(y) + cos(x)) - cos(x) * cos(y) * sin(z)
+A, B, C = 1.0, 0.7, 0.5
+U = zeros(N, N, N, 3)
+for k in 1:N, j in 1:N, i in 1:N
+    x, y, z = axis[i], axis[j], axis[k]
+    # ABC (solenoidal) plus ∇(sin x sin y sin z) (irrotational).
+    U[i, j, k, 1] = A * sin(z) + C * cos(y) + cos(x) * sin(y) * sin(z)
+    U[i, j, k, 2] = B * sin(x) + A * cos(z) + sin(x) * cos(y) * sin(z)
+    U[i, j, k, 3] = C * sin(y) + B * cos(x) + sin(x) * sin(y) * cos(z)
 end
 
-result = HD.helmholtz_decompose_spectral(U, grid)
+result = HD.helmholtz_decompose(U, grid)
+mag(V) = sqrt.(sum(abs2, V; dims = 4))
 
-println("=== 3-D mixed (ABC + gradient), FFTW spectral ===")
-println("|u_rot| / |u|:        $(round(relnorm(result.u_rot) / relnorm(U), sigdigits = 4))")
-println("|u_div| / |u|:        $(round(relnorm(result.u_div) / relnorm(U), sigdigits = 4))")
-println("Reconstruction error: $(round(maximum(abs.(result.u_rot .+ result.u_div .+ result.u_harm .- U)), sigdigits = 4))")
-println("Both components non-negligible: $(relnorm(result.u_rot) > 1 && relnorm(result.u_div) > 1)")
+println("=== 3-D mixed (ABC + gradient) ===")
+println("Max |u_rot|:           $(round(maximum(mag(result.u_rot)), sigdigits = 4))")
+println("Max |u_div|:           $(round(maximum(mag(result.u_div)), sigdigits = 4))")
+println("Harmonic fraction:     $(round(result.harmonic_fraction, sigdigits = 4))")
+println("Reconstruction error:  $(round(maximum(abs.(result.u_rot .+ result.u_div .+ result.u_harm .- U)), sigdigits = 4))")

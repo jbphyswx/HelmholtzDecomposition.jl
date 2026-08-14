@@ -1,34 +1,34 @@
 """
-Spherical Non-divergent Field (Rossby Wave)
+Spherical non-divergent field (Rossby wave).
 
-Helmholtz decomposition on a spherical grid with a purely rotational field; the divergent
-component should be ≈ 0. Uses the SOR solver (load `FastSphericalHarmonics` or `NUFSHT`
-for an O(N log N) spectral solve).
+A purely rotational flow on a lat–lon sphere: the divergent component should vanish. The curved
+metric is what makes this a real test — the face areas carry the `cos φ` that closes the surface,
+and the operators are built so `curl ∘ grad = 0` holds on it exactly.
+
+`FastSphericalHarmonics` or `NUFSHT` give an `O(N log N)` spectral solve on a covering node set;
+this lat–lon grid is not one of theirs, so it takes the multigrid-preconditioned iterative path.
 """
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
-using Statistics: Statistics
+using FlowGeometries: FlowGeometries as FG
+
+include(joinpath(@__DIR__, "..", "reference_flows", "reference_flows.jl"))
 
 speed(U) = sqrt.(U[:, :, 1] .^ 2 .+ U[:, :, 2] .^ 2)
 
-Nlon = 72
-Nlat = 36
-grid = HD.StructuredGrid(HD.SphericalGeometry(1.0),
-    collect(range(0.0, 2π - 2π / Nlon, length = Nlon)), collect(range(-π / 3, π / 3, length = Nlat)))
+const NLON, NLAT = 64, 32
+λ = range(0, 2π - 2π / NLON; length = NLON)
+φ = range(-π / 2 + π / (2NLAT), π / 2 - π / (2NLAT); length = NLAT)
+grid = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(1.0), λ, φ;
+                               topology = (true, false), period = (2π, nothing))
 
-u, v, = HD.rossby_wave(grid)
+u, v, = ReferenceFlows.rossby_wave(grid)
 U = cat(u, v; dims = 3)
+result = HD.helmholtz_decompose(U, grid)
 
-solver = HD.SORSolver(; max_iter = 20_000, tol = 1e-6, boundary = HD.Dirichlet())
-result = HD.helmholtz_decompose(u, v, grid; solver = solver, boundary_χ = HD.Neumann(), boundary_ψ = HD.Dirichlet())
-
-rot_mag = Statistics.mean(speed(result.u_rot))
-div_mag = Statistics.mean(speed(result.u_div))
-
-println("=== Spherical Non-divergent (Rossby Wave), SOR ===")
-println("Mean |u_rot|:        $(round(rot_mag, sigdigits = 4))")
-println("Mean |u_div|:        $(round(div_mag, sigdigits = 4))  (should be ≈ 0)")
-println("Div/Rot ratio:       $(round(div_mag / rot_mag, sigdigits = 4))")
-println("Harmonic fraction:   $(round(result.harmonic_fraction, sigdigits = 4))")
-println("χ solve: converged=$(result.χ_solve.converged), $(result.χ_solve.iterations) iters")
-println("ψ solve: converged=$(result.rot_solve[1].converged), $(result.rot_solve[1].iterations) iters")
+println("=== Spherical non-divergent (Rossby wave) ===")
+println("solver:                $(nameof(typeof(HD.plan_helmholtz(grid).solver)))")
+println("|u_div| / |u|:         $(round(maximum(speed(result.u_div)) / maximum(speed(U)), sigdigits = 3))")
+println("Harmonic fraction:     $(round(result.harmonic_fraction, sigdigits = 4))")
+println("χ solve:               $(result.χ_solve.iterations) iterations, converged = $(result.χ_solve.converged)")
+println("Reconstruction error:  $(round(maximum(abs.(result.u_rot .+ result.u_div .+ result.u_harm .- U)), sigdigits = 4))")
