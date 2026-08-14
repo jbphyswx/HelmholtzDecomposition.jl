@@ -1,5 +1,9 @@
 # HelmholtzDecomposition.jl
 
+[![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://jbphyswx.github.io/HelmholtzDecomposition.jl/dev)
+[![Build Status](https://github.com/jbphyswx/HelmholtzDecomposition.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/jbphyswx/HelmholtzDecomposition.jl/actions/workflows/CI.yml?query=branch%3Amain)
+[![Coverage](https://codecov.io/gh/jbphyswx/HelmholtzDecomposition.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/jbphyswx/HelmholtzDecomposition.jl)
+
 Helmholtz–Hodge decomposition of velocity fields into **rotational** (divergence-free),
 **divergent** (curl-free), and **harmonic** components — in **1D/2D/3D and generically N-D**,
 on Cartesian and spherical grids, on **CPU and GPU**, with serial / threaded / distributed /
