@@ -57,7 +57,7 @@ using CoarseGrainingEnergyFluxes: CoarseGrainingEnergyFluxes
 using FFTW: FFTW  # or using NUFSHT: NUFSHT for spherical
 
 # Step 1: Helmholtz decomposition
-result = HelmholtzDecomposition.helmholtz_decompose(u, v, grid)
+result = HelmholtzDecomposition.helmholtz_decompose(cat(u, v; dims = 3), grid)
 
 # Step 2: Filter the scalar potentials
 # (CoarseGrainingEnergyFluxes provides the filtering machinery)

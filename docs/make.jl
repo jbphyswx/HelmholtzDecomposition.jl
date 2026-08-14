@@ -15,8 +15,10 @@ Documenter.makedocs(;
         "Architecture" => "architecture.md",
         "Examples" => "examples.md",
         "Coarse-Graining Workflow" => "coarse_graining_workflow.md",
+        "API" => "api.md",
+        "Internals" => "internals.md",
     ],
-    warnonly = true,
+    warnonly = false,
 )
 
 Documenter.deploydocs(;

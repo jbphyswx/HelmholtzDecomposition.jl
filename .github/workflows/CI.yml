@@ -66,6 +66,12 @@ jobs:
     name: Documentation
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # `deploydocs` pushes to gh-pages with GITHUB_TOKEN, which is read-only by default. Without
+    # this the build succeeds and the deploy silently does nothing.
+    permissions:
+      contents: write
+      pull-requests: read
+      statuses: write
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2

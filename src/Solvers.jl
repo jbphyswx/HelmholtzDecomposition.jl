@@ -34,6 +34,21 @@ Supertype for Poisson solvers. Concrete subtypes implement
 abstract type AbstractPoissonSolver end
 
 """
+    solve_poisson!(Φ, RHS, grid, solver; boundary, coefficients, state, backend) -> SolverResult
+
+Solve `L Φ = RHS` in place, with `L` the operator `Operators.jl` builds.
+
+`coefficients` and `state` are the reusable parts — the Hodge factors of every face, and whatever
+the solver prepared for this `(grid, boundary)` pair. A decomposition solves `P + 1` right-hand
+sides and a batch multiplies that by the field count, so both are built once and passed in rather
+than derived here.
+
+Extensions add methods for their own solver types; the iterative [`CGSolver`](@ref) is the one that
+works on any grid, mask and boundary condition.
+"""
+function solve_poisson! end
+
+"""
     SolverResult{T}
 
 Convergence diagnostics from a solve: whether it met its tolerance, how many iterations it took

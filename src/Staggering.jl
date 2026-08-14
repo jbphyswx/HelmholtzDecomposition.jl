@@ -85,6 +85,11 @@ Shape of the array holding a rotation-potential component staggered in both `a` 
     CartesianIndex(ntuple(e -> F[e] - (e == a ? corner_offset(grid, a) :
                                        e == b ? corner_offset(grid, b) : 0), Val(N)))
 
+"""
+    allocate_corners(T, grid; backend) -> NTuple{P,AbstractArray{T,N}}
+
+One zeroed corner array per rotation pair, shaped by [`corner_dims`](@ref).
+"""
 allocate_corners(::Type{T}, grid::FlowGeometries.Grids.StructuredGrid{G,TT,N};
                  backend = ComputationalBackends.SerialBackend()) where {T,G,TT,N} =
     ntuple(p -> allocate_zeros(backend, T, corner_dims(grid, rotation_pairs(Val(N))[p]...)),

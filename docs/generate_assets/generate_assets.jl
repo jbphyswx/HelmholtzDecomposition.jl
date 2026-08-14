@@ -4,7 +4,7 @@ Generate static figure assets for HelmholtzDecomposition.jl docs.
 Run from this directory:
     julia --project=. generate_assets.jl
 
-Outputs PNG files to ../assets/ which are checked into the repo and referenced from
+Outputs PNG files to ../src/assets/ which are checked into the repo and referenced from
 README.md and docs/ markdown. A single, consistent colorscheme is used throughout:
 signed fields use the diverging `:balance` map (symmetric range); magnitudes use the
 sequential `:dense` map.
@@ -18,7 +18,7 @@ using HelmholtzDecomposition: HelmholtzDecomposition as HD
 
 include(joinpath(@__DIR__, "..", "..", "reference_flows", "reference_flows.jl"))
 
-const ASSETS_DIR = joinpath(@__DIR__, "..", "assets")
+const ASSETS_DIR = joinpath(@__DIR__, "..", "src", "assets")
 mkpath(ASSETS_DIR)
 
 const DIVERGING = :balance     # signed fields (velocity components, potentials)

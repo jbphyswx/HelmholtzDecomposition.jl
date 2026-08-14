@@ -4,31 +4,31 @@
 
 ### Taylor-Green Vortex (purely rotational)
 
-![Taylor-Green Decomposition](../assets/taylor_green_decomposition.png)
+![Taylor-Green Decomposition](assets/taylor_green_decomposition.png)
 
 ### Vortex + Source (mixed rotational and divergent)
 
-![Mixed Field Decomposition](../assets/mixed_field_decomposition.png)
+![Mixed Field Decomposition](assets/mixed_field_decomposition.png)
 
 ### Point Source (purely divergent)
 
-![Point Source Decomposition](../assets/point_source_decomposition.png)
+![Point Source Decomposition](assets/point_source_decomposition.png)
 
 ### Harmonic circulation on an annulus (multiply-connected)
 
-![Harmonic Annulus Decomposition](../assets/harmonic_annulus_decomposition.png)
+![Harmonic Annulus Decomposition](assets/harmonic_annulus_decomposition.png)
 
 ### 3-D ABC (Beltrami) flow — `z` mid-slice
 
-![3-D Decomposition](../assets/three_dimensional_decomposition.png)
+![3-D Decomposition](assets/three_dimensional_decomposition.png)
 
 ### 3-D mixed field — `z` mid-slice
 
-![3-D Mixed Decomposition](../assets/three_dimensional_mixed_decomposition.png)
+![3-D Mixed Decomposition](assets/three_dimensional_mixed_decomposition.png)
 
 ### Spherical mixed flow (Kelvin–Ekman, NUFSHT)
 
-![Spherical Decomposition](../assets/spherical_decomposition.png)
+![Spherical Decomposition](assets/spherical_decomposition.png)
 
 Velocity-like result fields use a component-last layout `(dims..., N)`; index the last
 axis (or use `cat(u, v; dims=3)` to build inputs). Runnable scripts live in `examples/`.
@@ -119,7 +119,7 @@ integrates over all of `S²`, so a patch does not determine the solution even on
 ## Coarse-Graining Workflow
 
 ```julia
-result = HD.helmholtz_decompose(u, v, grid)
+result = HD.helmholtz_decompose(cat(u, v; dims = 3), grid)
 
 # Filter the scalar potentials (use your filtering package) — this is what commutes with ∇.
 ψ_filtered = your_filter(HD.streamfunction(result), grid, filter_scale)

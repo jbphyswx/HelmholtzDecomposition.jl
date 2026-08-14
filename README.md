@@ -26,43 +26,43 @@ Then for coarse-graining: filter ψ̄, χ̄ as scalars → reconstruct velocity 
 
 ### Taylor-Green Vortex (purely rotational → divergent component ≈ 0)
 
-![Taylor-Green Decomposition](docs/assets/taylor_green_decomposition.png)
+![Taylor-Green Decomposition](docs/src/assets/taylor_green_decomposition.png)
 
 ### Vortex + Source (mixed rotational and divergent)
 
-![Mixed Field Decomposition](docs/assets/mixed_field_decomposition.png)
+![Mixed Field Decomposition](docs/src/assets/mixed_field_decomposition.png)
 
 ### Point Source (purely divergent → rotational component ≈ 0)
 
-![Point Source Decomposition](docs/assets/point_source_decomposition.png)
+![Point Source Decomposition](docs/src/assets/point_source_decomposition.png)
 
 ### Harmonic circulation on an annulus (multiply-connected domain)
 
 A pure circulation around a masked hole is **harmonic** — `u_rot ≈ 0`, `u_div ≈ 0`, and the
 whole field lands in `u_harm` (`harmonic_fraction ≈ 1`, `count_holes = 1`).
 
-![Harmonic Annulus Decomposition](docs/assets/harmonic_annulus_decomposition.png)
+![Harmonic Annulus Decomposition](docs/src/assets/harmonic_annulus_decomposition.png)
 
 ### 3-D ABC (Beltrami) flow (`z` mid-slice)
 
 A fully solenoidal 3-D field: the rotational part recovers the original and the divergent
 part vanishes.
 
-![3-D Decomposition](docs/assets/three_dimensional_decomposition.png)
+![3-D Decomposition](docs/src/assets/three_dimensional_decomposition.png)
 
 ### 3-D mixed field (`z` mid-slice)
 
 A 3-D field with **both** components (solenoidal ABC + a gradient): the decomposition
 splits `uₓ` into a nonzero rotational and a nonzero divergent part.
 
-![3-D Mixed Decomposition](docs/assets/three_dimensional_mixed_decomposition.png)
+![3-D Mixed Decomposition](docs/src/assets/three_dimensional_mixed_decomposition.png)
 
 ### Spherical mixed flow (Kelvin–Ekman, NUFSHT)
 
 Decomposition on a longitude–latitude grid via the non-uniform spherical-harmonic
 transform: a rotational core plus a smaller divergent (Ekman-like) part.
 
-![Spherical Decomposition](docs/assets/spherical_decomposition.png)
+![Spherical Decomposition](docs/src/assets/spherical_decomposition.png)
 
 ## Solver Extensions ⚠️
 
