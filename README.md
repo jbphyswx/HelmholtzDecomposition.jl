@@ -1,6 +1,6 @@
 # HelmholtzDecomposition.jl
 
-[![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://jbphyswx.github.io/HelmholtzDecomposition.jl/dev)
+[![Documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://jbphyswx.github.io/HelmholtzDecomposition.jl/dev/)
 [![Build Status](https://github.com/jbphyswx/HelmholtzDecomposition.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/jbphyswx/HelmholtzDecomposition.jl/actions/workflows/CI.yml?query=branch%3Amain)
 [![Coverage](https://codecov.io/gh/jbphyswx/HelmholtzDecomposition.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/jbphyswx/HelmholtzDecomposition.jl)
 
