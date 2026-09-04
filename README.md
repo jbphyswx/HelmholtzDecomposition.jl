@@ -68,32 +68,38 @@ transform: a rotational core plus a smaller divergent (Ekman-like) part.
 
 ![Spherical Decomposition](docs/src/assets/spherical_decomposition.png)
 
-## Solver Extensions ⚠️
+## Solver extensions
 
-The base package includes only an iterative SOR solver (Red-Black Successive Over-Relaxation). While correct, it is **orders of magnitude slower** than spectral solvers for large grids.
+The base package solves any grid, mask and boundary condition with multigrid-preconditioned
+conjugate gradients. Where a transform applies it is `O(N log N)`, and each arrives with its
+package:
 
-**Load the appropriate extension for your geometry:**
-
-| Geometry | Regular Grid | Irregular Grid |
+| Geometry | Regular grid | Irregular grid |
 |----------|-------------|----------------|
-| **Cartesian (periodic)** | `using FFTW` | `using FINUFFT` |
-| **Spherical** | `using FastSphericalHarmonics` | `using NUFSHT` |
+| **Cartesian** | `using FFTW` (periodic, bounded, channel) or `using AbstractFFTs` | `using FINUFFT` or `using NonuniformFFTs` |
+| **Spherical** | `using FastSphericalHarmonics` (Clenshaw–Curtis) | `using NUFSHT` (any covering node set) |
 
-The `AutoSolver()` (default) automatically picks the best loaded solver. If no spectral extension is loaded, it falls back to SOR with a `@debug` message.
+`AutoSolver()` (the default) picks among the loaded ones on the grid's own properties — mask, axis
+uniformity, topology and node layout.
+
+**Build axes from ranges.** FlowGeometries proves uniformity from the axis *type*, so a
+`collect`ed range is a `Vector`, carries no such proof, and quietly costs every transform fast
+path.
 
 ## Quick Start
 
 ```julia
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
+using FlowGeometries: FlowGeometries as FG
 using FFTW: FFTW  # load a spectral extension
 
-grid = HD.StructuredGrid(HD.CartesianGeometry(1000.0, 1000.0),
-                         collect(0.0:1000.0:99000.0), collect(0.0:1000.0:99000.0))
+xs = range(0.0, 99_000.0; length = 100)      # a range: uniformity provable from the type
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs)
 
-# Physical-space decomposition (mask/BC-aware; SOR or spectral Poisson solve)
+# Physical-space decomposition (mask- and boundary-aware; a transform where one applies)
 result = HD.helmholtz_decompose(u, v, grid)
 
-# Or the fast spectral path (returns physical fields via inverse transform)
+# Or the fully spectral path (exact derivatives, physical fields back)
 result = HD.helmholtz_decompose_spectral(u, v, grid)
 
 # Velocity-like fields use a component-last layout (dims..., N):
@@ -128,22 +134,38 @@ projection → synthesis back to the points.
 
 ```julia
 using FINUFFT: FINUFFT
-pts = HD.ScatteredPoints(HD.CartesianGeometry(1.0, 1.0), X; box = (Lx, Ly))   # X is (M, 2)
+# One coordinate vector per direction, plus a control volume per node.
+pts = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (x, y), areas;
+                                periodic = (true, true), period = (Lx, Ly))
 res = HD.helmholtz_decompose_spectral(U, pts)   # U is (M, 2) → (; u_rot, u_div, u_harm)
 ```
 
-Scattered **Cartesian** (FINUFFT) and scattered **spherical** (NUFSHT) are both fully
-supported and accurate for arbitrary point sets. Scattered-spherical uses NUFSHT's
-spin-weighted (spin±1) scattered transforms: the tangent velocity `U = u_θ + i u_φ` is a
-spin-1 field, and the symmetric/antisymmetric parts of its spin(±1) coefficients give the
-rotational/divergent components (an exact Hodge split, no finite-difference stencil). For a
-spherical point cloud, build `ScatteredPoints(SphericalGeometry(R), lons, lats)`.
+On the sphere the same entry point takes **any node set covering `S²`**, through NUFSHT's
+spin-weighted transforms: the tangent velocity `V = u_θ + i u_φ` is a spin-1 field, and the
+symmetric and antisymmetric parts of its spin(±1) coefficients are its rotational and divergent
+components — an exact Hodge split with no finite-difference stencil.
+
+Because it asks only for node positions, one implementation covers every spherical layout
+FlowGeometries builds: lat–lon and the spectral quadrature grids, `UnstructuredGrid` point clouds,
+and the pixelizations (`HEALPixGrid`, `RingGrid`, `CubedSphereGrid`, `IcosahedralGrid`,
+`YinYangGrid`).
+
+```julia
+using NUFSHT: NUFSHT
+sph  = FG.Geometry.SphericalGeometry(1.0)
+grid = FG.Grids.StructuredGrid(sph, lons, lats; topology = (true, false), period = (2π, 0.0))
+res  = HD.helmholtz_decompose_spectral(U, grid)   # U is (nlon, nlat, 2) = (u_east, u_north)
+```
+
+The expansion degree is sized from the grid unless `lmax` is given, and a fit that does not
+converge raises.
 
 ### Multiply-connected domains (the harmonic part)
 
 ```julia
-mask = HD.disk_mask(grid; radius = 0.3)               # an annulus / domain with an island
-grid = HD.StructuredGrid(geom, xs, ys; mask = mask)
+# An island: any Bool array of the grid's shape, false where a cell is out of the domain.
+mask = [ (x - 0.5)^2 + (y - 0.5)^2 > 0.09 for x in xs, y in ys ]
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, ys; mask = mask)
 HD.count_holes(grid)                                  # 1  (b₁ of the active region)
 res = HD.helmholtz_decompose(u, v, grid)
 res.harmonic_fraction                                 # ≈ 1 for a pure circulation about the hole
@@ -181,11 +203,13 @@ The package keeps two orthogonal axes separate:
 
 | Solver | When to use |
 |--------|-------------|
-| `SORSolver` (base, dimension-generic) | masked domains, non-periodic BCs, small grids |
-| `CartesianSpectralSolver` (FFTW) | regular periodic Cartesian, any dimension |
-| `CartesianNUFFTSolver` (FINUFFT) | irregular/scattered 2-D Cartesian |
+| `CGSolver` (base, dimension-generic) | any grid: masked domains, any boundary condition, any geometry. Multigrid-preconditioned by default |
+| `CartesianSpectralSolver` (FFTW) | uniform periodic Cartesian, any dimension |
+| `CartesianBoundedSolver` (FFTW) | uniform Cartesian with any mix of bounded and periodic directions, including a channel |
+| `CartesianRealTransformSolver` (AbstractFFTs) | the same, through whichever backend owns the array |
+| `CartesianNUFFTSolver` (FINUFFT) / NonuniformFFTs | scattered 2-D Cartesian |
 | `SphericalSpectralSolver` (FastSphericalHarmonics) | Clenshaw–Curtis lat/lon (`Nlon = 2·Nlat−1`) |
-| `SphericalNUSHTSolver` (NUFSHT) | arbitrary / scattered spherical grids |
+| `SphericalNUSHTSolver` (NUFSHT) | any spherical node set covering `S²` |
 
 `AutoSolver` is mask-aware (never picks a periodic spectral solver on a masked domain) and
 prefers the regular FFT/SHT on structured grids.

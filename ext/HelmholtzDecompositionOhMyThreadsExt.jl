@@ -23,14 +23,17 @@ function HD._decompose_batch!(
     plan::HD.HelmholtzPlan; kwargs...,
 )
     items = collect(fields)
-    OhMyThreads.@tasks for i in eachindex(items)
-        # Per task, not per field: `length(items)` workspaces would allocate the batch away.
-        @local ws = HD.allocate_workspace(plan)
-        # Serial inner backend, named rather than assumed: the plan's own backend drives the
-        # operator and solver loops, so leaving it in place would have the outer and inner loops
-        # each claim every thread. Slices are disjoint views, so the writes do not race.
-        HD._decompose_slice!(batch, i, items[i], plan, ws;
-                             backend = ComputationalBackends.SerialBackend(), kwargs...)
+    # The whole parallel section sits inside the pin: a host transform library's thread count is
+    # process-global, so it is set once here for every task. See `HD.with_serial_transforms`.
+    HD.with_serial_transforms(plan.solver) do
+        OhMyThreads.@tasks for i in eachindex(items)
+            # `@local` gives one workspace per task, and the fields of that task share it.
+            @local ws = HD.allocate_workspace(plan)
+            # The batch axis claims the threads, so the operator and solver loops within one field
+            # run serially. Slices are disjoint views, so the writes do not race.
+            HD._decompose_slice!(batch, i, items[i], plan, ws;
+                                 backend = ComputationalBackends.SerialBackend(), kwargs...)
+        end
     end
     return batch
 end

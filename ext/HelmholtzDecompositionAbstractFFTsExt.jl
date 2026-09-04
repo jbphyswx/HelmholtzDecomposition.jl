@@ -28,6 +28,7 @@ which is exactly when this solver runs at all.
 module HelmholtzDecompositionAbstractFFTsExt
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
+using ComputationalBackends: ComputationalBackends as CB
 using FlowGeometries: FlowGeometries as FG
 using SpectralBackends: SpectralBackends as SB
 using AbstractFFTs: AbstractFFTs
@@ -56,11 +57,13 @@ HD.requires_uniform_axes(::CartesianRealTransformSolver) = true
 
 @inline _storage_vector(grid) = typeof(similar(FG.Grids.measure(grid), eltype(grid), 1))
 
-HD._require_sampling(::CartesianRealTransformSolver, grid) =
-    _has_backend(_storage_vector(grid)) ? nothing : throw(ArgumentError(
-        "CartesianRealTransformSolver needs an FFT backend for $(_storage_vector(grid)); " *
-        "`AbstractFFTs` alone is an interface and provides none. Load one (`using FFTW` on the " *
-        "host, or the array's own package on a device)."))
+HD.supports_sampling(::CartesianRealTransformSolver, grid) =
+    _has_backend(_storage_vector(grid))
+
+HD._sampling_message(::CartesianRealTransformSolver, grid) =
+    "CartesianRealTransformSolver needs an FFT backend for $(_storage_vector(grid)); " *
+    "`AbstractFFTs` alone is an interface and provides none. Load one (`using FFTW` on the " *
+    "host, or the array's own package on a device)."
 
 # ---------------------------------------------------------------------------
 # Real path: every direction bounded
@@ -86,18 +89,47 @@ struct DirPlan{E,S,FP,BP,W}
     tw::W
 end
 
-function _dir_plan(::Type{T}, dims::Dims{N}, d::Int, off::Int) where {T,N}
-    ext = zeros(T, ntuple(e -> e == d ? 2dims[e] : dims[e], Val(N)))
-    spec = zeros(complex(T), ntuple(e -> e == d ? dims[e] + 1 : dims[e], Val(N)))
+function _dir_plan(::Type{T}, dims::Dims{N}, d::Int, off::Int, backend) where {T,N}
+    ext = HD.allocate_zeros(backend, T, ntuple(e -> e == d ? 2dims[e] : dims[e], Val(N)))
+    spec = HD.allocate_zeros(backend, complex(T),
+                             ntuple(e -> e == d ? dims[e] + 1 : dims[e], Val(N)))
     return DirPlan(ext, spec, AbstractFFTs.plan_rfft(ext, d:d),
-                   AbstractFFTs.plan_brfft(spec, 2dims[d], d:d), _twiddle(T, dims[d], off, N, d))
+                   AbstractFFTs.plan_brfft(spec, 2dims[d], d:d),
+                   _twiddle(T, dims[d], off, N, d, backend))
 end
 
 # Symbol of the discrete `L` along one direction, so this inverts the operator the decomposition
 # differentiates with. `πk/n` where the direction wraps, `π(k+off)/2n` where it ends.
-@inline _axis_symbol(::Type{T}, k::Int, n::Int, h::T, periodic::Bool, off::Int) where {T} =
+@inline _axis_symbol(::Type{T}, k, n::Int, h::T, periodic::Bool, off::Int) where {T} =
     (s = periodic ? sin(T(π) * T(k) / T(n)) : sin(T(π) * T(k + off) / T(2n));
      -4 * s * s / (h * h))
+
+"""
+    _axis_symbols(T, dims, kdims, h, per, off, first_periodic, backend) -> NTuple{N,AbstractArray}
+
+The symbol of `L` as one vector per direction, each reshaped to broadcast along its own axis.
+
+`λ[I] = Σ_d λ_d(I[d])`, so `∑ n_d` numbers carry what an `N`-D array held, and the sum is formed at
+the one divide that reads it. Filled by broadcast over an index range, so the vectors land wherever
+the backend allocates.
+"""
+function _axis_symbols(::Type{T}, dims::NTuple{N,Int}, kdims::NTuple{N,Int}, h, per,
+                       off::Int, first_periodic::Int, backend) where {T,N}
+    return ntuple(Val(N)) do d
+        n, nk = dims[d], kdims[d]
+        v = HD.allocate_zeros(backend, T, (nk,))
+        i = reshape(1:nk, nk)
+        if !per[d] || d == first_periodic
+            # A bounded direction indexes its own modes; the halved periodic one runs `0 : n÷2`.
+            v .= _axis_symbol.(T, i .- 1, n, h[d], per[d], off)
+        else
+            # Full FFT order: the upper half stands for negative frequencies of equal magnitude.
+            v .= _axis_symbol.(T, ifelse.(i .- 1 .< cld(n, 2), i .- 1, n .- i .+ 1), n, h[d],
+                               true, off)
+        end
+        reshape(v, ntuple(e -> e == d ? nk : 1, Val(N)))
+    end
+end
 
 """
     RealBoundedState
@@ -136,45 +168,29 @@ Base.show(io::IO, ::MixedTopologyState{T,N}) where {T,N} =
     print(io, "MixedTopologyState{", T, ",", N, "}(…)")
 
 function HD.prepare_solver(::CartesianRealTransformSolver,
-                           grid::FG.Grids.StructuredGrid{<:FG.Geometry.AbstractCartesianGeometry,T,N},
-                           boundary::HD.AbstractBoundaryCondition) where {T,N}
+                           grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
+                           boundary::HD.AbstractBoundaryCondition;
+                           backend = CB.SerialBackend(), shared = nothing) where {T,N}
     dims = size(grid)
     off = boundary isa HD.Dirichlet ? 1 : 0
     per = ntuple(d -> FG.Grids.isperiodic(grid, d), Val(N))
     h = ntuple(d -> abs(FG.Grids.spacing(grid, d)), Val(N))
-    work = HD.allocate_zeros(nothing, T, dims)
+    work = HD.allocate_zeros(backend, T, dims)
 
     if !any(per)
-        dirs = ntuple(d -> _dir_plan(T, dims, d, off), Val(N))
-        λ = zeros(T, dims)
-        @inbounds for I in CartesianIndices(dims)
-            λ[I] = sum(d -> _axis_symbol(T, I[d] - 1, dims[d], h[d], false, off), 1:N)
-        end
+        dirs = ntuple(d -> _dir_plan(T, dims, d, off, backend), Val(N))
+        λ = _axis_symbols(T, dims, dims, h, per, off, 0, backend)
         return RealBoundedState{T,N,typeof(dirs),typeof(λ),typeof(work)}(dirs, λ, work)
     end
 
     bdims = Tuple(d for d in 1:N if !per[d])
     pdims = Tuple(d for d in 1:N if per[d])
-    dirs = map(d -> _dir_plan(T, dims, d, off), bdims)
-    spec = zeros(complex(T), ntuple(e -> e == pdims[1] ? dims[e] ÷ 2 + 1 : dims[e], Val(N)))
+    dirs = map(d -> _dir_plan(T, dims, d, off, backend), bdims)
+    spec = HD.allocate_zeros(backend, complex(T),
+                             ntuple(e -> e == pdims[1] ? dims[e] ÷ 2 + 1 : dims[e], Val(N)))
     pplan = AbstractFFTs.plan_rfft(work, pdims)
     iplan = AbstractFFTs.plan_brfft(spec, dims[pdims[1]], pdims)
-    kdims = size(spec)
-    λ = zeros(T, kdims)
-    @inbounds for I in CartesianIndices(kdims)
-        λ[I] = sum(1:N) do d
-            # A periodic direction after the halving carries `k = i − 1`; the others run in FFT
-            # order, where the upper half stands for negative frequencies of the same magnitude.
-            k = if !per[d]
-                I[d] - 1
-            elseif d == pdims[1]
-                I[d] - 1
-            else
-                I[d] - 1 < cld(dims[d], 2) ? I[d] - 1 : dims[d] - I[d] + 1
-            end
-            _axis_symbol(T, k, dims[d], h[d], per[d], off)
-        end
-    end
+    λ = _axis_symbols(T, dims, size(spec), h, per, off, pdims[1], backend)
     nrm = T(prod(d -> dims[d], pdims))
     return MixedTopologyState{T,N,typeof(dirs),typeof(pplan),typeof(iplan),typeof(λ),typeof(work),
                               typeof(spec)}(dirs, bdims, pdims, pplan, iplan, λ, work, spec, nrm)
@@ -223,7 +239,8 @@ function _solve!(Φ::AbstractArray{T,N}, RHS, st::RealBoundedState, boundary) wh
     for d in 1:N
         _forward_real!(st.work, st.dirs[d], d, odd)
     end
-    st.work .= ifelse.(iszero.(st.λ), zero(T), st.work ./ st.λ)
+    λ = HD.lazy_axis_sum(st.λ)
+    st.work .= ifelse.(iszero.(λ), zero(T), st.work ./ λ)
     for d in 1:N
         _inverse_real!(st.work, st.dirs[d], d, odd)
     end
@@ -241,7 +258,8 @@ function _solve!(Φ::AbstractArray{T,N}, RHS, st::MixedTopologyState, boundary) 
         _forward_real!(st.work, st.dirs[i], d, odd)
     end
     LinearAlgebra.mul!(st.spec, st.pplan, st.work)
-    st.spec .= ifelse.(iszero.(st.λ), zero(complex(T)), st.spec ./ st.λ)
+    λ = HD.lazy_axis_sum(st.λ)
+    st.spec .= ifelse.(iszero.(λ), zero(complex(T)), st.spec ./ λ)
     LinearAlgebra.mul!(st.work, st.iplan, st.spec)
     st.work ./= st.norm
     for (i, d) in enumerate(st.bdims)
@@ -251,9 +269,12 @@ function _solve!(Φ::AbstractArray{T,N}, RHS, st::MixedTopologyState, boundary) 
     return HD.SolverResult{T}(true, 1, zero(T))
 end
 
-@inline _twiddle(::Type{T}, n::Int, off::Int, nd::Int, d::Int) where {T} =
-    reshape([cis(-T(π) * T(k + off) / T(2n)) for k in 0:(n - 1)],
-            ntuple(e -> e == d ? n : 1, nd))
+function _twiddle(::Type{T}, n::Int, off::Int, nd::Int, d::Int, backend) where {T}
+    w = HD.allocate_zeros(backend, complex(T), (n,))
+    k = reshape(0:(n - 1), n)
+    w .= cis.(.-T(π) .* T.(k .+ off) ./ T(2n))
+    return reshape(w, ntuple(e -> e == d ? n : 1, nd))
+end
 
 """
     solve_poisson!(Φ, RHS, grid, solver; boundary, state)
@@ -265,7 +286,7 @@ keyword's type are the *same* method, and the second silently replaces the first
 function HD.solve_poisson!(
     Φ::AbstractArray{T,N},
     RHS::AbstractArray{T,N},
-    grid::FG.Grids.StructuredGrid{<:FG.Geometry.AbstractCartesianGeometry,T,N},
+    grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
     solver::CartesianRealTransformSolver;
     boundary::HD.AbstractBoundaryCondition = HD.Neumann(),
     state = HD.prepare_solver(solver, grid, boundary),

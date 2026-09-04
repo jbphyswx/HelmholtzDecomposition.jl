@@ -34,7 +34,7 @@ a curved grid is trigonometry per cell per direction — is invariant across sol
 across the `P + 1` potentials, and across a whole batch. Rebuilding it per call is the single
 largest avoidable cost in a decomposition, so it is built here and only read afterwards.
 """
-struct HelmholtzPlan{N,P,T,G,BC,LC,FM,DG,DC,SV,DSV,EB}
+struct HelmholtzPlan{N,P,T,G,BC,LC,FM,DG,DC,SV,DSV,EB,SH,DSH}
     grid::G
     boundary::BC
     coefficients::LC
@@ -44,6 +44,10 @@ struct HelmholtzPlan{N,P,T,G,BC,LC,FM,DG,DC,SV,DSV,EB}
     solver::SV
     dual_solvers::DSV
     backend::EB
+    # The read-only half of each solver's state — the multigrid hierarchy is the one that costs
+    # anything to build. A batch builds it once here; a task adds only the vectors it writes.
+    shared::SH
+    dual_shared::DSH
 end
 
 """
@@ -63,7 +67,7 @@ field is parallel rather than only a batch of them. A batch overrides it with a 
 backend, because an outer and an inner loop each claiming every thread is slower than either.
 """
 function plan_helmholtz(
-    grid::FlowGeometries.Grids.StructuredGrid{G,T,N};
+    grid::FaceIndexedGrid{T,G,N};
     boundary::AbstractBoundaryCondition = Neumann(),
     solver::AbstractPoissonSolver = AutoSolver(),
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
@@ -75,8 +79,8 @@ function plan_helmholtz(
     # Everything geometric is assembled on the host, where the coordinates and scale factors are:
     # this is one-off work, and the inner loops only ever read its results. Choosing and preparing
     # the solver also reads the mask, so both happen before anything moves.
-    hcoeff = laplacian_coefficients(grid, boundary)
     hmetrics = face_metrics(grid, boundary)
+    hcoeff = laplacian_coefficients(grid, boundary, hmetrics)
     hduals = ntuple(p -> dual_grid(grid, pairs[p][1], pairs[p][2], boundary), Val(P))
     # `Dirichlet`, whatever the primal condition is. The rotation potential is pinned to zero on
     # the corners the dual grid drops — a closed boundary is a streamline, so `R` is constant along
@@ -85,21 +89,28 @@ function plan_helmholtz(
     dbc = Dirichlet()
     hdcoef = ntuple(p -> laplacian_coefficients(hduals[p], dbc), Val(P))
 
-    # Only the CHOICE is made here; the state each solver writes through is per task and is built
-    # by `allocate_workspace`. A dual grid has its own dimensions and mask, so it chooses its own.
+    # The solver's CHOICE and its read-only state are made here; the buffers each task writes
+    # through are built by `allocate_workspace`. A dual grid has its own dimensions and mask, so it
+    # chooses its own.
     concrete = select_solver(solver, grid, boundary)
     dsolvers = ntuple(p -> select_solver(solver, hduals[p], dbc), Val(P))
+    hshared = prepare_shared(concrete, grid, boundary)
+    hdshared = ntuple(p -> prepare_shared(dsolvers[p], hduals[p], dbc), Val(P))
 
     g = to_backend(exec, grid)
     coeff = to_backend(exec, hcoeff)
     metrics = to_backend(exec, hmetrics)
     duals = ntuple(p -> to_backend(exec, hduals[p]), Val(P))
     dcoef = ntuple(p -> to_backend(exec, hdcoef[p]), Val(P))
+    # The shared solver state is assembled on the host alongside the coefficients and moves with
+    # them; a kernel reads it during every solve.
+    shared = to_backend(exec, hshared)
+    dshared = ntuple(p -> to_backend(exec, hdshared[p]), Val(P))
 
     return HelmholtzPlan{N,P,T,typeof(g),typeof(boundary),typeof(coeff),typeof(metrics),
                          typeof(duals),typeof(dcoef),typeof(concrete),typeof(dsolvers),
-                         typeof(exec)}(
-        g, boundary, coeff, metrics, duals, dcoef, concrete, dsolvers, exec,
+                         typeof(exec),typeof(shared),typeof(dshared)}(
+        g, boundary, coeff, metrics, duals, dcoef, concrete, dsolvers, exec, shared, dshared,
     )
 end
 
@@ -114,35 +125,56 @@ primal and dual grids — so a batch shares exactly one, which is the whole poin
 expensive part. A workspace holds the face and corner buffers, which every field writes through,
 so each task needs its own; sharing one across threads would race on them.
 """
-struct HelmholtzWorkspace{FV,CV,SC,ST,DST}
+struct HelmholtzWorkspace{FV,CV,ST,DST}
     v::FV               # face velocity
     gχ::FV              # face gradient of χ
     urot::FV            # face rotational velocity
     W::CV               # corner vorticity, one array per pair
-    R::CV               # corner rotation potential
-    scratch::SC         # cell scratch
     state::ST           # solver state, primal grid
     dual_states::DST    # solver state, one per dual grid
 end
 
 """
+    _WORKSPACE_LOCK
+
+Held while a workspace is built.
+
+Every transform plan a decomposition uses is constructed here, through `prepare_solver`. Those plans
+come from FFTW's planner, which keeps one process-global table and is not thread safe, and the
+libraries reaching it — `FFTW.jl`, `FastTransforms` under `FastSphericalHarmonics`, `NUFSHT` — each
+guard only their own calls. One lock at this level covers them together, since a batch builds every
+plan it will use inside this function.
+
+Uncontended on the root task, and taken once per task in a batch.
+"""
+const _WORKSPACE_LOCK = ReentrantLock()
+
+"""
     allocate_workspace(plan) -> HelmholtzWorkspace
 
 Buffers for one task working through `plan`.
+
+Plan construction is serialised — see [`_WORKSPACE_LOCK`](@ref).
 """
-function allocate_workspace(plan::HelmholtzPlan{N,P,T}) where {N,P,T}
+allocate_workspace(plan::HelmholtzPlan) =
+    Base.lock(() -> _allocate_workspace(plan), _WORKSPACE_LOCK)
+
+function _allocate_workspace(plan::HelmholtzPlan{N,P,T}) where {N,P,T}
     grid, b, bc = plan.grid, plan.backend, plan.boundary
     # Solver state belongs here and not on the plan: it holds the buffers a solve writes through —
     # the conjugate-gradient vectors, the multigrid level arrays, the transform scratch — so a
     # threaded batch sharing one plan would have every task writing the same ones.
-    state = prepare_solver(plan.solver, grid, bc)
-    dual_states = ntuple(p -> prepare_solver(plan.dual_solvers[p], plan.dual_grids[p], Dirichlet()),
-                         Val(P))
+    state = prepare_solver(plan.solver, grid, bc; backend = b, shared = plan.shared)
+    # Mapped across the tuples for the reason `_solve_potentials!` is — a workspace is built once
+    # per task, so a dynamic dispatch here is paid by every member of a batch.
+    dual_states = map(plan.dual_solvers, plan.dual_grids, plan.dual_shared) do ds, dg, sh
+        prepare_solver(ds, dg, Dirichlet(); backend = b, shared = sh)
+    end
     return HelmholtzWorkspace(
         allocate_faces(T, grid; backend = b), allocate_faces(T, grid; backend = b),
         allocate_faces(T, grid; backend = b),
-        allocate_corners(T, grid; backend = b), allocate_corners(T, grid; backend = b),
-        allocate_zeros(b, T, size(grid)), state, dual_states,
+        allocate_corners(T, grid; backend = b),
+        state, dual_states,
     )
 end
 
@@ -155,6 +187,19 @@ Base.show(io::IO, p::HelmholtzPlan{N,P,T}) where {N,P,T} =
 # ---------------------------------------------------------------------------
 
 """
+    AbstractHelmholtzResult{N,P,T}
+
+What a decomposition writes into. Every subtype carries `χ`, `rotation_potential`, `divergence`
+and the two convergence diagnostics; [`HelmholtzResult`](@ref) adds the collocated velocity parts
+and [`PotentialsResult`](@ref) stops at the potentials.
+
+The accessors that read only the shared fields — [`velocity_potential`](@ref),
+[`streamfunction`](@ref), [`vector_potential`](@ref), [`corner_rotation_potential`](@ref) — are
+defined on this type once.
+"""
+abstract type AbstractHelmholtzResult{N,P,T<:AbstractFloat} end
+
+"""
     HelmholtzResult
 
 Velocity-like fields use the component-last layout `(dims..., N)`; potentials and scalar
@@ -164,7 +209,8 @@ The array fields are `const` and the diagnostics are not: an in-place decomposit
 convergence information into the result it was handed rather than allocating a fresh struct to
 carry two numbers.
 """
-mutable struct HelmholtzResult{N,P,T<:AbstractFloat,AV<:AbstractArray{T},AS<:AbstractArray{T,N},CV}
+mutable struct HelmholtzResult{N,P,T<:AbstractFloat,AV<:AbstractArray{T},AS<:AbstractArray{T,N},
+                               CV} <: AbstractHelmholtzResult{N,P,T}
     const u_rot::AV
     const u_div::AV
     const u_harm::AV
@@ -179,7 +225,46 @@ mutable struct HelmholtzResult{N,P,T<:AbstractFloat,AV<:AbstractArray{T},AS<:Abs
     rot_solve::NTuple{P,SolverResult{T}}
 end
 
-@inline Base.ndims(::HelmholtzResult{N}) where {N} = N
+"""
+    PotentialsResult
+
+The scalar potentials alone: `χ` at cell centres, the rotation potential `R` on the corner grid,
+the divergence that drove the `χ` solve, and the convergence diagnostics.
+
+Filtering works on these — on the sphere, coarse-graining commutes with the differential operators
+when it is applied to `ψ` and `χ` as scalars (Aluie 2019). No collocated velocity array is
+allocated: [`helmholtz_decompose!`](@ref) dispatches on this type, stops after the potentials, and
+never interpolates back to cell centres or forms the norms.
+
+Array fields are `const` and the diagnostics are not, as on [`HelmholtzResult`](@ref).
+"""
+mutable struct PotentialsResult{N,P,T<:AbstractFloat,AS<:AbstractArray{T,N},CV} <:
+               AbstractHelmholtzResult{N,P,T}
+    const χ::AS
+    const rotation_potential::CV
+    const divergence::AS
+    χ_solve::SolverResult{T}
+    rot_solve::NTuple{P,SolverResult{T}}
+end
+
+@inline Base.ndims(::AbstractHelmholtzResult{N}) where {N} = N
+
+"""
+    allocate_potentials(plan) -> PotentialsResult
+
+Buffers for the potentials alone: `χ`, `R` and the divergence, against the three `(dims…, N)`
+velocity arrays [`allocate_result`](@ref) adds.
+"""
+function allocate_potentials(plan::HelmholtzPlan{N,P,T}) where {N,P,T}
+    dims = size(plan.grid)
+    b = plan.backend
+    dummy = SolverResult{T}(false, 0, zero(T))
+    Rpot = allocate_corners(T, plan.grid; backend = b)
+    χ = allocate_zeros(b, T, dims)
+    return PotentialsResult{N,P,T,typeof(χ),typeof(Rpot)}(
+        χ, Rpot, allocate_zeros(b, T, dims), dummy, ntuple(_ -> dummy, Val(P)),
+    )
+end
 
 """
     allocate_result(plan) -> HelmholtzResult
@@ -333,19 +418,20 @@ face_divergent(ws::HelmholtzWorkspace) = ws.gχ
 face_rotational(ws::HelmholtzWorkspace) = ws.urot
 
 """
-    corner_rotation_potential(ws) -> NTuple{P,Array}
+    corner_rotation_potential(result) -> NTuple{P,AbstractArray}
 
-`R` on the corner (dual) grid, one array per rotation pair — see [`face_velocity`](@ref).
+`R` on the corner (dual) grid, one array per rotation pair. The solve writes here, so this is the
+staggered field itself — see [`face_velocity`](@ref).
 """
-corner_rotation_potential(ws::HelmholtzWorkspace) = ws.R
+corner_rotation_potential(r::AbstractHelmholtzResult) = r.rotation_potential
 
 """
     streamfunction(result) -> Array
 
 The 2-D streamfunction `ψ`, on the corner (dual) grid. Only defined in 2D.
 """
-streamfunction(r::HelmholtzResult{2}) = r.rotation_potential[1]
-streamfunction(::HelmholtzResult{N}) where {N} = throw(ArgumentError(
+streamfunction(r::AbstractHelmholtzResult{2}) = r.rotation_potential[1]
+streamfunction(::AbstractHelmholtzResult{N}) where {N} = throw(ArgumentError(
     "streamfunction is only defined in 2D (got N=$N); use `vector_potential` in 3D or " *
     "`rotation_potential` generally"))
 
@@ -354,7 +440,7 @@ streamfunction(::HelmholtzResult{N}) where {N} = throw(ArgumentError(
 
 The scalar velocity potential `χ`, at cell centres, in any dimension.
 """
-velocity_potential(r::HelmholtzResult) = r.χ
+velocity_potential(r::AbstractHelmholtzResult) = r.χ
 
 """
     vector_potential(result) -> (A1, A2, A3)
@@ -362,11 +448,11 @@ velocity_potential(r::HelmholtzResult) = r.χ
 The 3-D vector potential, the Hodge dual of the rotation potential: `A1 = R_23`, `A2 = −R_13`,
 `A3 = R_12`. Only defined in 3D.
 """
-function vector_potential(r::HelmholtzResult{3})
+function vector_potential(r::AbstractHelmholtzResult{3})
     R12, R13, R23 = r.rotation_potential
     return (R23, -1 .* R13, R12)
 end
-vector_potential(::HelmholtzResult{N}) where {N} =
+vector_potential(::AbstractHelmholtzResult{N}) where {N} =
     throw(ArgumentError("vector_potential is only defined in 3D (got N=$N)"))
 
 # ---------------------------------------------------------------------------
@@ -378,21 +464,58 @@ vector_potential(::HelmholtzResult{N}) where {N} =
 
 Decompose the cell-centred, component-last velocity `u` into `result`, in place.
 
-The solver is not an argument here: it is fixed by `plan`. Accepting one would either be ignored —
-a silent no-op — or force the plan's transform state to be rebuilt for a different solver, which
-is the per-call cost the plan exists to remove. Pass `solver` to [`plan_helmholtz`](@ref).
+How far the work goes is the `result`'s type. A [`PotentialsResult`](@ref) stops once `χ` and `R`
+are solved; a [`HelmholtzResult`](@ref) goes on to reconstruct the collocated velocity parts and
+the harmonic fraction. Neither takes a flag, and neither allocates a buffer only the other uses.
+
+`plan` fixes the solver; select one with [`plan_helmholtz`](@ref).
 """
+function helmholtz_decompose!(
+    result::PotentialsResult{N,P,T}, u::AbstractArray, plan::HelmholtzPlan{N,P,T},
+    ws::HelmholtzWorkspace = allocate_workspace(plan);
+    backend = plan.backend,
+) where {N,P,T}
+    _check_velocity(u, plan, Val(N))
+    return _solve_potentials!(result, u, plan, ws, backend)
+end
+
+@inline function _check_velocity(u, plan::HelmholtzPlan{N}, ::Val{N}) where {N}
+    size(u) == (size(plan.grid)..., N) || throw(DimensionMismatch(
+        "velocity array size $(size(u)) does not match (dims..., N) = $((size(plan.grid)..., N))"))
+    return nothing
+end
+
 function helmholtz_decompose!(
     result::HelmholtzResult{N,P,T}, u::AbstractArray, plan::HelmholtzPlan{N,P,T},
     ws::HelmholtzWorkspace = allocate_workspace(plan);
     backend = plan.backend,
 ) where {N,P,T}
+    _check_velocity(u, plan, Val(N))
+    _solve_potentials!(result, u, plan, ws, backend)
+
     grid, bc = plan.grid, plan.boundary
-    size(u) == (size(grid)..., N) || throw(DimensionMismatch(
-        "velocity array size $(size(u)) does not match (dims..., N) = $((size(grid)..., N))"))
+    rotational_velocity!(ws.urot, result.rotation_potential, grid, bc, plan.metrics;
+                         backend = backend)
+    # Back to centres, and the harmonic remainder.
+    to_centres!(result.u_div, ws.gχ, grid, bc, plan.metrics; backend = backend)
+    to_centres!(result.u_rot, ws.urot, grid, bc, plan.metrics; backend = backend)
+    @. result.u_harm = u - result.u_div - result.u_rot
+    _zero_inactive!(result.u_harm, grid, Val(N); backend = backend)
+
+    den = velocity_norm(u, grid; backend = backend)
+    result.harmonic_fraction = iszero(den) ? zero(T) :
+                               velocity_norm(result.u_harm, grid; backend = backend) / den
+    return result
+end
+
+# `χ` and `R`: what both entry points share. Writes only fields the two result types have in
+# common, so one body serves both.
+function _solve_potentials!(result, u::AbstractArray, plan::HelmholtzPlan{N,P,T},
+                            ws::HelmholtzWorkspace, backend) where {N,P,T}
+    grid, bc = plan.grid, plan.boundary
 
     # Both the solver choice and its transform state come from the plan: neither depends on `u`,
-    # so a batch resolves and builds them once in total rather than once per field.
+    # so a batch resolves and builds them once in total across the fields.
     concrete = plan.solver
     state = ws.state
 
@@ -401,7 +524,8 @@ function helmholtz_decompose!(
 
     # 2. δ = D u, and the solvability condition where the constants are in L's null space.
     divergence!(result.divergence, ws.v, grid, bc, plan.metrics; backend = backend)
-    plan.coefficients.singular && project_out_constant!(result.divergence, grid, plan.coefficients)
+    plan.coefficients.singular &&
+        project_out_constant!(result.divergence, grid, plan.coefficients; backend = backend)
 
     # 3. L χ = δ, then u_div = G χ. `D u_div = L χ = δ` now holds exactly.
     result.χ_solve = solve_poisson!(result.χ, result.divergence, grid, concrete;
@@ -413,34 +537,32 @@ function helmholtz_decompose!(
     #    already exactly divergence-free; this is what separates its rotational part from the
     #    harmonic one.
     curl!(ws.W, ws.v, grid, bc, plan.metrics; backend = backend)
-    rot = ntuple(Val(P)) do p
-        dg, dc = plan.dual_grids[p], plan.dual_coefficients[p]
-        dc.singular && project_out_constant!(ws.W[p], dg, dc)
+    # Solved straight into the result, which holds `R` on the same corner grid the workspace did.
+    # The `P` dual grids need not share a type, so a tuple of them under a loop variable is a
+    # `P`-way union and every rotation solve dispatches dynamically. `map` compiles each component
+    # against its own grid.
+    result.rot_solve = map(result.rotation_potential, ws.W, plan.dual_grids,
+                           plan.dual_coefficients, plan.dual_solvers,
+                           ws.dual_states) do Rp, Wp, dg, dc, ds, st
+        dc.singular && project_out_constant!(Wp, dg, dc; backend = backend)
         # `Dirichlet` here regardless of the primal condition — see `plan_helmholtz`.
-        res = solve_poisson!(ws.R[p], ws.W[p], dg, plan.dual_solvers[p];
-                             boundary = Dirichlet(), coefficients = dc,
-                             state = ws.dual_states[p], backend = backend)
-        copyto!(result.rotation_potential[p], ws.R[p])
-        res
+        solve_poisson!(Rp, Wp, dg, ds; boundary = Dirichlet(), coefficients = dc, state = st,
+                       backend = backend)
     end
-    result.rot_solve = rot
-    rotational_velocity!(ws.urot, ws.R, grid, bc, plan.metrics; backend = backend)
-
-    # 5. Back to centres, and the harmonic remainder.
-    to_centres!(result.u_div, ws.gχ, grid, bc, plan.metrics; backend = backend)
-    to_centres!(result.u_rot, ws.urot, grid, bc, plan.metrics; backend = backend)
-    @. result.u_harm = u - result.u_div - result.u_rot
-    _zero_inactive!(result.u_harm, grid, Val(N); backend = backend)
-
-    den = velocity_norm(u, grid, ws.scratch)
-    result.harmonic_fraction = iszero(den) ? zero(T) :
-                               velocity_norm(result.u_harm, grid, ws.scratch) / den
     return result
 end
 
-function _zero_inactive!(U, grid, ::Val{N}; backend = ComputationalBackends.SerialBackend()) where {N}
+@inline _zero_inactive!(U, grid, v::Val{N};
+                        backend = ComputationalBackends.SerialBackend()) where {N} =
+    _zero_inactive!(U, grid, FlowGeometries.Grids.mask(grid), v; backend = backend)
+
+# Every cell active: the pass over `(dims..., N)` has nothing to write and is skipped.
+@inline _zero_inactive!(U, grid, ::FlowGeometries.Grids.AllActive, ::Val{N};
+                        backend = ComputationalBackends.SerialBackend()) where {N} = U
+
+function _zero_inactive!(U, grid, msk, ::Val{N};
+                         backend = ComputationalBackends.SerialBackend()) where {N}
     T = eltype(U)
-    msk = FlowGeometries.Grids.mask(grid)
     cart = CartesianIndices(size(grid))
     # Component views are built once, outside the loop: taking them per index would rebuild the
     # same `N` views for every cell, and a view is not something a device kernel should be forming.
@@ -495,25 +617,44 @@ function count_holes(grid::FlowGeometries.Grids.AbstractGrid)
 end
 
 """
-    velocity_norm(U, grid, scratch) -> T
+    velocity_norm(U, grid; backend) -> T
 
 Measure-weighted `‖U‖ = sqrt(∫|U|² dV)` over the active cells.
+
+One pass, with the component sum accumulated per cell, so no scratch grid is needed and the
+reduction runs on the backend the rest of the decomposition uses.
 """
-function velocity_norm(U, grid::FlowGeometries.Grids.StructuredGrid{G,T,N}, scratch) where {G,T,N}
+function velocity_norm(U, grid::FaceIndexedGrid{T,G,N};
+                       backend = ComputationalBackends.SerialBackend()) where {G,T,N}
     msk = FlowGeometries.Grids.mask(grid)
+    # The grid's own measure is nonzero on inactive cells, so the mask is read separately.
     meas = FlowGeometries.Grids.measure(grid)
-    fill!(scratch, zero(T))
-    for c in 1:N
-        scratch .+= abs2.(_component(U, c, Val(N)))
+    cart = CartesianIndices(size(grid))
+    comps = ntuple(c -> _component(U, c, Val(N)), Val(N))
+    acc = FlowGeometries.Execution.reduce_indices(+, zero(T), length(cart), backend) do lin
+        @inbounds begin
+            I = cart[lin]
+            if msk[I]
+                s = zero(T)
+                for c in 1:N
+                    s += abs2(comps[c][I])
+                end
+                s * meas[I]
+            else
+                zero(T)
+            end
+        end
     end
-    # The grid's own measure, unlike a `LaplacianCoefficients` one, is nonzero on inactive cells.
-    return sqrt(lazy_sum((m, s, w) -> ifelse(m, s * w, zero(T)), msk, scratch, meas))
+    return sqrt(acc)
 end
 
 """
     helmholtz_decompose(u, grid; boundary = Neumann(), solver = AutoSolver()) -> HelmholtzResult
+    helmholtz_decompose(u, v, grid; kwargs...)        # 2-D convenience
+    helmholtz_decompose(u, v, w, grid; kwargs...)     # 3-D convenience
 
-Decompose a cell-centred, component-last velocity field on `grid`.
+Decompose a cell-centred, component-last velocity field on `grid`. The component forms stack their
+arguments into that layout, matching [`helmholtz_decompose_spectral`](@ref).
 
 Builds a [`HelmholtzPlan`](@ref) and discards it. A caller decomposing more than one field on the
 same grid should build the plan once and call [`helmholtz_decompose!`](@ref) — the plan holds the
@@ -526,6 +667,33 @@ function helmholtz_decompose(
 )
     plan = plan_helmholtz(grid; boundary = boundary, solver = solver)
     return helmholtz_decompose!(allocate_result(plan), u, plan, allocate_workspace(plan))
+end
+
+helmholtz_decompose(u::AbstractArray{<:Any,N}, v::AbstractArray{<:Any,N},
+                    grid::FlowGeometries.Grids.StructuredGrid; kwargs...) where {N} =
+    helmholtz_decompose(_stack_components(grid, u, v), grid; kwargs...)
+
+helmholtz_decompose(u::AbstractArray{<:Any,N}, v::AbstractArray{<:Any,N},
+                    w::AbstractArray{<:Any,N},
+                    grid::FlowGeometries.Grids.StructuredGrid; kwargs...) where {N} =
+    helmholtz_decompose(_stack_components(grid, u, v, w), grid; kwargs...)
+
+"""
+    helmholtz_potentials(u, grid; boundary, solver) -> PotentialsResult
+
+Solve for `χ` and `R` and stop, for a caller who works on the potentials — filtering on the sphere
+is the case, where coarse-graining commutes with the differential operators only on the scalars.
+
+Allocates neither the collocated velocity parts nor the norms over them, so on a `256³` grid it
+holds three cell-sized arrays against the three `(dims…, 3)` arrays a full decomposition adds.
+"""
+function helmholtz_potentials(
+    u::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid;
+    boundary::AbstractBoundaryCondition = Neumann(),
+    solver::AbstractPoissonSolver = AutoSolver(),
+)
+    plan = plan_helmholtz(grid; boundary = boundary, solver = solver)
+    return helmholtz_decompose!(allocate_potentials(plan), u, plan, allocate_workspace(plan))
 end
 
 # ---------------------------------------------------------------------------
@@ -541,6 +709,35 @@ stubs exist unconditionally, so it is always `true`.
 @inline _extension_loaded(name::Symbol) = Base.get_extension(@__MODULE__, name) !== nothing
 
 @inline _threading_available() = _extension_loaded(:HelmholtzDecompositionOhMyThreadsExt)
+
+"""
+    with_serial_transforms(f, solver)
+
+Run `f` with `solver`'s transform library pinned to one thread, restoring its count afterwards.
+
+`FastTransforms`, which `FastSphericalHarmonics` is built on, returns a **different** result when
+its OpenMP parallel region is entered from a non-root Julia task, and does so at one Julia thread.
+On a Clenshaw–Curtis sphere `AutoSolver` resolves the primal solve to that transform, so a threaded
+batch reaches it from a worker task.
+
+The pin goes around the whole parallel section: the count is process-global, so tasks setting and
+restoring it individually write over each other. Pinning leaves a root-task result unchanged.
+
+`solver` carries the dispatch, so the pin costs a solver with no such library nothing and the
+extension that owns the library owns the method.
+"""
+with_serial_transforms(f, ::AbstractPoissonSolver) = f()
+
+"""
+    pin_serial_transforms(solver)
+
+Pin `solver`'s transform library to one thread for the remainder of this process.
+
+For a worker process, where the work arrives on a handler task and there is no root-task section to
+scope a restore to. A rank running its block on its own root task needs neither this nor
+[`with_serial_transforms`](@ref).
+"""
+pin_serial_transforms(::AbstractPoissonSolver) = nothing
 
 """
     helmholtz_decompose_batch(plan, fields; backend = AutoBackend())

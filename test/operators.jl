@@ -18,13 +18,14 @@ using Random: Random
 
 const CART = FG.Geometry.CartesianGeometry{Float64}()
 
-# The weight that makes D the negative adjoint of G is the face area times the face gap.
-function dot_faces(p, q, grid, bc, ::Type{T}, ::Val{N}) where {T,N}
+# The weight that makes D the negative adjoint of G is the face area times the face gap. Read from
+# the metrics the operators themselves use, so this holds on every layout that has them.
+function dot_faces(p, q, grid, fm, ::Type{T}, ::Val{N}) where {T,N}
     acc = zero(T)
     for d in 1:N, F in CartesianIndices(HD.face_dims(grid, d))
-        A = HD.face_area(grid, F, d, bc, T)
+        A = fm.area[d][F]
         iszero(A) && continue
-        acc += A * HD.face_gap(grid, F, d, T) * p[d][F] * q[d][F]
+        acc += A * fm.gap[d][F] * p[d][F] * q[d][F]
     end
     return acc
 end
@@ -52,17 +53,20 @@ function operator_properties(grid, bc)
     g = HD.allocate_faces(T, grid)
     Dv = zeros(T, dims)
 
-    HD.gradient!(g, χ, grid, bc)
-    HD.divergence!(Dv, v, grid, bc)
+    fm = HD.face_metrics(grid, bc)
+    HD.gradient!(g, χ, grid, bc, fm)
+    HD.divergence!(Dv, v, grid, bc, fm)
     # D = −G*, under the cell-measure inner product on one side and A·g on the other.
-    @test rel(dot_faces(g, v, grid, bc, T, Val(N)), -dot_cells(χ, Dv, grid, T)) < 1e-10
+    @test rel(dot_faces(g, v, grid, fm, T, Val(N)), -dot_cells(χ, Dv, grid, T)) < 1e-10
 
-    c = HD.laplacian_coefficients(grid, bc)
+    c = HD.laplacian_coefficients(grid, bc, fm)
     Lχ = zeros(T, dims); HD.apply_laplacian!(Lχ, χ, grid, c)
     Lψ = zeros(T, dims); HD.apply_laplacian!(Lψ, ψ, grid, c)
     # The assembled coefficients must be the same operator as applying D and G in turn.
     scratch = HD.allocate_faces(T, grid)
-    LDG = zeros(T, dims); HD.laplacian!(LDG, χ, grid, bc, scratch)
+    LDG = zeros(T, dims)
+    HD.gradient!(scratch, χ, grid, bc, fm)
+    HD.divergence!(LDG, scratch, grid, bc, fm)
     @test sqrt(dot_cells(Lχ .- LDG, Lχ .- LDG, grid, T)) < 1e-8
     # Self-adjoint, and negative semidefinite.
     @test rel(dot_cells(Lχ, ψ, grid, T), dot_cells(χ, Lψ, grid, T)) < 1e-10
@@ -71,9 +75,17 @@ function operator_properties(grid, bc)
     # curl ∘ G = 0: the two parts are independent, not merely nearly so.
     if N >= 2
         W = HD.allocate_corners(T, grid)
-        HD.curl!(W, g, grid, bc)
+        HD.curl!(W, g, grid, bc, fm)
         @test sqrt(sum(a -> sum(abs2, a), W)) < 1e-8
     end
+end
+
+# A mildly warped quadrilateral mesh, given its cell vertices; the centres are their averages.
+function warped_grid(nx::Int, ny::Int, ::Type{T} = Float64) where {T}
+    kx = [T((i - 1) / nx + 0.06 * sin(π * (j - 1) / ny) / nx) for i in 1:(nx + 1), j in 1:(ny + 1)]
+    ky = [T((j - 1) / ny + 0.05 * sin(2π * (i - 1) / nx) / ny) for i in 1:(nx + 1), j in 1:(ny + 1)]
+    avg(k) = [(k[i, j] + k[i + 1, j] + k[i, j + 1] + k[i + 1, j + 1]) / 4 for i in 1:nx, j in 1:ny]
+    return FG.Grids.CurvilinearGrid(CART, avg(kx), avg(ky); corners = (kx, ky))
 end
 
 @testset "operator family" begin
@@ -93,10 +105,66 @@ end
                                                                  range(0, 2π - 2π/16; length = 16),
                                                                  range(-π/2 + π/20, π/2 - π/20; length = 10)), HD.Neumann()),
         ("Cartesian 3-D",                FG.Grids.StructuredGrid(CART, xs, ys, range(0.0, 0.5; length = 6)), HD.Neumann()),
+        # A curvilinear mesh carries `CartesianCells` addressing with index-stencil adjacency, so
+        # the same operator family applies; only `face_metrics` reads a different description of
+        # the geometry. A metric evaluated at the cell shows up here as `curl(grad χ) ≠ 0`.
+        ("curvilinear, Neumann",         warped_grid(11, 9), HD.Neumann()),
+        ("curvilinear, Dirichlet",       warped_grid(11, 9), HD.Dirichlet()),
     ]
     for (name, grid, bc) in cases
         @testset "$name" begin
             operator_properties(grid, bc)
+        end
+    end
+end
+
+@testset "face metric storage" begin
+    xs = range(0.0, 1.0; length = 12)
+    ys = range(0.0, 0.8; length = 9)
+    stretched = cumsum(vcat(0.0, 0.05 .+ 0.03 .* sin.(range(0, 3π; length = 11))))
+    mask = trues(12, 9); mask[5:7, 4:5] .= false
+    sph = FG.Geometry.SphericalGeometry(1.0)
+
+    # (name, grid, expected layout). The layout is asserted, so a grid that falls to the dense
+    # form fails here.
+    cases = [
+        ("Cartesian bounded", FG.Grids.StructuredGrid(CART, xs, ys), HD.SeparableMetrics),
+        ("stretched axis", FG.Grids.StructuredGrid(CART, stretched, ys), HD.SeparableMetrics),
+        ("x-periodic", FG.Grids.StructuredGrid(CART, range(0.0, 1.0 - 1/12; length = 12), ys;
+                                               topology = (true, false), period = 1.0),
+         HD.SeparableMetrics),
+        ("spherical lat-lon", FG.Grids.StructuredGrid(sph, range(0, 2π - 2π/16; length = 16),
+                                                      range(-π/2 + π/20, π/2 - π/20; length = 10)),
+         HD.SeparableMetrics),
+        ("Cartesian 3-D", FG.Grids.StructuredGrid(CART, xs, ys, range(0.0, 0.5; length = 6)),
+         HD.SeparableMetrics),
+        # A mask breaks the product form, and the dense array is the right representation.
+        ("masked hole", FG.Grids.StructuredGrid(CART, xs, ys; mask = mask), HD.DenseMetrics),
+    ]
+
+    for (name, grid, want_layout) in cases, bc in (HD.Neumann(), HD.Dirichlet())
+        @testset "$name/$(nameof(typeof(bc)))" begin
+            T = Float64
+            N = ndims(grid)
+            @test HD.metric_layout(grid) isa want_layout
+
+            fm = HD.face_metrics(grid, bc)
+            # Every face, against the scalar functions the operators are defined by. The factored
+            # form is exact on a Cartesian geometry and within a rounding step on a curved one,
+            # where it divides by the reference value and multiplies back.
+            worst = zero(T)
+            for d in 1:N, F in CartesianIndices(HD.face_dims(grid, d))
+                a = HD.face_area(grid, F, d, bc, T)
+                g = HD.face_gap(grid, F, d, T)
+                worst = max(worst, abs(fm.area[d][F] - a), abs(fm.gap[d][F] - g))
+            end
+            @test worst <= 8 * eps(T)
+
+            # `∑ n_d` numbers against `∏ n_d`, asserted so the saving is gated.
+            if want_layout === HD.SeparableMetrics
+                dense = sum(d -> 2 * prod(HD.face_dims(grid, d)) * sizeof(T), 1:N)
+                @test Base.summarysize(fm) < dense
+            end
         end
     end
 end

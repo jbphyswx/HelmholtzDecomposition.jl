@@ -21,7 +21,7 @@ supplied). Returns the `CairoMakie.Figure`.
 """
 function HD.plot_decomposition(
     result::HD.HelmholtzResult{2},
-    grid::FG.Grids.StructuredGrid{G,T,2} where {G,T};
+    grid::FG.Grids.StructuredGrid{T,G,2} where {T,G};
     orig::Union{Nothing,AbstractArray} = nothing,
 )
     xs, ys = FG.Grids.coordinates(grid)
@@ -41,7 +41,7 @@ function HD.plot_decomposition(
 end
 
 # Backwards-friendly 4-arg form (original passed as separate components).
-HD.plot_decomposition(result::HD.HelmholtzResult{2}, grid::FG.Grids.StructuredGrid{G,T,2} where {G,T}, u_orig::AbstractMatrix, v_orig::AbstractMatrix; kwargs...) =
+HD.plot_decomposition(result::HD.HelmholtzResult{2}, grid::FG.Grids.StructuredGrid{T,G,2} where {T,G}, u_orig::AbstractMatrix, v_orig::AbstractMatrix; kwargs...) =
     HD.plot_decomposition(result, grid; orig = cat(u_orig, v_orig; dims = 3), kwargs...)
 
 end # module

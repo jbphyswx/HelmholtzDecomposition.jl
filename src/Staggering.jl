@@ -18,6 +18,25 @@ Face array `d` is indexed so that face `F` along `d` separates cell `F − 1` fr
 """
 
 """
+    FaceIndexedGrid{T,G,N}
+
+The grids this operator family applies to: a face lies between cell `I − e_d` and cell `I` along
+each direction `d`.
+
+`FlowGeometries` states that property as two traits — `CartesianCells` addressing with
+`IndexStencilNeighbors` adjacency — and exactly three layouts carry it: `StructuredGrid`,
+`CurvilinearGrid` and `RotatedGrid`. Every index walk, the adjointness of `D = −G*`, the solvers
+and the multigrid hierarchy are the same on all three; only [`face_metrics`](@ref) differs, which
+is why the operator bodies never mention the layout.
+
+The pixelizations and node sets (`HEALPixGrid`, `RingGrid`, `CubedSphereGrid`, `IcosahedralGrid`,
+`YinYangGrid`, `UnstructuredGrid`) name a cell by one integer and have no directional faces. They
+are served by the spectral path instead.
+"""
+const FaceIndexedGrid{T,G,N} = Union{FlowGeometries.Grids.StructuredGrid{T,G,N},
+                                     FlowGeometries.Grids.CurvilinearGrid{T,G,N}}
+
+"""
     nfaces(grid, d) -> Int
 
 Number of faces normal to direction `d`: `n` if the direction wraps, `n + 1` if it ends.
@@ -30,7 +49,7 @@ Number of faces normal to direction `d`: `n` if the direction wraps, `n + 1` if 
 
 Shape of the face array normal to direction `d`.
 """
-@inline face_dims(grid::FlowGeometries.Grids.StructuredGrid{G,T,N}, d::Integer) where {G,T,N} =
+@inline face_dims(grid::FaceIndexedGrid{T,G,N}, d::Integer) where {G,T,N} =
     ntuple(e -> e == d ? nfaces(grid, e) : size(grid, e), Val(N))
 
 """
@@ -39,7 +58,7 @@ Shape of the face array normal to direction `d`.
 One zeroed face array per direction. This is the internal staggered layout; the public API stays
 collocated, so nothing outside this package sees it.
 """
-allocate_faces(::Type{T}, grid::FlowGeometries.Grids.StructuredGrid{G,TT,N};
+allocate_faces(::Type{T}, grid::FaceIndexedGrid{TT,G,N};
                backend = ComputationalBackends.SerialBackend()) where {T,G,TT,N} =
     ntuple(d -> allocate_zeros(backend, T, face_dims(grid, d)), Val(N))
 
@@ -55,7 +74,7 @@ thing, but says it as *data*, and a masked grid is refused by every direct trans
 them says it as a **Dirichlet condition on a smaller domain**, which a sine transform inverts
 exactly. Measured at 512²: 98 iterations and 4.6 s became one transform and 19 ms.
 """
-@inline ncorners(grid::FlowGeometries.Grids.StructuredGrid, d::Integer) =
+@inline ncorners(grid::FaceIndexedGrid, d::Integer) =
     FlowGeometries.Grids.isperiodic(grid, d) ? nfaces(grid, d) : nfaces(grid, d) - 2
 
 """
@@ -64,7 +83,7 @@ exactly. Measured at 512²: 98 iterations and 4.6 s became one transform and 19 
 What to add to a corner index in direction `d` to get the face index it sits on: `1` where the
 outer pair was dropped, `0` where the direction wraps and nothing was.
 """
-@inline corner_offset(grid::FlowGeometries.Grids.StructuredGrid, d::Integer) =
+@inline corner_offset(grid::FaceIndexedGrid, d::Integer) =
     FlowGeometries.Grids.isperiodic(grid, d) ? 0 : 1
 
 """
@@ -72,7 +91,7 @@ outer pair was dropped, `0` where the direction wraps and nothing was.
 
 Shape of the array holding a rotation-potential component staggered in both `a` and `b`.
 """
-@inline corner_dims(grid::FlowGeometries.Grids.StructuredGrid{G,T,N}, a::Integer, b::Integer) where {G,T,N} =
+@inline corner_dims(grid::FaceIndexedGrid{T,G,N}, a::Integer, b::Integer) where {G,T,N} =
     ntuple(e -> (e == a || e == b) ? ncorners(grid, e) : size(grid, e), Val(N))
 
 # Corner index -> face index, and back. `to_faces` is exact; `to_corner` can land outside the
@@ -90,7 +109,7 @@ Shape of the array holding a rotation-potential component staggered in both `a` 
 
 One zeroed corner array per rotation pair, shaped by [`corner_dims`](@ref).
 """
-allocate_corners(::Type{T}, grid::FlowGeometries.Grids.StructuredGrid{G,TT,N};
+allocate_corners(::Type{T}, grid::FaceIndexedGrid{TT,G,N};
                  backend = ComputationalBackends.SerialBackend()) where {T,G,TT,N} =
     ntuple(p -> allocate_zeros(backend, T, corner_dims(grid, rotation_pairs(Val(N))[p]...)),
            Val(n_rotation_components(N)))

@@ -31,7 +31,7 @@ Taylor-Green vortex on a Cartesian grid. Purely non-divergent (rotational only).
 The divergent component is exactly zero.
 """
 function taylor_green_vortex(
-    grid::FlowGeometries.Grids.StructuredGrid{G,T,2};
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2};
     A::Real = one(T),
     kx::Real = T(2π) / (FlowGeometries.Grids.coordinates(grid)[1][end] - FlowGeometries.Grids.coordinates(grid)[1][1] + FlowGeometries.Grids.coordinates(grid)[1][2] - FlowGeometries.Grids.coordinates(grid)[1][1]),
     ky::Real = T(2π) / (FlowGeometries.Grids.coordinates(grid)[2][end] - FlowGeometries.Grids.coordinates(grid)[2][1] + FlowGeometries.Grids.coordinates(grid)[2][2] - FlowGeometries.Grids.coordinates(grid)[2][1])
@@ -74,7 +74,7 @@ Purely divergent field on a Cartesian grid (irrotational, zero vorticity).
 The rotational component is exactly zero.
 """
 function point_source_sink(
-    grid::FlowGeometries.Grids.StructuredGrid{G,T,2};
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2};
     A::Real = one(T),
     kx::Real = T(2π) / (FlowGeometries.Grids.coordinates(grid)[1][end] - FlowGeometries.Grids.coordinates(grid)[1][1] + FlowGeometries.Grids.coordinates(grid)[1][2] - FlowGeometries.Grids.coordinates(grid)[1][1]),
     ky::Real = T(2π) / (FlowGeometries.Grids.coordinates(grid)[2][end] - FlowGeometries.Grids.coordinates(grid)[2][1] + FlowGeometries.Grids.coordinates(grid)[2][2] - FlowGeometries.Grids.coordinates(grid)[2][1])
@@ -112,7 +112,7 @@ Mixed field: sum of Taylor-Green vortex (rotational) and source/sink (divergent)
 on a Cartesian grid.
 """
 function rankine_vortex_with_source(
-    grid::FlowGeometries.Grids.StructuredGrid{G,T,2};
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2};
     A_rot::Real = one(T),
     A_div::Real = T(0.5),
     kx::Real = T(2π) / (FlowGeometries.Grids.coordinates(grid)[1][end] - FlowGeometries.Grids.coordinates(grid)[1][1] + FlowGeometries.Grids.coordinates(grid)[1][2] - FlowGeometries.Grids.coordinates(grid)[1][1]),
@@ -142,7 +142,7 @@ Uses spherical harmonic-like stream function:
 The velocity is derived from ψ so the divergent component is exactly zero.
 """
 function rossby_wave(
-    grid::FlowGeometries.Grids.StructuredGrid{G,T,2};
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2};
     n::Int = 3,
     m::Int = 2,
     A::Real = one(T)
@@ -187,7 +187,7 @@ The divergent part uses velocity potential:
     χ = A_div · sin(q·λ) · cosᵖ(φ)
 """
 function kelvin_ekman_flow(
-    grid::FlowGeometries.Grids.StructuredGrid{G,T,2};
+    grid::FlowGeometries.Grids.StructuredGrid{T,G,2};
     A_rot::Real = one(T),
     A_div::Real = T(0.3),
     n::Int = 3,
@@ -238,7 +238,7 @@ given `radius` masked out (marked inactive), producing an annulus / domain-with-
 for constructing multiply-connected domains that carry a nonzero harmonic component.
 """
 function disk_mask(
-    grid::FlowGeometries.Grids.StructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry,T,2};
+    grid::FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,2};
     center::Tuple{<:Real,<:Real} = _domain_center(grid),
     radius::Real = (FlowGeometries.Grids.coordinates(grid)[1][end] - FlowGeometries.Grids.coordinates(grid)[1][1]) / 4,
 ) where {T}
@@ -252,7 +252,7 @@ function disk_mask(
     return mask
 end
 
-function _domain_center(grid::FlowGeometries.Grids.StructuredGrid{G,T,2}) where {G,T}
+function _domain_center(grid::FlowGeometries.Grids.StructuredGrid{T,G,2}) where {G,T}
     xs, ys = FlowGeometries.Grids.coordinates(grid)
     return ((xs[1] + xs[end]) / 2, (ys[1] + ys[end]) / 2)
 end
@@ -268,7 +268,7 @@ or velocity potential, so a Helmholtz decomposition must place essentially all o
 harmonic component.
 """
 function harmonic_vortex(
-    grid::FlowGeometries.Grids.StructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry,T,2};
+    grid::FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,2};
     Γ::Real = one(T),
     center::Tuple{<:Real,<:Real} = _domain_center(grid),
 ) where {T}
@@ -297,7 +297,7 @@ center it is both curl-free and divergence-free — purely *harmonic* — with n
 flux mode of the harmonic subspace on a multiply-connected domain.
 """
 function harmonic_source(
-    grid::FlowGeometries.Grids.StructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry,T,2};
+    grid::FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,2};
     q::Real = one(T),
     center::Tuple{<:Real,<:Real} = _domain_center(grid),
 ) where {T}
