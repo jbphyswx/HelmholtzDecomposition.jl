@@ -26,12 +26,35 @@ HD.allocate_zeros(backend::KA.Backend, ::Type{T}, dims::Dims) where {T} =
 # arrays, which is what makes the device path checkable without a device.
 HD.to_backend(backend::KA.Backend, x) = Adapt.adapt(backend, x)
 
+# A kernel launch adapts what the body captures, and `Adapt` recurses into a tuple and into
+# `FlowGeometries`' own wrappers; a struct it has no rule for it passes through whole. `LazyDiagonal`
+# is captured by the smoother and by the Jacobi preconditioner, so it declares how it converts.
+Adapt.adapt_structure(to, d::HD.LazyDiagonal{N,T}) where {N,T} =
+    HD.LazyDiagonal{N,T}(Adapt.adapt(to, d.coef), Adapt.adapt(to, d.measure),
+                         Adapt.adapt(to, d.grid))
+
+# `LazyDiagonal` reads the coefficients and the measure, so it is rebuilt around the ones that just
+# moved and the device holds one copy of each.
+_adapt_diagonal(b, d::HD.LazyDiagonal{N,T}, coef, meas) where {N,T} =
+    HD.LazyDiagonal{N,T}(coef, meas, Adapt.adapt(b, d.grid))
+_adapt_diagonal(b, d, _, _) = Adapt.adapt(b, d)
+
 function HD.to_backend(b::KA.Backend, c::HD.LaplacianCoefficients{N,T}) where {N,T}
     coef = map(a -> Adapt.adapt(b, a), c.coef)
-    diag = Adapt.adapt(b, c.diag)
     meas = Adapt.adapt(b, c.measure)
+    diag = _adapt_diagonal(b, c.diag, coef, meas)
     # `singular` rides along unchanged: it is a property of the operator, already decided.
-    return HD.LaplacianCoefficients{N,T,typeof(coef),typeof(diag)}(coef, diag, meas, c.singular)
+    return HD.LaplacianCoefficients{N,T,typeof(coef),typeof(diag),typeof(meas)}(
+        coef, diag, meas, c.total, c.singular)
+end
+
+# The hierarchy is read during every cycle, so its grids and coefficients move with the plan. The
+# per-level vectors are not here: they belong to the task and come from `multigrid_buffers`.
+function HD.to_backend(b::KA.Backend, mg::HD.MultigridPreconditioner)
+    levels = map(mg.levels) do lev
+        HD.MultigridLevel(HD.to_backend(b, lev.grid), HD.to_backend(b, lev.coefficients))
+    end
+    return HD.MultigridPreconditioner(levels, mg.ω, mg.ν)
 end
 
 function HD.to_backend(b::KA.Backend, m::HD.FaceMetrics{N,T}) where {N,T}

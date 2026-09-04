@@ -12,9 +12,15 @@ HelmholtzDecomposition.HelmholtzDecomposition
 ```@docs
 HelmholtzDecomposition.helmholtz_decompose
 HelmholtzDecomposition.helmholtz_decompose!
+HelmholtzDecomposition.helmholtz_potentials
 HelmholtzDecomposition.helmholtz_decompose_batch
 HelmholtzDecomposition.helmholtz_decompose_batch!
 ```
+
+How much work `helmholtz_decompose!` does is the result's type: a
+[`PotentialsResult`](@ref HelmholtzDecomposition.PotentialsResult) stops once `χ` and `R` are
+solved and allocates no collocated velocity array, while a
+[`HelmholtzResult`](@ref HelmholtzDecomposition.HelmholtzResult) reconstructs the three parts.
 
 ## Plan, workspace and results
 
@@ -23,8 +29,11 @@ HelmholtzDecomposition.plan_helmholtz
 HelmholtzDecomposition.HelmholtzPlan
 HelmholtzDecomposition.HelmholtzWorkspace
 HelmholtzDecomposition.allocate_workspace
+HelmholtzDecomposition.AbstractHelmholtzResult
 HelmholtzDecomposition.HelmholtzResult
 HelmholtzDecomposition.allocate_result
+HelmholtzDecomposition.PotentialsResult
+HelmholtzDecomposition.allocate_potentials
 HelmholtzDecomposition.HelmholtzBatch
 HelmholtzDecomposition.allocate_batch
 ```
@@ -67,6 +76,7 @@ HelmholtzDecomposition.AutoSolver
 HelmholtzDecomposition.CGSolver
 HelmholtzDecomposition.solve_poisson!
 HelmholtzDecomposition.prepare_solver
+HelmholtzDecomposition.prepare_shared
 HelmholtzDecomposition.select_solver
 HelmholtzDecomposition.SolverResult
 ```
@@ -135,6 +145,8 @@ HelmholtzDecomposition.to_backend
 HelmholtzDecomposition.multigrid
 HelmholtzDecomposition.MultigridPreconditioner
 HelmholtzDecomposition.MultigridLevel
+HelmholtzDecomposition.LevelBuffers
+HelmholtzDecomposition.multigrid_buffers
 HelmholtzDecomposition.coarsen
 HelmholtzDecomposition.galerkin_coefficients
 HelmholtzDecomposition.restrict!

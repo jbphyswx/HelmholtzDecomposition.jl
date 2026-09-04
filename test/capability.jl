@@ -151,7 +151,11 @@ end
     n = 12
     xr = range(0.0, 1.0; length = n)
     grid = FG.Grids.StructuredGrid(CART, xr, xr)
-    plan = HD.plan_helmholtz(grid; boundary = HD.Neumann())
+    # The inner backend is named, so both calls below run identical arithmetic and the comparison
+    # isolates the batch axis. `AutoBackend` resolves to `ThreadedBackend` at more than one thread,
+    # which threads the loops *within* each field for the serial batch and leaves them serial for
+    # the threaded one — two different reduction groupings, differing in the last bits.
+    plan = HD.plan_helmholtz(grid; boundary = HD.Neumann(), backend = CB.SerialBackend())
     Random.seed!(2)
     fields = [randn(n, n, 2) for _ in 1:4]
 

@@ -170,12 +170,12 @@ function helmholtz_project_spectral(u_hat::AbstractMatrix, v_hat::AbstractMatrix
 end
 
 # Convenience: separate component arrays + grid (builds wavenumbers from the grid).
-function helmholtz_project_spectral(velocity_hat::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry,T,N}; kwargs...) where {T,N}
+function helmholtz_project_spectral(velocity_hat::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,N}; kwargs...) where {T,N}
     ks = _grid_wavenumbers(velocity_hat, grid)
     return helmholtz_project_spectral(velocity_hat, ks)
 end
 
-function helmholtz_project_spectral(u_hat::AbstractMatrix, v_hat::AbstractMatrix, grid::FlowGeometries.Grids.StructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry,T,2}; kwargs...) where {T}
+function helmholtz_project_spectral(u_hat::AbstractMatrix, v_hat::AbstractMatrix, grid::FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,2}; kwargs...) where {T}
     velocity_hat = _stack_spectral(u_hat, v_hat)
     return helmholtz_project_spectral(velocity_hat, grid)
 end
@@ -197,7 +197,7 @@ Reconstruct the per-axis angular wavenumber vectors for a component-last spectra
 on a Cartesian grid. Axis 1 is treated as an `rfft` axis when its spectral length equals
 `N₁÷2 + 1`, otherwise as a full `fft` axis.
 """
-function _grid_wavenumbers(velocity_hat::AbstractArray{<:Complex}, grid::FlowGeometries.Grids.StructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry,T,N}) where {N,T}
+function _grid_wavenumbers(velocity_hat::AbstractArray{<:Complex}, grid::FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,N}) where {N,T}
     dims = size(grid)
     kdims = size(velocity_hat)[1:N]
     return ntuple(Val(N)) do d
@@ -289,7 +289,8 @@ On this path `rotation_potential` holds **cell-centred** arrays, where the finit
 holds corner-staggered ones. The field is type-parameterised for exactly this reason, but the
 staggering does depend on which path produced the result.
 """
-function build_cartesian_result(grid::FlowGeometries.Grids.StructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry,T,N}, U, velocity_hat, ks::NTuple{N,Any}, inverse) where {N,T}
+function build_cartesian_result(grid::FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,N}, U, velocity_hat, ks::NTuple{N,Any}, inverse;
+                                backend = ComputationalBackends.SerialBackend()) where {N,T}
     proj = helmholtz_project_spectral(velocity_hat, ks)
     χ_hat, R_hat = helmholtz_potentials_spectral(velocity_hat, ks)
 
@@ -340,9 +341,9 @@ function build_cartesian_result(grid::FlowGeometries.Grids.StructuredGrid{<:Flow
     u_rot = similar(U, T, (dims..., N))
     @. u_rot = U - u_div - u_harm
 
-    scratch = similar(U, T, dims)
-    den = velocity_norm(U, grid, scratch)
-    hfrac = iszero(den) ? zero(T) : velocity_norm(u_harm, grid, scratch) / den
+    den = velocity_norm(U, grid; backend = backend)
+    hfrac = iszero(den) ? zero(T) :
+            velocity_norm(u_harm, grid; backend = backend) / den
     ok = SolverResult{T}(true, 1, zero(T))
     return HelmholtzResult{N,P,T,typeof(u_div),typeof(χ),typeof(Rpot)}(
         u_rot, u_div, u_harm, χ, Rpot, divergence, hfrac, ok, ntuple(_ -> ok, Val(P)),

@@ -42,14 +42,34 @@ _grids() = begin
     sph = FG.Geometry.SphericalGeometry(1.0)
     λ = range(0, 2π - 2π / 20; length = 20)
     φ = range(-π / 2 + π / 24, π / 2 - π / 24; length = 12)
+    zs = range(0.0, 0.6; length = 6)
     return (
         ("bounded", FG.Grids.StructuredGrid(cart, xs, ys)),
         ("periodic", FG.Grids.StructuredGrid(cart, xp, yp; topology = (true, true),
                                              period = (1.0, 1.0))),
         ("masked", FG.Grids.StructuredGrid(cart, xs, ys; mask = mask)),
         ("spherical", FG.Grids.StructuredGrid(sph, λ, φ)),
+        # Three rotation components, which exercises `rotation_terms` and the per-pair corner
+        # machinery at the arity 2-D leaves untested.
+        ("3d", FG.Grids.StructuredGrid(cart, range(0.0, 1.0; length = 8),
+                                       range(0.0, 0.9; length = 7), zs)),
     )
 end
+
+"""
+Solvers to gate a decomposition on.
+
+`AutoSolver` is here because it is what a caller gets, and it resolves to a different concrete
+solver per grid — the transform on a periodic or bounded uniform grid, conjugate gradients on a
+masked one. Gating `CGSolver` alone leaves every transform solver unmeasured, and a transform that
+plans inside `solve_poisson!` allocates its whole spectral working set on each of the `P + 1`
+solves.
+"""
+_solvers() = (
+    ("jacobi", HD.CGSolver(; multigrid = false)),
+    ("mg", HD.CGSolver(; multigrid = true)),
+    ("auto", HD.AutoSolver()),
+)
 
 Test.@testset "allocations: operators" begin
     for (name, grid) in _grids(), bc in (HD.Neumann(), HD.Dirichlet())
@@ -131,10 +151,9 @@ Test.@testset "allocations: norms" begin
         T = Float64
         N = ndims(grid)
         U = randn(size(grid)..., N)
-        scratch = zeros(T, size(grid))
-        f_norm(a, b, c, d) = HD.velocity_norm(a, b, c)
+        f_norm(a, b, c, d) = HD.velocity_norm(a, b)
         Test.@testset "$name" begin
-            Test.@test gate(f_norm, U, grid, scratch, nothing) == 0
+            Test.@test gate(f_norm, U, grid, nothing, nothing) == 0
         end
     end
 end

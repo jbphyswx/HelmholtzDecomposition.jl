@@ -40,6 +40,10 @@ function HD._decompose_batch!(
     # A worker cannot write into the caller's arrays, so each returns its chunk as its own batch
     # and the slices are copied in here — one message per worker rather than one per field.
     parts = Distributed.pmap(ranges) do rng
+        # The chunk arrives on the worker's handler task, and a host transform library entered from
+        # a non-root task returns a different result. The pin is set-only here: the process has no
+        # root-task section around this call. See `HD.pin_serial_transforms`.
+        HD.pin_serial_transforms(plan.solver)
         local_batch = HD.allocate_batch(plan, length(rng))
         ws = HD.allocate_workspace(plan)
         # Serial within a worker: the worker process gets one chunk of the batch, and the plan's

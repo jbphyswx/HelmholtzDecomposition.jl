@@ -8,8 +8,10 @@ periodic Cartesian grids in 1D/2D/3D/ND using the real FFT: forward `rfft` → d
 module HelmholtzDecompositionFFTWExt
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
+using ComputationalBackends: ComputationalBackends as CB
 using FFTW: FFTW
 using FlowGeometries: FlowGeometries as FG
+using LinearAlgebra: LinearAlgebra
 using SpectralBackends: SpectralBackends as SB
 # The periodic path goes through the `AbstractFFTs` interface rather than FFTW's own functions, so
 # it dispatches to whatever backend owns the array — CUFFT for a device array, FFTW for a host one
@@ -34,26 +36,6 @@ HD.requires_uniform_axes(::CartesianSpectralSolver) = true
 HD.requires_periodic_domain(::CartesianSpectralSolver) = true
 
 # Per-axis angular wavenumbers matching an rfft layout (axis 1 reduced).
-"""
-    _discrete_laplacian_symbol(T, ks, h, Val(N)) -> Array{T}
-
-`−Σ_d (4/h_d²)·sin²(k_d·h_d/2)`, the eigenvalue of the compact Laplacian `L = D G` at each
-wavevector. Zero at `k = 0`, the constant mode `L` leaves in its null space.
-"""
-function _discrete_laplacian_symbol(::Type{T}, ks, h::NTuple{N,T}, ::Val{N}) where {T,N}
-    shape = ntuple(d -> length(ks[d]), Val(N))
-    λ = zeros(T, shape)
-    @inbounds for I in CartesianIndices(shape)
-        acc = zero(T)
-        for d in 1:N
-            s = sin(T(ks[d][I[d]]) * h[d] / 2)
-            acc -= 4 * s * s / (h[d] * h[d])
-        end
-        λ[I] = acc
-    end
-    return λ
-end
-
 function _rfft_wavenumbers(::Type{T}, dims::NTuple{N,Int}, spacing::NTuple{N,T}) where {T,N}
     return ntuple(Val(N)) do d
         if d == 1
@@ -64,27 +46,79 @@ function _rfft_wavenumbers(::Type{T}, dims::NTuple{N,Int}, spacing::NTuple{N,T})
     end
 end
 
+"""
+    PeriodicSpectralState
+
+The reusable half of a periodic solve: the two transform plans, the spectral buffer they execute
+through, the symbol as one vector per axis, and the inverse's normalisation.
+
+None of it depends on the right-hand side, while a decomposition solves `P + 1` of those and a
+batch multiplies that by the field count.
+
+Plan-owning, so it gets an explicit one-line `show`: the default prints the plan's internals.
+"""
+struct PeriodicSpectralState{T,S,FP,BP,L}
+    spec::S
+    fplan::FP
+    bplan::BP
+    λ::L
+    norm::T
+end
+
+Base.show(io::IO, ::PeriodicSpectralState{T}) where {T} =
+    print(io, "PeriodicSpectralState{", T, "}(…)")
+
+# The DISCRETE symbol, `−Σ_d (4/h_d²)·sin²(k_d h_d/2)`, one vector per axis. Dividing by the
+# continuous `−k²` inverts a different operator from the one `D` and `G` compose; with this one the
+# transform is an exact direct solve of the same `L` the iterative solver approaches.
+#
+# `k_d h_d / 2 = π·m/n_d` with `m` the signed mode index, and `sin²` is even, so the folded index
+# `min(i−1, n−i+1)` serves both the halved first axis and the full ones.
+function _periodic_symbols(::Type{T}, dims::NTuple{N,Int}, kdims::NTuple{N,Int}, h, backend) where {T,N}
+    return ntuple(Val(N)) do d
+        n, nk = dims[d], kdims[d]
+        v = HD.allocate_zeros(backend, T, (nk,))
+        i = reshape(1:nk, nk)
+        s = sin.(T(π) .* min.(i .- 1, n .- i .+ 1) ./ T(n))
+        v .= .-4 .* s .^ 2 ./ (h[d] * h[d])
+        reshape(v, ntuple(e -> e == d ? nk : 1, Val(N)))
+    end
+end
+
+function HD.prepare_solver(
+    ::CartesianSpectralSolver,
+    grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
+    ::HD.AbstractBoundaryCondition;
+    backend = CB.SerialBackend(), shared = nothing,
+) where {T,N}
+    dims = size(grid)
+    h = ntuple(d -> abs(FG.Grids.spacing(grid, d)), Val(N))
+    kdims = ntuple(d -> d == 1 ? dims[1] ÷ 2 + 1 : dims[d], Val(N))
+    work = HD.allocate_zeros(backend, T, dims)
+    spec = HD.allocate_zeros(backend, complex(T), kdims)
+    return PeriodicSpectralState(spec, AbstractFFTs.plan_rfft(work),
+                                 AbstractFFTs.plan_brfft(spec, dims[1]),
+                                 _periodic_symbols(T, dims, kdims, h, backend),
+                                 one(T) / T(prod(dims)))
+end
+
 function HD.solve_poisson!(
     Φ::AbstractArray{T,N},
     RHS::AbstractArray{T,N},
-    grid::FG.Grids.StructuredGrid{<:FG.Geometry.AbstractCartesianGeometry,T,N},
+    grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
     solver::CartesianSpectralSolver;
     boundary::HD.AbstractBoundaryCondition = HD.Neumann(),
+    state::PeriodicSpectralState = HD.prepare_solver(solver, grid, boundary),
     kwargs...,
 ) where {T<:AbstractFloat,N}
     HD._require_boundary(solver, boundary)
-    dims = size(grid)
-    RHS_hat = AbstractFFTs.rfft(RHS)
-    h = ntuple(d -> abs(FG.Grids.spacing(grid, d)), Val(N))
-    ks = _rfft_wavenumbers(T, dims, h)
-    # The DISCRETE symbol, not `−k²`. `L = D G` is the compact Laplacian, whose Fourier symbol on
-    # a uniform periodic grid is `−Σ_d (4/h_d²)·sin²(k_d h_d/2)`; dividing by `−k²` would invert a
-    # different operator from the one the decomposition differentiates with, which is precisely
-    # the inconsistency this rewrite removed. With the discrete symbol the transform is an *exact
-    # direct solve* of the same `L` the iterative solver approaches — same answer, no iterations.
-    λ = _discrete_laplacian_symbol(T, ks, h, Val(N))
-    @. RHS_hat = ifelse(λ == zero(T), zero(eltype(RHS_hat)), RHS_hat / λ)
-    Φ .= AbstractFFTs.irfft(RHS_hat, dims[1])
+    LinearAlgebra.mul!(state.spec, state.fplan, RHS)
+    λ = HD.lazy_axis_sum(state.λ)
+    state.spec .= ifelse.(iszero.(λ), zero(complex(T)), state.spec ./ λ)
+    # A multi-dimensional complex-to-real plan consumes its input; `spec` is the state's own and is
+    # refilled by the forward transform on each solve.
+    LinearAlgebra.mul!(Φ, state.bplan, state.spec)
+    Φ .*= state.norm
     return HD.SolverResult{T}(true, 1, zero(T))
 end
 
@@ -92,8 +126,8 @@ function HD._decompose_spectral(
     ::CartesianSpectralSolver,
     ::FG.Geometry.AbstractCartesianGeometry,
     U::AbstractArray{T,M},
-    grid::FG.Grids.StructuredGrid{<:FG.Geometry.AbstractCartesianGeometry,T,N};
-    kwargs...,
+    grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N};
+    backend = CB.SerialBackend(), kwargs...,
 ) where {T,M,N}
     dims = size(grid)
     ks = _rfft_wavenumbers(T, dims, ntuple(d -> abs(FG.Grids.spacing(grid, d)), Val(N)))
@@ -111,7 +145,7 @@ function HD._decompose_spectral(
 
     # Fully-spectral decomposition (exact derivatives) → physical HelmholtzResult.
     inverse = x -> AbstractFFTs.irfft(x, dims[1])
-    return HD.build_cartesian_result(grid, U, velocity_hat, ks, inverse)
+    return HD.build_cartesian_result(grid, U, velocity_hat, ks, inverse; backend = backend)
 end
 
 # ---------------------------------------------------------------------------
@@ -185,63 +219,66 @@ function _axis_symbol(proto, ::Type{T}, n::Int, h::T, bc, periodic::Bool) where 
     return λ
 end
 
+# One vector per axis, each reshaped to broadcast along its own. The whole-grid symbol is their
+# sum, formed at the divide by `HD.lazy_axis_sum`.
 function _bounded_symbol(proto, ::Type{T}, dims::NTuple{N,Int}, h::NTuple{N,T}, bc,
                          periodic::NTuple{N,Bool}) where {T,N}
-    per_axis = ntuple(d -> _axis_symbol(proto, T, dims[d], h[d], bc, periodic[d]), Val(N))
-    λ = similar(proto, T, dims)
-    fill!(λ, zero(T))
-    @inbounds for I in CartesianIndices(dims)
-        acc = zero(T)
-        for d in 1:N
-            acc += per_axis[d][I[d]]
-        end
-        λ[I] = acc
+    return ntuple(Val(N)) do d
+        v = _axis_symbol(proto, T, dims[d], h[d], bc, periodic[d])
+        reshape(v, ntuple(e -> e == d ? dims[d] : 1, Val(N)))
     end
-    return λ
 end
 
 """
-    BoundedState{T,A,PF,PI}
+    BoundedState{T,A,PF,PI,L}
 
-The reusable half of a bounded solve: the two `r2r` plans, the eigenvalue array, and the scratch
-they transform through. All of it depends on the grid and the boundary condition only, so it is
-built once per [`HelmholtzPlan`](@ref) rather than on each of the `(P+1)·B` solves.
+The reusable half of a bounded solve: the two `r2r` plans, the symbol's per-axis factors, and the
+scratch they transform through. All of it depends on the grid and the boundary condition only, so
+it is built once per [`HelmholtzPlan`](@ref) across the `(P+1)·B` solves.
 
-Plan-owning, so it gets an explicit one-line `show`: the default would print the FFTW plan's
-internals, which can segfault.
+Plan-owning, so it gets an explicit one-line `show`: the default prints the FFTW plan's internals,
+which can segfault.
 """
-struct BoundedState{T,A<:AbstractArray{T},PF,PI}
+struct BoundedState{T,A<:AbstractArray{T},PF,PI,L}
     forward::PF
     inverse::PI
-    λ::A
+    λ::L
     scratch::A
     norm::T
 end
 
 Base.show(io::IO, s::BoundedState{T}) where {T} =
-    print(io, "BoundedState{", T, "}(", join(size(s.λ), "×"), ")")
+    print(io, "BoundedState{", T, "}(", join(size(s.scratch), "×"), ")")
 
 function HD.prepare_solver(
     ::CartesianBoundedSolver,
-    grid::FG.Grids.StructuredGrid{<:FG.Geometry.AbstractCartesianGeometry,T,N},
-    boundary::HD.AbstractBoundaryCondition,
+    grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
+    boundary::HD.AbstractBoundaryCondition;
+    backend = CB.SerialBackend(), shared = nothing,
 ) where {T,N}
     dims = size(grid)
     h = ntuple(d -> abs(FG.Grids.spacing(grid, d)), Val(N))
     per = ntuple(d -> FG.Grids.isperiodic(grid, d), Val(N))
-    scratch = HD.allocate_zeros(nothing, T, dims)
+    # `FFTW.plan_r2r!` plans against host memory; a device array takes
+    # `CartesianRealTransformSolver`, which goes through `AbstractFFTs`.
+    scratch = HD.allocate_zeros(backend, T, dims)
+    scratch isa Array || throw(ArgumentError(
+        "CartesianBoundedSolver uses FFTW's real-to-real transform, which is host-only. Load " *
+        "`AbstractFFTs` and let `CartesianRealTransformSolver` take this grid, or plan it on the " *
+        "host."))
     fwd = FFTW.plan_r2r!(scratch, ntuple(d -> _forward_kind(boundary, per[d]), Val(N)))
     inv = FFTW.plan_r2r!(scratch, ntuple(d -> _inverse_kind(boundary, per[d]), Val(N)))
     norm = one(T) / prod(ntuple(d -> _kind_norm(T, dims[d], per[d]), Val(N)))
-    return BoundedState{T,typeof(scratch),typeof(fwd),typeof(inv)}(
-        fwd, inv, _bounded_symbol(scratch, T, dims, h, boundary, per), scratch, norm,
+    λ = _bounded_symbol(scratch, T, dims, h, boundary, per)
+    return BoundedState{T,typeof(scratch),typeof(fwd),typeof(inv),typeof(λ)}(
+        fwd, inv, λ, scratch, norm,
     )
 end
 
 function HD.solve_poisson!(
     Φ::AbstractArray{T,N},
     RHS::AbstractArray{T,N},
-    grid::FG.Grids.StructuredGrid{<:FG.Geometry.AbstractCartesianGeometry,T,N},
+    grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
     solver::CartesianBoundedSolver;
     boundary::HD.AbstractBoundaryCondition = HD.Neumann(),
     state::BoundedState = HD.prepare_solver(solver, grid, boundary),
@@ -250,8 +287,8 @@ function HD.solve_poisson!(
     HD._require_boundary(solver, boundary)
     copyto!(state.scratch, RHS)
     state.forward * state.scratch                    # in place
-    λ = state.λ
-    @. state.scratch = ifelse(λ == zero(T), zero(T), state.scratch / λ)
+    λ = HD.lazy_axis_sum(state.λ)
+    state.scratch .= ifelse.(iszero.(λ), zero(T), state.scratch ./ λ)
     state.inverse * state.scratch
     @. Φ = state.scratch * state.norm
     return HD.SolverResult{T}(true, 1, zero(T))

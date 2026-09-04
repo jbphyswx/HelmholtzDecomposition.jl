@@ -10,26 +10,44 @@ operators (Aluie 2019, Proposition 2). The correct approach — mathematically e
 the generalized convolution that **does** commute — is to filter the scalar Helmholtz
 potentials (ψ, χ) separately. This package provides the decomposition step.
 
-# Solver Extensions (important for performance!)
-The base package includes only the SOR iterative solver, which works on any grid but may be
-**orders of magnitude slower** than spectral solvers. Load an appropriate extension:
+# Solver extensions
+The base package solves any grid, mask and boundary condition with multigrid-preconditioned
+conjugate gradients. A transform is `O(N log N)` where one applies, and each arrives with its
+package:
 
-| Geometry   | Regular Grid                      | Irregular Grid          |
-|------------|-----------------------------------|-------------------------|
-| Cartesian  | `using FFTW`                      | `using FINUFFT`         |
-| Spherical  | `using FastSphericalHarmonics`    | `using NUFSHT`          |
+| Geometry   | Regular grid                      | Irregular grid                         |
+|------------|-----------------------------------|----------------------------------------|
+| Cartesian  | `using FFTW`, `using AbstractFFTs`| `using FINUFFT`, `using NonuniformFFTs`|
+| Spherical  | `using FastSphericalHarmonics`    | `using NUFSHT`                         |
 
-# Quick Start
+`AutoSolver` picks among the loaded ones on the grid's own properties — mask, axis uniformity,
+topology and node layout — and refuses a solver named directly that cannot solve the problem given.
+
+# Quick start
 ```julia
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using FlowGeometries: FlowGeometries as FG
-using FFTW: FFTW  # load spectral extension for Cartesian grids
+using FFTW: FFTW
 
-grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, ys)
-result = HD.helmholtz_decompose(u, v, grid)
-# result.u_rot, result.v_rot  — rotational velocity
-# result.u_div, result.v_div  — divergent velocity
-# result.ψ, result.χ          — scalar potentials
+xs = range(0, 1; length = 128)          # a range, so uniformity is provable from the axis type
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs)
+u = randn(128, 128, 2)                  # component-last: (dims..., N)
+
+result = HD.helmholtz_decompose(u, grid)
+result.u_rot              # rotational (divergence-free) velocity, (128, 128, 2)
+result.u_div              # divergent (curl-free) velocity
+result.u_harm             # harmonic remainder
+result.χ                  # scalar velocity potential, at cell centres
+HD.streamfunction(result) # ψ in 2-D; `HD.vector_potential` in 3-D
+result.harmonic_fraction  # ‖u_harm‖ / ‖u‖
+```
+
+Decomposing more than one field on a grid builds the plan once:
+
+```julia
+plan = HD.plan_helmholtz(grid)
+ws, res = HD.allocate_workspace(plan), HD.allocate_result(plan)
+HD.helmholtz_decompose!(res, u, plan, ws)      # allocation-free
 ```
 
 Nothing is exported: every name is reached as `HelmholtzDecomposition.name`.
@@ -51,6 +69,7 @@ include("BoundaryConditions.jl")
 include("Staggering.jl")
 include("Operators.jl")
 include("Solvers.jl")
+include("LeastSquares.jl")
 include("Multigrid.jl")
 include("DualGrid.jl")
 include("Decomposition.jl")

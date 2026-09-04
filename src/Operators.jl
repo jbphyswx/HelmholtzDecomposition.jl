@@ -285,12 +285,173 @@ struct FaceMetrics{N,T,A<:NTuple{N,AbstractArray{T,N}}}
     gap::A
 end
 
-function face_metrics(grid::FlowGeometries.Grids.StructuredGrid{G,T,N}, bc) where {G,T,N}
-    area = ntuple(d -> zeros(T, face_dims(grid, d)), Val(N))
-    gap = ntuple(d -> zeros(T, face_dims(grid, d)), Val(N))
-    @inbounds for d in 1:N, F in CartesianIndices(face_dims(grid, d))
-        area[d][F] = face_area(grid, F, d, bc, T)
-        gap[d][F] = face_gap(grid, F, d, T)
+"""
+    SeparableMetrics() / DenseMetrics()
+
+How a face metric is stored, chosen from the geometry and mask **types** so the choice folds at
+compile time.
+
+A face area is `∏_{e≠d} |h_e(x_F)|·w_e`. Every `h_e` is `1` on a Cartesian geometry; on a spherical
+one `h_λ = R cos φ` and `h_φ = R`, and each term is a function of a single index. Both are products
+of one factor per axis, so `∑_d n_d` numbers carry what `∏_d n_d` numbers held. A no-flux edge is
+the `d`-factor vanishing at its two end entries, so a boundary condition preserves the form. A mask
+breaks it, and there the dense array is the representation.
+"""
+struct SeparableMetrics end
+struct DenseMetrics end
+
+@inline metric_layout(grid::FlowGeometries.Grids.StructuredGrid) =
+    _metric_layout(FlowGeometries.Grids.grid_geometry(grid), FlowGeometries.Grids.mask(grid))
+
+@inline _metric_layout(::FlowGeometries.Geometry.AbstractCartesianGeometry,
+                       ::FlowGeometries.Grids.AllActive) = SeparableMetrics()
+@inline _metric_layout(::FlowGeometries.Geometry.AbstractSphericalGeometry,
+                       ::FlowGeometries.Grids.AllActive) = SeparableMetrics()
+@inline _metric_layout(_, _) = DenseMetrics()
+
+# An index where `f` is nonzero, to take the axis factors through. The centre is tried first: a
+# vanishing entry sits at the end of an axis.
+function _separable_reference(f::F, dims::NTuple{N,Int}) where {F,N}
+    mid = CartesianIndex(ntuple(e -> cld(dims[e], 2), Val(N)))
+    iszero(f(mid)) || return mid
+    for I in CartesianIndices(dims)
+        iszero(f(I)) || return I
+    end
+    return nothing
+end
+
+"""
+    _factorise(f, dims, ::Type{T}) -> NTuple{N,Vector{T}} or nothing
+
+Axis factors `g_e` with `f(I) = ∏_e g_e(I[e])`, read off `f` along each axis through one reference
+index: `O(∑ n_e)` evaluations against `O(∏ n_e)` for the dense array.
+
+With `G_e(i) = f(ref with e → i)` and `P = f(ref)`, expanding gives `∏_e G_e(I[e]) = f(I)·P^{N-1}`,
+so dividing the trailing `N-1` factors by `P` leaves `∏_e g_e = f`.
+
+`nothing` where `f` vanishes everywhere, which no reference factors.
+"""
+function _factorise(f::F, dims::NTuple{N,Int}, ::Type{T}) where {F,N,T}
+    ref = _separable_reference(f, dims)
+    ref === nothing && return nothing
+    P = f(ref)
+    return ntuple(Val(N)) do e
+        g = Vector{T}(undef, dims[e])
+        @inbounds for i in 1:dims[e]
+            g[i] = f(CartesianIndex(ntuple(k -> k == e ? i : ref[k], Val(N))))
+        end
+        e == 1 ? g : (g ./= P; g)
+    end
+end
+
+"""
+    _metric_array(f, dims, layout, ::Type{T}) -> AbstractArray{T,N}
+
+One face metric, held as its axis factors where the layout admits them and densely elsewhere.
+Both are `AbstractArray{T,N}` indexed `a[F]`, so the operators read them the same way.
+
+Whether the factored form reproduces `f` is a property of the geometry, checked exhaustively in
+`test/operators.jl` against the scalar functions on every grid kind.
+"""
+function _metric_array(f::F, dims::NTuple{N,Int}, ::SeparableMetrics, ::Type{T}) where {F,N,T}
+    g = _factorise(f, dims, T)
+    g === nothing && return _metric_array(f, dims, DenseMetrics(), T)
+    return FlowGeometries.Grids.SeparableMeasure(g)
+end
+
+function _metric_array(f::F, dims::NTuple{N,Int}, ::DenseMetrics, ::Type{T}) where {F,N,T}
+    a = zeros(T, dims)
+    @inbounds for I in CartesianIndices(dims)
+        a[I] = f(I)
+    end
+    return a
+end
+
+"""
+    face_metrics(grid::CurvilinearGrid, bc)
+
+Face areas and gaps read off the grid's own cell-vertex arrays.
+
+A curvilinear cell's shape is its own, so no product of axis factors describes it and the arrays
+are dense. At `N = 2` a face is the edge between two vertices and its area is their separation; the
+gap is the distance between the two cell centres it divides. `FlowGeometries` derives the
+curvilinear cell measure from those same vertices, so `L`'s flux balance and the measure it divides
+by come from one description of the mesh.
+
+The boundary condition and the mask enter exactly where they do on a rectilinear grid: a face
+against an inactive cell carries zero area, and so does a bounded outer edge under `Neumann`.
+"""
+function face_metrics(grid::FlowGeometries.Grids.CurvilinearGrid{T,G,2}, bc) where {G,T}
+    FlowGeometries.Grids.has_corners(grid) || throw(ArgumentError(
+        "the flux-form operators build face areas from this CurvilinearGrid's cell-vertex arrays, " *
+        "which it did not retain. Rebuild it with `keep_corners = true`, or pass `corners`."))
+    k = FlowGeometries.Grids.corners(grid)
+    area = ntuple(d -> _curvilinear_area(grid, k, d, bc, T), Val(2))
+    gap = ntuple(d -> _curvilinear_gap(grid, d, T), Val(2))
+    return FaceMetrics{2,T,typeof(area)}(area, gap)
+end
+
+# A curvilinear metric is per cell, so there is nothing to factor.
+@inline metric_layout(::FlowGeometries.Grids.CurvilinearGrid) = DenseMetrics()
+
+# Face `F` normal to `d` spans the two vertices at `F` and at `F` stepped once along the transverse
+# direction. Its area is their separation; `face_area`'s open/closed rules decide whether it counts.
+function _curvilinear_area(grid, k, d::Integer, bc, ::Type{T}) where {T}
+    e = d == 1 ? 2 : 1
+    dims = face_dims(grid, d)
+    a = zeros(T, dims)
+    @inbounds for F in CartesianIndices(dims)
+        iszero(_face_openness(grid, F, d, bc, T)) && continue
+        Q = CartesianIndex(ntuple(j -> j == e ? F[j] + 1 : F[j], Val(2)))
+        a[F] = sqrt((T(k[1][Q]) - T(k[1][F]))^2 + (T(k[2][Q]) - T(k[2][F]))^2)
+    end
+    return a
+end
+
+# Centre-to-centre distance across the face, or half a cell where the face has one side.
+function _curvilinear_gap(grid, d::Integer, ::Type{T}) where {T}
+    c = FlowGeometries.Grids.coordinates(grid)
+    dims = face_dims(grid, d)
+    g = ones(T, dims)
+    @inbounds for F in CartesianIndices(dims)
+        Cl = cell_below(grid, F, d)
+        Cu = cell_above(grid, F, d)
+        if Cl !== nothing && Cu !== nothing
+            g[F] = sqrt((T(c[1][Cu]) - T(c[1][Cl]))^2 + (T(c[2][Cu]) - T(c[2][Cl]))^2)
+        else
+            C = Cu === nothing ? Cl : Cu
+            C === nothing && continue
+            # Half the cell's own extent along `d`, from its two bounding vertices.
+            Q = CartesianIndex(ntuple(j -> j == d ? C[j] + 1 : C[j], Val(2)))
+            kk = FlowGeometries.Grids.corners(grid)
+            g[F] = sqrt((T(kk[1][Q]) - T(kk[1][C]))^2 + (T(kk[2][Q]) - T(kk[2][C]))^2) / 2
+        end
+    end
+    return g
+end
+
+# Whether a face carries flux at all: the mask and the boundary condition, with no geometry.
+@inline function _face_openness(grid, F::CartesianIndex{N}, d::Integer, bc, ::Type{T}) where {N,T}
+    Cl = cell_below(grid, F, d)
+    Cu = cell_above(grid, F, d)
+    Cl === nothing && Cu === nothing && return zero(T)
+    if Cl === nothing || Cu === nothing
+        C = Cu === nothing ? Cl : Cu
+        @inbounds FlowGeometries.Grids.isactive(grid, Tuple(C)...) || return zero(T)
+        return bc isa Dirichlet ? one(T) : zero(T)
+    end
+    @inbounds (FlowGeometries.Grids.isactive(grid, Tuple(Cl)...) &&
+               FlowGeometries.Grids.isactive(grid, Tuple(Cu)...)) || return zero(T)
+    return one(T)
+end
+
+function face_metrics(grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, bc) where {G,T,N}
+    layout = metric_layout(grid)
+    area = ntuple(Val(N)) do d
+        _metric_array(F -> face_area(grid, F, d, bc, T), face_dims(grid, d), layout, T)
+    end
+    gap = ntuple(Val(N)) do d
+        _metric_array(F -> face_gap(grid, F, d, T), face_dims(grid, d), layout, T)
     end
     return FaceMetrics{N,T,typeof(area)}(area, gap)
 end
@@ -301,7 +462,7 @@ end
 `g[d][F] = (χ_above − χ_below) / gap` on every face. A face with area but only one cell is a
 Dirichlet edge, whose ghost value is zero — which is exactly what the condition says.
 """
-function gradient!(g::NTuple{N,<:AbstractArray}, χ, grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
+function gradient!(g::NTuple{N,<:AbstractArray}, χ, grid::FaceIndexedGrid{T,G,N},
                   bc, fm::FaceMetrics{N,T} = face_metrics(grid, bc); backend = ComputationalBackends.SerialBackend()) where {G,T,N}
     for d in 1:N
         gd, ad, gpd = g[d], fm.area[d], fm.gap[d]
@@ -338,7 +499,7 @@ end
 `δ[I] = (1/V_I) Σ_d (A·v)[face above] − (A·v)[face below]` — the negative adjoint of
 [`gradient!`](@ref) under the cell-measure inner product, which is what makes `L = D G` symmetric.
 """
-function divergence!(δ, v::NTuple{N,<:AbstractArray}, grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
+function divergence!(δ, v::NTuple{N,<:AbstractArray}, grid::FaceIndexedGrid{T,G,N},
                      bc, fm::FaceMetrics{N,T} = face_metrics(grid, bc); backend = ComputationalBackends.SerialBackend()) where {G,T,N}
     msk = FlowGeometries.Grids.mask(grid)
     meas = FlowGeometries.Grids.measure(grid)
@@ -397,7 +558,7 @@ when all four faces bounding it are open — a loop running half through a mask 
 circulation, and requiring only two faces is what previously broke `curl(grad χ) = 0` on a masked
 grid.
 """
-function curl!(W::NTuple, v::NTuple{N,<:AbstractArray}, grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
+function curl!(W::NTuple, v::NTuple{N,<:AbstractArray}, grid::FaceIndexedGrid{T,G,N},
                bc, fm::FaceMetrics{N,T} = face_metrics(grid, bc); backend = ComputationalBackends.SerialBackend()) where {G,T,N}
     for (p, (a, b)) in enumerate(rotation_pairs(Val(N)))
         Wp = W[p]
@@ -445,7 +606,7 @@ end
 adjoint of [`curl!`](@ref), so `div(u_rot) = 0` holds discretely.
 """
 function rotational_velocity!(u_rot::NTuple{N,<:AbstractArray}, R::NTuple,
-                              grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
+                              grid::FaceIndexedGrid{T,G,N},
                               bc, fm::FaceMetrics{N,T} = face_metrics(grid, bc);
                               backend = ComputationalBackends.SerialBackend()) where {G,T,N}
     all_terms = rotation_terms(Val(N))
@@ -512,7 +673,7 @@ end
 Cell-centred velocity `(dims..., N)` to face-normal velocity, averaging the two cells a face
 separates. A face of zero area takes nothing; an open boundary face has only one cell to read.
 """
-function to_faces!(vf::NTuple{N,<:AbstractArray}, uc, grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
+function to_faces!(vf::NTuple{N,<:AbstractArray}, uc, grid::FaceIndexedGrid{T,G,N},
                    bc, fm::FaceMetrics{N,T} = face_metrics(grid, bc); backend = ComputationalBackends.SerialBackend()) where {G,T,N}
     for d in 1:N
         vd, ad = vf[d], fm.area[d]
@@ -548,7 +709,7 @@ end
 Face-normal velocity back to cell centres, averaging a cell's two faces — the adjoint of
 [`to_faces!`](@ref). A cell against a closed face averages only the faces that carry flux.
 """
-function to_centres!(uc, vf::NTuple{N,<:AbstractArray}, grid::FlowGeometries.Grids.StructuredGrid{G,T,N},
+function to_centres!(uc, vf::NTuple{N,<:AbstractArray}, grid::FaceIndexedGrid{T,G,N},
                      bc, fm::FaceMetrics{N,T} = face_metrics(grid, bc); backend = ComputationalBackends.SerialBackend()) where {G,T,N}
     msk = FlowGeometries.Grids.mask(grid)
     cart = CartesianIndices(size(grid))
