@@ -288,12 +288,23 @@ function _applicable(solver::AbstractPoissonSolver, grid, boundary)
     return true
 end
 
+"""
+    default_solver(solver_type, grid) -> solver
+
+The candidate [`AutoSolver`](@ref) tries for `grid`.
+
+A solver carrying a setting that has to match the grid — a mode count per direction, and with it the
+dimension in its own type — gives a method here. The fallback builds it from its own defaults, which
+is right for a solver whose configuration is independent of the grid.
+"""
+default_solver(solver_type::Type, grid) = solver_type()
+
 function _resolve_auto_solver(grid::FlowGeometries.Grids.AbstractGrid{G}, boundary) where {G}
     for algorithm in _spectral_algorithms(G)
         entries = get(_SPECTRAL_SOLVERS, algorithm, nothing)
         entries === nothing && continue
         for (_, solver_type) in entries
-            candidate = solver_type()
+            candidate = default_solver(solver_type, grid)
             _applicable(candidate, grid, boundary) && return candidate
         end
     end

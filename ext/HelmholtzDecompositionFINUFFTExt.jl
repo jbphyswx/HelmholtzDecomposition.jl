@@ -63,6 +63,42 @@ end
 HD.supports_boundary(::CartesianNUFFTSolver, ::HD.AbstractBoundaryCondition) = true
 HD.requires_full_domain(::CartesianNUFFTSolver) = true
 
+# This solver expands a point cloud, and its methods are written for `UnstructuredGrid` at a
+# matching dimension. A rectilinear grid reaches it only through selection, which then has no
+# `solve_poisson!` to call, and a solver whose `D` disagrees with the grid carries the wrong mode
+# count in its own type.
+HD.supports_sampling(::CartesianNUFFTSolver, grid) = false
+HD.supports_sampling(::CartesianNUFFTSolver{D},
+                     ::FG.Grids.UnstructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,
+                                                 D}) where {D,T} = true
+
+HD._sampling_message(::CartesianNUFFTSolver{D}, grid) where {D} =
+    "CartesianNUFFTSolver expands a cloud of $D-dimensional samples and takes an " *
+    "`UnstructuredGrid` over that many directions; this grid is $(nameof(typeof(grid))). Build " *
+    "the points with `FlowGeometries.Grids.UnstructuredGrid`, or solve a rectilinear grid with a " *
+    "transform defined on it or with the iterative solver."
+
+"""
+    default_solver(::Type{CartesianNUFFTSolver}, grid)
+
+The candidate [`HD.AutoSolver`](@ref) tries: one mode count per direction of `grid`.
+
+The dimension rides in the solver's own type and the mode count has to be resolvable from the
+samples, so neither can come from a constructor default. The count leaves a factor of two between
+`prod(nk)` and the node count, which is the margin `_require_resolvable` asks for.
+
+The direction count is the grid's own type parameter. `ndims` of a point cloud is `1`: its cells
+carry one flat address each, and that is unrelated to how many directions they sit in.
+"""
+function HD.default_solver(
+    ::Type{CartesianNUFFTSolver},
+    grid::FG.Grids.UnstructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,D},
+) where {T,D}
+    M = length(FG.Grids.mask(grid))
+    n = max(2, 2 * fld(floor(Int, (M / 2)^(1 / D)), 2))
+    return CartesianNUFFTSolver(; nk = ntuple(_ -> n, Val(D)))
+end
+
 """
     NUFFTPair{T,P}
 

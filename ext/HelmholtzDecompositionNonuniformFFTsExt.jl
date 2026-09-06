@@ -69,6 +69,31 @@ end
 HD.supports_boundary(::CartesianNonuniformFFTSolver, ::HD.AbstractBoundaryCondition) = true
 HD.requires_full_domain(::CartesianNonuniformFFTSolver) = true
 
+# As for the FINUFFT solver: this expands a point cloud, and its methods take an `UnstructuredGrid`
+# at a matching dimension.
+HD.supports_sampling(::CartesianNonuniformFFTSolver, grid) = false
+HD.supports_sampling(::CartesianNonuniformFFTSolver{D},
+                     ::FG.Grids.UnstructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,
+                                                 D}) where {D,T} = true
+
+HD._sampling_message(::CartesianNonuniformFFTSolver{D}, grid) where {D} =
+    "CartesianNonuniformFFTSolver expands a cloud of $D-dimensional samples and takes an " *
+    "`UnstructuredGrid` over that many directions; this grid is $(nameof(typeof(grid))). Build " *
+    "the points with `FlowGeometries.Grids.UnstructuredGrid`, or solve a rectilinear grid with a " *
+    "transform defined on it or with the iterative solver."
+
+# One mode count per direction of the grid, leaving a factor of two against the node count. The
+# direction count is the grid's own type parameter: `ndims` of a point cloud is `1`, its cells
+# carrying one flat address each.
+function HD.default_solver(
+    ::Type{CartesianNonuniformFFTSolver},
+    grid::FG.Grids.UnstructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,D},
+) where {T,D}
+    M = length(FG.Grids.mask(grid))
+    n = max(2, 2 * fld(floor(Int, (M / 2)^(1 / D)), 2))
+    return CartesianNonuniformFFTSolver(; nk = ntuple(_ -> n, Val(D)))
+end
+
 """
     NUHandle{T,P}
 

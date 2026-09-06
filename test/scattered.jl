@@ -149,6 +149,43 @@ Test.@testset "scattered Cartesian" begin
         Test.@test_throws ArgumentError HD._decompose_spectral(tight, geo, Ud, dense)
     end
 
+    Test.@testset "a rectilinear grid never selects the point-cloud solver" begin
+        # Axes collected into `Vector`s are not uniform at the type level, so the bounded and the
+        # periodic transforms both refuse them. Selection has to reach the iterative solver: the
+        # scattered solvers carry their dimension in their own type and have no `solve_poisson!`
+        # for a rectilinear grid at any dimension.
+        T = Float64
+        xs = collect(range(0, 2π; length = 9)[1:8])
+        for dims in ((xs, xs), (xs, xs, xs))
+            g = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{T}(), dims...)
+            sel = HD.select_solver(HD.AutoSolver(), g, HD.Neumann())
+            Test.@test sel isa HD.CGSolver
+            Test.@test hasmethod(HD.solve_poisson!,
+                                 Tuple{Array{T,length(dims)}, Array{T,length(dims)},
+                                       typeof(g), typeof(sel)})
+        end
+
+        g3 = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{T}(), xs, xs, xs)
+        r = HD.helmholtz_decompose(zeros(T, 8, 8, 8, 3), g3; boundary = HD.Neumann())
+        Test.@test size(r.u_rot) == (8, 8, 8, 3)
+
+        # Named directly, each scattered solver refuses a rectilinear grid, and the refusal names
+        # the layout it takes.
+        Test.@test_throws ArgumentError HD.select_solver(
+            FIExt.CartesianNUFFTSolver(; nk = (8, 8, 8)), g3, HD.Neumann())
+        Test.@test_throws ArgumentError HD.select_solver(
+            NUExt.CartesianNonuniformFFTSolver(; nk = (8, 8, 8)), g3, HD.Neumann())
+
+        # On the point cloud it is built for, `AutoSolver` picks it and sizes it to the grid. The
+        # direction count is the coordinate count: `ndims` of a point cloud is `1`, since its cells
+        # carry one flat address each.
+        pts, Up, _ = scattered_case(2000)
+        auto = HD.select_solver(HD.AutoSolver(), pts, HD.Neumann())
+        Test.@test auto isa FIExt.CartesianNUFFTSolver
+        Test.@test length(auto.nk) == length(FG.Grids.coordinates(pts))
+        Test.@test prod(auto.nk) <= size(Up, 1)
+    end
+
     Test.@testset "a node set that cannot determine the modes is reported" begin
         # Samples confined to a band of the torus — a ship track, a satellite swath. `144` modes
         # from `2000` samples clears every counting test by a wide margin, the fit converges, and
