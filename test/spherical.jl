@@ -232,7 +232,10 @@ Test.@testset "a threaded batch on a Clenshaw–Curtis sphere matches serial" be
                        eachindex(fields))
         thr = maximum(i -> maximum(abs, getfield(bser[i], f) .- getfield(bthr[i], f)),
                       eachindex(fields))
-        Test.@test thr <= max(base, 8 * eps(Float64) * scale)
+        # `base` is one draw of that same round-off and lands either side of `thr` by chance, so
+        # the comparison is taken against a floor as well. `1e-13` relative sits far above the
+        # transform's own scatter and far below a threading fault, which reads in tenths.
+        Test.@test thr <= max(base, 1e-13 * scale)
     end
 end
 
