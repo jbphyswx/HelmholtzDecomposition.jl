@@ -138,6 +138,53 @@ Test.@testset "Clenshaw–Curtis spectral Hodge" begin
     end
 end
 
+# `∇χ` and `k̂ × ∇χ` on the unit sphere for `χ = cosᵃφ sinᵇφ cos(mλ)`, which is `P_l^m(sin φ) cos(mλ)`
+# up to normalization for the `(m, a, b)` used below. Components are (east, north).
+function _grad_and_rot(λ, φ, m, a, b)
+    nlon, nlat = length(λ), length(φ)
+    G = zeros(nlon, nlat, 2)
+    R = zeros(nlon, nlat, 2)
+    for j in 1:nlat, i in 1:nlon
+        c, s = cos(φ[j]), sin(φ[j])
+        dλ = -m * c^a * s^b * sin(m * λ[i])                              # ∂λ χ
+        dφ = (-a * c^(a - 1) * s^(b + 1) + (b == 0 ? 0.0 : b * c^(a + 1) * s^(b - 1))) *
+             cos(m * λ[i])                                                # ∂φ χ
+        G[i, j, 1] = dλ / c
+        G[i, j, 2] = dφ
+        R[i, j, 1] = -dφ
+        R[i, j, 2] = dλ / c
+    end
+    return G, R
+end
+
+Test.@testset "spin E/B labels at m ≥ 2" begin
+    # A gradient is divergent and its rotation by `k̂ ×` is rotational, whatever `m`. Swapped labels
+    # put each field wholly in the other part.
+    nlat = 24
+    ax = FG.SphericalSampling.spherical_axes(Float64, FG.SphericalSampling.ClenshawCurtisSampling(),
+                                             nlat)
+    cc = FG.Grids.StructuredGrid(SPH, ax.λ, ax.φ)
+    ll = latlon(nlat)
+    fsh = fsh_ext().SphericalSpectralSolver()
+    nu = nufsht_ext().SphericalNUSHTSolver(; lmax = nlat - 1, tol = 1e-12, rtol = 1e-12)
+    cases = ((2, 2, 0), (2, 2, 1), (3, 3, 0), (4, 4, 0))    # (l, m) = (2,2), (3,2), (3,3), (4,4)
+    for (label, grid, solver) in (("FSH, Clenshaw–Curtis", cc, fsh), ("NUFSHT, Clenshaw–Curtis", cc, nu),
+                                  ("NUFSHT, longitude–latitude", ll, nu))
+        λ, φ = FG.Grids.coordinates(grid, 1), FG.Grids.coordinates(grid, 2)
+        Test.@testset "$label" begin
+            for (m, a, b) in cases
+                G, R = _grad_and_rot(λ, φ, m, a, b)
+                g = HD.helmholtz_decompose_spectral(G, grid; solver)
+                Test.@test nrm(g.u_rot) / nrm(G) < 1e-10
+                Test.@test nrm(g.u_div .- G) / nrm(G) < 1e-10
+                r = HD.helmholtz_decompose_spectral(R, grid; solver)
+                Test.@test nrm(r.u_div) / nrm(R) < 1e-10
+                Test.@test nrm(r.u_rot .- R) / nrm(R) < 1e-10
+            end
+        end
+    end
+end
+
 Test.@testset "quadrature samplings resolve and split" begin
     # Gauss–Legendre and Driscoll–Healy are the samplings whose quadrature is exact at the stated
     # band limit. `FastSphericalHarmonics` implements neither, so they resolve to the non-uniform

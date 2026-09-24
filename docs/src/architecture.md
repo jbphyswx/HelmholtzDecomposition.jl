@@ -94,7 +94,7 @@ extension are both the bounded FFT — so the priority is explicit and load orde
 ```
 AbstractPoissonSolver
 ├── AutoSolver
-├── CGSolver{T}                       # multigrid-preconditioned by default
+├── CGSolver{R}                       # multigrid-preconditioned by default; R the tolerance type
 ├── CartesianSpectralSolver           (ext: FFTW)          periodic rfft
 ├── CartesianBoundedSolver            (ext: FFTW)          r2r, per-direction kind
 ├── CartesianRealTransformSolver      (ext: AbstractFFTs)  bounded/channel/periodic, any backend

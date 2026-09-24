@@ -531,6 +531,7 @@ function _solve_potentials!(result, u::AbstractArray, plan::HelmholtzPlan{N,P,T}
     result.χ_solve = solve_poisson!(result.χ, result.divergence, grid, concrete;
                                     boundary = bc, coefficients = plan.coefficients, state = state,
                                     backend = backend)
+    _require_converged(result.χ_solve, :χ)
     gradient!(ws.gχ, result.χ, grid, bc, plan.metrics; backend = backend)
 
     # 4. W = curl u on the corners, and L R = W on each dual grid. The remainder u − u_div is
@@ -546,8 +547,10 @@ function _solve_potentials!(result, u::AbstractArray, plan::HelmholtzPlan{N,P,T}
                            ws.dual_states) do Rp, Wp, dg, dc, ds, st
         dc.singular && project_out_constant!(Wp, dg, dc; backend = backend)
         # `Dirichlet` here regardless of the primal condition — see `plan_helmholtz`.
-        solve_poisson!(Rp, Wp, dg, ds; boundary = Dirichlet(), coefficients = dc, state = st,
-                       backend = backend)
+        s = solve_poisson!(Rp, Wp, dg, ds; boundary = Dirichlet(), coefficients = dc, state = st,
+                           backend = backend)
+        _require_converged(s, :rotation_potential)
+        s
     end
     return result
 end

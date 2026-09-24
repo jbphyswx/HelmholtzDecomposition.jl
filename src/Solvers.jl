@@ -60,6 +60,19 @@ struct SolverResult{T<:AbstractFloat}
     residual::T
 end
 
+"""
+    _require_converged(r::SolverResult, what)
+
+Throw unless the solve that produced `r` met its tolerance. A potential solved short of it gives a
+part without the field's divergence or curl, and the difference lands in the harmonic remainder.
+"""
+@inline _require_converged(r::SolverResult, what::Symbol) =
+    r.converged ? nothing : _throw_unconverged(r, what)
+
+@noinline _throw_unconverged(r::SolverResult, what::Symbol) = throw(ArgumentError(
+    "the $what solve did not reach its tolerance: relative residual $(r.residual) after " *
+    "$(r.iterations) iterations. Raise the solver's `max_iter`, or pass a larger `rtol`."))
+
 # ---------------------------------------------------------------------------
 # Solver capability
 # ---------------------------------------------------------------------------
@@ -242,10 +255,9 @@ The value is a list because more than one extension can implement the same algor
 and the `AbstractFFTs` even/odd extension are both the bounded FFT. They are ordered by an explicit
 priority, not by load order, so which one runs does not depend on which package was imported first.
 """
-# `Type`, not `Type{<:AbstractPoissonSolver}`: a solver parameterised on its tolerance type is a
-# `UnionAll`, which that bound rejects.
 const _SPECTRAL_SOLVERS =
     Dict{Type{<:SpectralBackends.AbstractSpectralBackend},Vector{Tuple{Int,Type}}}()
+# The solver slot holds a `Type`: a solver parameterised on its tolerance type is a `UnionAll`.
 
 """
     register_spectral_solver!(algorithm, solver_type; priority)
@@ -374,10 +386,12 @@ trigonometry per cell per direction. That is invariant across iterations — and
 potentials and the whole batch — so it is reduced once here.
 
 `coef[I, d]` is the coefficient of the face **below** cell `I` along `d`; `diag[I]` is the
-negative sum of a cell's own face coefficients, divided by its measure.
+negative sum of a cell's own face coefficients, divided by its measure. `nullspace` holds the
+constants `L` annihilates, one per closed component (see [`ComponentNullspace`](@ref)), and
+`singular` says whether there are any.
 """
 struct LaplacianCoefficients{N,T,C<:NTuple{N,AbstractArray{T,N}},D<:AbstractArray{T,N},
-                             M<:AbstractArray{T,N}}
+                             M<:AbstractArray{T,N},NS}
     coef::C          # coef[d][F] = A_F / g_F, the Hodge factor of face F
     diag::D          # −Σ over a cell's own faces, divided by its measure
     # `measure` and `diag` carry separate types: on an unmasked grid the measure is the grid's own
@@ -386,7 +400,35 @@ struct LaplacianCoefficients{N,T,C<:NTuple{N,AbstractArray{T,N}},D<:AbstractArra
     # `Σ V_I` over the active cells. `project_out_constant!` divides by it on every conjugate-
     # gradient iteration, and it is a property of the grid.
     total::T
-    singular::Bool   # constants in the null space: no boundary removes them
+    singular::Bool
+    nullspace::NS
+end
+
+"""
+    ComponentNullspace{P,O,V}
+
+The constants in `L`'s null space, one per closed component: a connected component of the graph of
+faces with nonzero coefficient on which `L·1 = 0`. Component `k`'s cells are the linear indices
+`perm[offsets[k]:offsets[k+1]-1]` and `totals[k]` is its measure. `full` marks a single closed
+component holding every active cell, which [`project_out_constant!`](@ref) removes in one linear
+pass without reading `perm`.
+
+`perm` is read by kernels and moves with the plan. `offsets` and `totals` bound the host loop over
+components; they are tuples, so a device plan holds no host array.
+"""
+struct ComponentNullspace{P<:AbstractVector{<:Integer},O<:Tuple{Vararg{Int}},
+                          V<:Tuple{Vararg{AbstractFloat}}}
+    full::Bool
+    perm::P
+    offsets::O
+    totals::V
+end
+
+# Coefficients with their null space, found from the operator they define.
+function _with_nullspace(grid, coef::NTuple{N,Any}, diag, meas, total::T) where {N,T}
+    ns = _nullspace(grid, coef, diag, meas, Val(N), T)
+    return LaplacianCoefficients{N,T,typeof(coef),typeof(diag),typeof(meas),typeof(ns)}(
+        coef, diag, meas, total, !isempty(ns.totals), ns)
 end
 
 """
@@ -418,10 +460,7 @@ function laplacian_coefficients(
     diag = _diagonal(grid, coef, meas, T)
     # `sum` of a separable measure is the product of its per-axis sums, which `FlowGeometries`
     # specialises; on a masked grid the inactive entries are already zero.
-    total = T(sum(meas))
-    P = (N, T, typeof(coef), typeof(diag), typeof(meas))
-    built = LaplacianCoefficients{P...}(coef, diag, meas, total, false)
-    return LaplacianCoefficients{P...}(coef, diag, meas, total, _detect_singular(grid, built))
+    return _with_nullspace(grid, coef, diag, meas, T(sum(meas)))
 end
 
 """
@@ -479,33 +518,102 @@ function _measure_array(grid, msk, ::Type{T}) where {T}
 end
 
 """
-    _detect_singular(grid, c) -> Bool
+    _nullspace(grid, coef, diag, measure, Val(N), T) -> ComponentNullspace
 
-Whether the constants lie in `L`'s null space, decided by applying `L` to the constant field and
-seeing whether anything comes back.
-
-Asking the boundary condition instead is not enough, and the dual grid is why: its boundary ring
-of corners has no closed loop of cells around it, so those corners are masked out and every face
-of the active region is closed — the operator there is singular **even under `Dirichlet`**, which
-a condition-based test reports as nonsingular. Conjugate gradients on a singular system with no
-null-space projection then drifts along the null space instead of converging, which showed up as a
-harmonic fraction of `1.7e+32`.
-
-`L·1 = 0` is exactly the property that matters and costs one operator application at plan time.
+The constants in `L`'s null space. `(L·1)_I = (1/V_I) Σ_f c_f (1_nbr − 1)` is nonzero only through a
+face whose far side is the zero ghost of a Dirichlet edge, so the null space is spanned by the
+indicators of the components of the coupling graph on which `L·1` vanishes. That is tested per
+component against the scale of the diagonal, so a face whose area is round-off, as at a pole, counts
+as closed. Decided from the operator itself: the dual grid's masked-off boundary ring closes every
+face of its active region, which makes it singular under `Dirichlet`.
 """
-function _detect_singular(grid, c::LaplacianCoefficients{N,T}) where {N,T}
-    ones_ = fill(one(T), size(grid))
-    out = similar(ones_)
-    apply_laplacian!(out, ones_, grid, c)
+function _nullspace(grid, coef, diag, meas, v::Val{N}, ::Type{T}) where {N,T}
+    dims = size(grid)
+    labels = zeros(Int32, dims)
+    ncomp = _label_components!(labels, grid, coef, v)
+    ones_ = fill(one(T), dims)
+    Lone = similar(ones_)
+    _apply_laplacian!(Lone, ones_, grid, FlowGeometries.Grids.mask(grid), coef, meas, v, T,
+                      ComputationalBackends.SerialBackend())
     scale = zero(T)
-    resid = zero(T)
-    @inbounds for I in CartesianIndices(size(grid))
-        FlowGeometries.Grids.isactive(grid, Tuple(I)...) || continue
-        scale = max(scale, abs(c.diag[I]))
-        resid = max(resid, abs(out[I]))
+    worst = zeros(T, ncomp)
+    counts = zeros(Int, ncomp)
+    @inbounds for I in CartesianIndices(dims)
+        k = labels[I]
+        k == 0 && continue
+        scale = max(scale, abs(diag[I]))
+        worst[k] = max(worst[k], abs(Lone[I]))
+        counts[k] += 1
     end
-    iszero(scale) && return true
-    return resid <= sqrt(eps(T)) * scale
+    closed = [iszero(scale) || worst[k] <= sqrt(eps(T)) * scale for k in 1:ncomp]
+    K = count(closed)
+    K == 0 && return ComponentNullspace(false, Int[], (1,), ())
+    ncomp == 1 && return ComponentNullspace(true, Int[], (1,), (T(sum(meas)),))
+    # The closed components' cells, grouped by component with a counting sort over the labels.
+    slot = zeros(Int, ncomp)
+    offsets = ones(Int, K + 1)
+    s = 0
+    for k in 1:ncomp
+        closed[k] || continue
+        s += 1
+        slot[k] = s
+        offsets[s + 1] = offsets[s] + counts[k]
+    end
+    perm = Vector{Int}(undef, offsets[end] - 1)
+    next = offsets[1:K]
+    totals = zeros(T, K)
+    @inbounds for (lin, I) in enumerate(CartesianIndices(dims))
+        k = labels[I]
+        (k == 0 || slot[k] == 0) && continue
+        s = slot[k]
+        perm[next[s]] = lin
+        next[s] += 1
+        totals[s] += T(meas[I])
+    end
+    return ComponentNullspace(false, perm, Tuple(offsets), Tuple(totals))
+end
+
+# Each active cell's component of the coupling graph: two cells share one when a chain of faces of
+# nonzero coefficient joins them. Returns the number of components.
+function _label_components!(labels, grid, coef, v::Val{N}) where {N}
+    dims = size(grid)
+    lin = LinearIndices(dims)
+    cart = CartesianIndices(dims)
+    stack = Int[]
+    ncomp = Int32(0)
+    @inbounds for I0 in cart
+        (labels[I0] == 0 && FlowGeometries.Grids.isactive(grid, Tuple(I0)...)) || continue
+        ncomp += Int32(1)
+        labels[I0] = ncomp
+        push!(stack, lin[I0])
+        while !isempty(stack)
+            _join_neighbours!(labels, stack, lin, grid, coef, cart[pop!(stack)], ncomp, v)
+        end
+    end
+    return Int(ncomp)
+end
+
+# The direction is a type parameter, as in `_flux_sum`, so `coef[d]` is a fixed slot of the tuple.
+@inline _join_neighbours!(labels, stack, lin, grid, coef, I::CartesianIndex, k, ::Val{0}) = nothing
+
+@inline function _join_neighbours!(labels, stack, lin, grid, coef, I::CartesianIndex{N}, k,
+                                   ::Val{d}) where {N,d}
+    @inbounds begin
+        cd = coef[d]
+        Flo = face_below(I, d)
+        iszero(cd[Flo]) || _join!(labels, stack, lin, cell_below(grid, Flo, d), k)
+        Fhi = face_above(grid, I, d)
+        iszero(cd[Fhi]) || _join!(labels, stack, lin, cell_above(grid, Fhi, d), k)
+    end
+    return _join_neighbours!(labels, stack, lin, grid, coef, I, k, Val(d - 1))
+end
+
+@inline _join!(labels, stack, lin, ::Nothing, k) = nothing
+@inline function _join!(labels, stack, lin, J::CartesianIndex, k)
+    @inbounds labels[J] == 0 || return nothing
+    @inbounds labels[J] = k
+    push!(stack, lin[J])
+    return nothing
 end
 
 """
@@ -613,14 +721,19 @@ end
     return false
 end
 
-# Host arrays walk the index space itself, in slabs of the trailing axis. Stepping a
-# `CartesianIndex` carries the coordinates along, so no cell pays the division the flat form does.
+# Host arrays on a host backend walk the index space itself, in slabs of the trailing axis. Stepping
+# a `CartesianIndex` carries the coordinates along, so no cell pays the division the flat form does.
+# A KernelAbstractions backend takes the flat form whatever its arrays are, `KA.CPU()`'s `Array`s
+# included: `run_chunks` is a host loop.
 #
 # A row whose other coordinates are all interior meets the boundary only at its two ends, so it
 # splits into those two cells and a run that takes `_laplacian_interior`. That run is the whole grid
 # apart from its surface.
+const _HostBackend = Union{ComputationalBackends.AbstractSerialBackend,
+                           ComputationalBackends.AbstractThreadedBackend}
+
 function _apply_laplacian!(out::Array, Φ, grid, msk, coef, meas, v::Val{N}, ::Type{T},
-                           backend) where {N,T}
+                           backend::_HostBackend) where {N,T}
     dims = size(grid)
     n1 = dims[1]
     mid = CartesianIndices(ntuple(e -> dims[e + 1], Val(N - 2)))
@@ -666,7 +779,7 @@ end
 
 # A one-dimensional grid has no leading axes to nest, so the trailing axis is the whole of it.
 function _apply_laplacian!(out::Array, Φ, grid, msk, coef, meas, v::Val{1}, ::Type{T},
-                           backend) where {T}
+                           backend::_HostBackend) where {T}
     FlowGeometries.Execution.run_chunks(size(grid, 1), backend) do slab
         @inbounds for i in slab
             I = CartesianIndex(i)
@@ -691,23 +804,26 @@ array of symbol values is stored or read.
 @inline lazy_axis_sum(v::NTuple{N,Any}) where {N} = Broadcast.broadcasted(+, v...)
 
 """
-    CGSolver(; max_iter = 1000, rtol = 1e-10)
+    CGSolver(; max_iter = 1000, rtol = nothing, multigrid = true)
 
 Conjugate gradients on `−L`, which is symmetric positive (semi)definite by construction — see
-`Operators.jl`. Jacobi-preconditioned, and on a closed problem the iterate and residual are kept
-orthogonal to the constants.
+`Operators.jl` — preconditioned by a multigrid V-cycle, or by Jacobi with `multigrid = false`. On a
+singular problem the iterate and residual are kept orthogonal to `L`'s null space.
 
-Works on any grid, any mask, any boundary condition. Stage 6 adds a multigrid preconditioner in
-place of Jacobi; the outer iteration is unchanged by that.
+The solve stops when the residual falls to `rtol` of the right-hand side, both measured in the
+cell-measure norm; `rtol = nothing` is `100·eps(T)` for the field's element type `T`. Works on any
+grid, mask and boundary condition.
 """
-struct CGSolver{T<:AbstractFloat} <: AbstractPoissonSolver
+struct CGSolver{R<:Union{Nothing,AbstractFloat}} <: AbstractPoissonSolver
     max_iter::Int
-    rtol::T
+    rtol::R
     multigrid::Bool
 end
 
-CGSolver(; max_iter::Int = 1000, rtol::AbstractFloat = 1e-10, multigrid::Bool = true) =
-    CGSolver(max_iter, rtol, multigrid)
+CGSolver(; max_iter::Int = 1000, rtol::Union{Nothing,AbstractFloat} = nothing,
+         multigrid::Bool = true) = CGSolver(max_iter, rtol, multigrid)
+
+@inline _rtol(s::CGSolver, ::Type{T}) where {T} = s.rtol === nothing ? 100 * eps(T) : T(s.rtol)
 
 # Cell by cell, so every condition on a bounded direction is honoured, and a mask with it.
 supports_boundary(::CGSolver, ::AbstractBoundaryCondition) = true
@@ -721,16 +837,11 @@ supports_boundary(::CGSolver, ::AbstractBoundaryCondition) = true
 `D = −G*` with the adjoint taken against the cell measure. A Krylov method using the wrong inner
 product is no longer minimising what it reports, so the weight is not optional.
 """
-# `measure` is zero on inactive cells, so no mask term is needed.
-#
-# Through `Execution.reduce_indices`, which has a method per backend, so the reduction runs where
-# the rest of the iteration does. `sum` over a `Broadcasted` is serial whatever backend is asked
-# for, and a conjugate-gradient step evaluates three of these.
 function _dot_measure(a, b, grid, c::LaplacianCoefficients{N,T};
                       backend = ComputationalBackends.SerialBackend()) where {N,T}
+    # `measure` is zero on inactive cells, so no mask term is needed; each cell reads only its own
+    # entries, so the index is linear.
     meas = c.measure
-    # Linear: each cell contributes its own entry and reads no neighbour, so no `CartesianIndex`
-    # has to be rebuilt. A lazy measure converts internally and is no worse than it was.
     return FlowGeometries.Execution.reduce_indices(+, zero(T), length(a), backend) do lin
         @inbounds a[lin] * b[lin] * meas[lin]
     end
@@ -796,6 +907,7 @@ function solve_poisson!(
     c = coefficients
     ws = state.workspace
     r, p, Ap, z = ws.r, ws.p, ws.Ap, ws.z
+    rtol = _rtol(solver, T)
 
     # Solve A Φ = b with A = −L, which is the positive-definite orientation.
     fill!(Φ, zero(T))
@@ -813,15 +925,17 @@ function solve_poisson!(
         apply_laplacian!(Ap, p, grid, c; backend = backend)
         @. Ap = -Ap
         pAp = _dot_measure(p, Ap, grid, c; backend = backend)
-        # A zero curvature means `p` lies in the null space; with the projection above that only
-        # happens once the residual is already exhausted.
-        iszero(pAp) && return SolverResult{T}(true, iter, rnorm / bnorm)
+        # A zero curvature means `p` lies in the null space, and no step reduces the residual.
+        if iszero(pAp)
+            c.singular && project_out_constant!(Φ, grid, c; backend = backend)
+            return SolverResult{T}(rnorm <= rtol * bnorm, iter, rnorm / bnorm)
+        end
         α = rz / pAp
         @. Φ += α * p
         @. r -= α * Ap
         c.singular && project_out_constant!(r, grid, c; backend = backend)
         rnorm = sqrt(_dot_measure(r, r, grid, c; backend = backend))
-        rnorm <= solver.rtol * bnorm && begin
+        rnorm <= rtol * bnorm && begin
             c.singular && project_out_constant!(Φ, grid, c; backend = backend)
             return SolverResult{T}(true, iter, rnorm / bnorm)
         end
@@ -864,22 +978,44 @@ end
 """
     project_out_constant!(Φ, grid, c)
 
-Remove the measure-weighted mean of `Φ` over the active cells.
+Remove from `Φ`, on each closed component of `L` (see [`ComponentNullspace`](@ref)), its
+measure-weighted mean over that component.
 
-A closed problem — every direction periodic, or a Neumann boundary — leaves the constants in
-`L`'s null space. Krylov iterations must stay orthogonal to that null space or they drift along
-it, so this is applied to the right-hand side once and to the iterate as it goes.
+Those constants are `L`'s null space. Krylov iterations must stay orthogonal to it or they drift
+along it, so this is applied to the right-hand side once and to the iterate as it goes.
 """
 function project_out_constant!(Φ, grid, c::LaplacianCoefficients{N,T};
                                backend = ComputationalBackends.SerialBackend()) where {N,T}
     c.singular || return Φ
-    iszero(c.total) && return Φ
-    meas = c.measure
-    # Both passes are linear: a cell reads its own measure and its own value.
+    ns = c.nullspace
+    ns.full && return _project_mean!(Φ, c.measure, c.total, backend, T)
+    meas, perm = c.measure, ns.perm
+    for k in eachindex(ns.totals)
+        o = ns.offsets[k] - 1
+        n = ns.offsets[k + 1] - ns.offsets[k]
+        acc = FlowGeometries.Execution.reduce_indices(+, zero(T), n, backend) do i
+            @inbounds begin
+                j = perm[o + i]
+                Φ[j] * meas[j]
+            end
+        end
+        m = acc / ns.totals[k]
+        FlowGeometries.Execution.run_indices(n, backend) do i
+            @inbounds Φ[perm[o + i]] -= m
+            return nothing
+        end
+    end
+    return Φ
+end
+
+# One closed component holding every active cell: both passes are linear, a cell reading its own
+# measure and its own value.
+function _project_mean!(Φ, meas, total, backend, ::Type{T}) where {T}
+    iszero(total) && return Φ
     acc = FlowGeometries.Execution.reduce_indices(+, zero(T), length(Φ), backend) do lin
         @inbounds Φ[lin] * meas[lin]
     end
-    m = acc / c.total
+    m = acc / total
     FlowGeometries.Execution.run_indices(length(Φ), backend) do lin
         # An inactive cell has zero measure and keeps the zero the operator puts there.
         @inbounds iszero(meas[lin]) || (Φ[lin] -= m)

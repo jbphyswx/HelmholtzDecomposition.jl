@@ -43,9 +43,12 @@ function HD.to_backend(b::KA.Backend, c::HD.LaplacianCoefficients{N,T}) where {N
     coef = map(a -> Adapt.adapt(b, a), c.coef)
     meas = Adapt.adapt(b, c.measure)
     diag = _adapt_diagonal(b, c.diag, coef, meas)
-    # `singular` rides along unchanged: it is a property of the operator, already decided.
-    return HD.LaplacianCoefficients{N,T,typeof(coef),typeof(diag),typeof(meas)}(
-        coef, diag, meas, c.total, c.singular)
+    # A kernel reads the component cells; the offsets and measures are tuples bounding the host
+    # loop over components.
+    ns = c.nullspace
+    nsd = HD.ComponentNullspace(ns.full, Adapt.adapt(b, ns.perm), ns.offsets, ns.totals)
+    return HD.LaplacianCoefficients{N,T,typeof(coef),typeof(diag),typeof(meas),typeof(nsd)}(
+        coef, diag, meas, c.total, c.singular, nsd)
 end
 
 # The hierarchy is read during every cycle, so its grids and coefficients move with the plan. The

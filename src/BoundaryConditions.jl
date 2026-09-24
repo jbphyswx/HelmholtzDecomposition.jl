@@ -25,6 +25,5 @@ struct Dirichlet <: AbstractBoundaryCondition end
 "Homogeneous Neumann condition (`∂Φ/∂n = 0` on the boundary): no flux through the domain edge."
 struct Neumann <: AbstractBoundaryCondition end
 
-# Whether the resulting Laplacian is singular is deliberately NOT asked of the condition: a
-# grid whose mask closes off every boundary face is singular under `Dirichlet` too. It is
-# decided by applying the operator to the constant field — see `_detect_singular`.
+# A grid whose mask closes off every boundary face is singular under `Dirichlet` too, so the
+# Laplacian's null space is read from the operator itself — see `_nullspace`.

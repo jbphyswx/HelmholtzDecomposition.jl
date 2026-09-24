@@ -104,11 +104,12 @@ function galerkin_coefficients(
         meas[Ic] = m
     end
     diag = _diagonal(cgrid, coef, meas, T)
-    total = T(sum(meas))
-    P = (N, T, typeof(coef), typeof(diag), typeof(meas))
-    built = LaplacianCoefficients{P...}(coef, diag, meas, total, false)
-    return LaplacianCoefficients{P...}(coef, diag, meas, total, _detect_singular(cgrid, built))
+    return _with_nullspace(cgrid, coef, diag, meas, T(sum(meas)))
 end
+
+# A curvilinear mesh has no axes to halve. `_levels` reads `nothing` as "no level below this one",
+# so the hierarchy is the top level alone and the preconditioner is its smoother.
+coarsen(::FlowGeometries.Grids.CurvilinearGrid, bc) = nothing
 
 """
     coarsen(grid, bc) -> grid or nothing
@@ -119,10 +120,6 @@ A coarse cell is active when **any** of the fine cells it covers is. The alterna
 all of them — erodes the domain by a cell per level, so a narrow channel or a coastline would
 vanish partway down the hierarchy and the correction there would be identically zero.
 """
-# A curvilinear mesh has no axes to halve. `_levels` reads `nothing` as "no level below this one",
-# so the hierarchy is the top level alone and the preconditioner is its smoother.
-coarsen(::FlowGeometries.Grids.CurvilinearGrid, bc) = nothing
-
 function coarsen(grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, bc) where {G,T,N}
     dims = size(grid)
     # Nothing left to coarsen once every direction is too small to halve usefully.

@@ -140,3 +140,26 @@ Test.@testset "device: a decomposition runs and matches the host" begin
     Test.@test Array(dres.u_rot) ≈ href.u_rot
     Test.@test Array(dres.u_div) ≈ href.u_div
 end
+
+Test.@testset "device: GPUBackend(KA.CPU()) matches the host" begin
+    # `KA.CPU()` allocates plain `Array`s, so this reaches every method that dispatches on the array
+    # type; the kernels still run through KernelAbstractions.
+    Random.seed!(22)
+    for (dims, solver) in (((12, 12), HD.CGSolver(; multigrid = false)),
+                           ((12, 12), HD.CGSolver(; multigrid = true)),
+                           ((8, 8, 8), HD.CGSolver(; multigrid = true)))
+        N = length(dims)
+        grid = FG.Grids.StructuredGrid(CART, ntuple(d -> range(0.0, 1.0; length = dims[d]), N)...)
+        u = randn(dims..., N)
+        hplan = HD.plan_helmholtz(grid; boundary = HD.Neumann(), solver, backend = CB.SerialBackend())
+        href = HD.helmholtz_decompose!(HD.allocate_result(hplan), u, hplan,
+                                       HD.allocate_workspace(hplan))
+        kplan = HD.plan_helmholtz(grid; boundary = HD.Neumann(), solver,
+                                  backend = CB.GPUBackend(KA.CPU()))
+        kres = HD.helmholtz_decompose!(HD.allocate_result(kplan), u, kplan,
+                                       HD.allocate_workspace(kplan))
+        Test.@test kres.χ ≈ href.χ
+        Test.@test kres.u_rot ≈ href.u_rot
+        Test.@test kres.u_div ≈ href.u_div
+    end
+end

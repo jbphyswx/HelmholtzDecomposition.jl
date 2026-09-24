@@ -147,6 +147,75 @@ end
     @test maximum(abs.(ΦN .- fN)) < 1e-9
 end
 
+@testset "iterative solves converge in Float32 and refuse to return unconverged" begin
+    n = 32
+    xr = collect(range(0.0f0, 1.0f0; length = n))       # a `Vector` axis, so the solver is CG
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float32}(), xr, xr)
+    Random.seed!(12)
+    u = randn(Float32, n, n, 2)
+    for mg in (true, false)
+        plan = HD.plan_helmholtz(grid; boundary = HD.Neumann(), solver = HD.CGSolver(; multigrid = mg),
+                                 backend = CB.SerialBackend())
+        @test plan.solver isa HD.CGSolver
+        ws = HD.allocate_workspace(plan)
+        res = HD.helmholtz_decompose!(HD.allocate_result(plan), u, plan, ws)
+        @test res.χ_solve.converged
+        @test all(s -> s.converged, res.rot_solve)
+        @test eltype(res.χ) == Float32
+        # `D Gχ = D u` up to the true residual, which in Float32 is of order `eps·κ(L)`, with
+        # `κ ≈ 8n²/π²` for this Laplacian.
+        δ = zeros(Float32, n, n)
+        HD.divergence!(δ, HD.face_divergent(ws), grid, plan.boundary, plan.metrics)
+        κ = 8 * n^2 / π^2
+        @test sqrt(sum(abs2, δ .- res.divergence)) <= 10 * eps(Float32) * κ * sqrt(sum(abs2, res.divergence))
+    end
+
+    # A solve stopped by its iteration cap raises.
+    capped = HD.plan_helmholtz(grid; boundary = HD.Neumann(),
+                               solver = HD.CGSolver(; max_iter = 2, multigrid = false),
+                               backend = CB.SerialBackend())
+    @test_throws ArgumentError HD.helmholtz_decompose!(HD.allocate_result(capped), u, capped)
+end
+
+@testset "each closed component of the mask keeps its own constant" begin
+    # `L`'s null space is one constant per component no Dirichlet face reaches: both basins of a
+    # walled Neumann box, and a lake cut off by an inactive ring inside a Dirichlet box.
+    n = 40
+    xr = collect(range(0.0, 1.0; length = n))
+    wall = trues(n, n)
+    wall[n ÷ 2, :] .= false
+    lake = trues(n, n)
+    for j in 1:n, i in 1:n
+        abs(hypot(xr[i] - 0.5, xr[j] - 0.5) - 0.25) < 0.04 && (lake[i, j] = false)
+    end
+    Random.seed!(13)
+    κ = 8 * n^2 / π^2
+    for (mask, bc, nclosed) in ((wall, HD.Neumann(), 2), (lake, HD.Dirichlet(), 1))
+        grid = FG.Grids.StructuredGrid(CART, xr, xr; mask = mask)
+        plan = HD.plan_helmholtz(grid; boundary = bc, solver = HD.CGSolver(),
+                                 backend = CB.SerialBackend())
+        c = plan.coefficients
+        ns = c.nullspace
+        @test c.singular
+        @test length(ns.totals) == nclosed
+        @test !ns.full
+        u = randn(n, n, 2) .* mask
+        ws = HD.allocate_workspace(plan)
+        res = HD.helmholtz_decompose!(HD.allocate_result(plan), u, plan, ws)
+        @test res.χ_solve.converged
+        # χ is unique up to one constant per closed component, fixed by zero mean on each: the
+        # weighted sum vanishes to the round-off of an n-term sum.
+        for k in eachindex(ns.totals)
+            cells = ns.perm[ns.offsets[k]:(ns.offsets[k + 1] - 1)]
+            @test abs(sum(res.χ[cells] .* c.measure[cells])) <=
+                  length(cells) * eps() * sum(abs.(res.χ[cells]) .* c.measure[cells])
+        end
+        δ = zeros(n, n)
+        HD.divergence!(δ, HD.face_divergent(ws), grid, plan.boundary, plan.metrics)
+        @test sqrt(sum(abs2, δ .- res.divergence)) <= 10 * eps() * κ * sqrt(sum(abs2, res.divergence))
+    end
+end
+
 @testset "backend honesty" begin
     n = 12
     xr = range(0.0, 1.0; length = n)
