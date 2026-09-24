@@ -60,6 +60,9 @@ Nothing is exported: every name is reached as `HelmholtzDecomposition.name`.
 """
 module HelmholtzDecomposition
 
+# First, so its `__init__` selects the OpenMP runtime's thread-local mode before FastTransforms loads
+# that runtime; see `FlowTransformBindings.with_fasttransforms_threads`.
+using FlowTransformBindings: FlowTransformBindings
 using ComputationalBackends: ComputationalBackends
 using FlowGeometries: FlowGeometries
 using SpectralBackends: SpectralBackends

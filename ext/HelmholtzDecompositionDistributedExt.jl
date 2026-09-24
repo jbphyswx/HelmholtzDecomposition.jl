@@ -15,6 +15,7 @@ module HelmholtzDecompositionDistributedExt
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using ComputationalBackends: ComputationalBackends
 using Distributed: Distributed
+using FlowTransformBindings: FlowTransformBindings as FTB
 
 # Contiguous, near-equal blocks, so each chunk touches one span of the batch.
 function _chunks(n::Int, k::Int)
@@ -40,19 +41,17 @@ function HD._decompose_batch!(
     # A worker cannot write into the caller's arrays, so each returns its chunk as its own batch
     # and the slices are copied in here — one message per worker rather than one per field.
     parts = Distributed.pmap(ranges) do rng
-        # The chunk arrives on the worker's handler task, and a host transform library entered from
-        # a non-root task returns a different result. The pin is set-only here: the process has no
-        # root-task section around this call. See `HD.pin_serial_transforms`.
-        HD.pin_serial_transforms(plan.solver)
-        local_batch = HD.allocate_batch(plan, length(rng))
-        ws = HD.allocate_workspace(plan)
-        # Serial within a worker: the worker process gets one chunk of the batch, and the plan's
-        # own backend would otherwise have each of them thread across the whole machine.
-        for (k, i) in enumerate(rng)
-            HD._decompose_slice!(local_batch, k, items[i], plan, ws;
-                                 backend = ComputationalBackends.SerialBackend(), kwargs...)
+        # Serial within a worker, FastTransforms on one OpenMP thread included: each worker process
+        # gets one chunk of the batch, and the processes carry the parallelism.
+        Base.ScopedValues.with(FTB.FASTTRANSFORMS_THREADS => 1) do
+            local_batch = HD.allocate_batch(plan, length(rng))
+            ws = HD.allocate_workspace(plan)
+            for (k, i) in enumerate(rng)
+                HD._decompose_slice!(local_batch, k, items[i], plan, ws;
+                                     backend = ComputationalBackends.SerialBackend(), kwargs...)
+            end
+            local_batch
         end
-        return local_batch
     end
     for (rng, part) in zip(ranges, parts)
         for (k, i) in enumerate(rng)

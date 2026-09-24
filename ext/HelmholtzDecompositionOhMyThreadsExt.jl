@@ -9,13 +9,14 @@ for all of them and are the expensive part, so rebuilding per task would defeat 
 task takes its own [`HelmholtzWorkspace`](@ref) through `@local`, allocated once per task rather
 than once per field, since those buffers are written through and sharing them would race.
 
-The inner decomposition is left serial: threading it as well would oversubscribe, with an outer
-loop and an inner one each claiming every thread.
+The inner decomposition runs serially, FastTransforms on one OpenMP thread included
+(`FlowTransformBindings.FASTTRANSFORMS_THREADS`): the batch axis claims the threads.
 """
 module HelmholtzDecompositionOhMyThreadsExt
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using ComputationalBackends: ComputationalBackends
+using FlowTransformBindings: FlowTransformBindings as FTB
 using OhMyThreads: OhMyThreads
 
 function HD._decompose_batch!(
@@ -23,9 +24,7 @@ function HD._decompose_batch!(
     plan::HD.HelmholtzPlan; kwargs...,
 )
     items = collect(fields)
-    # The whole parallel section sits inside the pin: a host transform library's thread count is
-    # process-global, so it is set once here for every task. See `HD.with_serial_transforms`.
-    HD.with_serial_transforms(plan.solver) do
+    Base.ScopedValues.with(FTB.FASTTRANSFORMS_THREADS => 1) do
         OhMyThreads.@tasks for i in eachindex(items)
             # `@local` gives one workspace per task, and the fields of that task share it.
             @local ws = HD.allocate_workspace(plan)

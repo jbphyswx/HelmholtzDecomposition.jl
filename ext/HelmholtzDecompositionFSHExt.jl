@@ -20,6 +20,7 @@ using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using ComputationalBackends: ComputationalBackends as CB
 using FlowGeometries: FlowGeometries as FG
 using SpectralBackends: SpectralBackends as SB
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
 
 struct SphericalSpectralSolver <: HD.AbstractPoissonSolver end
@@ -125,8 +126,10 @@ function HD.prepare_solver(::SphericalSpectralSolver,
     # runs one transform and one evaluation over `coeffs`, which is left zeroed for the first solve.
     cache = FSH.SphPlanCache{T}()
     Base.lock(_PLANNER_LOCK) do
-        FSH.sph_transform!(coeffs; cache = cache)
-        FSH.sph_evaluate!(coeffs; cache = cache)
+        FTB.with_fasttransforms_threads() do
+            FSH.sph_transform!(coeffs; cache = cache)
+            FSH.sph_evaluate!(coeffs; cache = cache)
+        end
     end
     fill!(coeffs, zero(T))
     return SphericalSpectralState(coeffs, inv_eig, cache)
@@ -148,7 +151,7 @@ function HD.solve_poisson!(
     @inbounds for j in 1:nlat, i in 1:nlon
         C[j, i] = RHS[i, j]
     end
-    FSH.sph_transform!(C; cache = state.cache)
+    FTB.with_fasttransforms_threads(() -> FSH.sph_transform!(C; cache = state.cache))
     @inbounds for ℓ in 1:lmax
         w = state.inv_eig[ℓ + 1]
         for m in (-ℓ):ℓ
@@ -157,7 +160,7 @@ function HD.solve_poisson!(
     end
     # ℓ = 0 is the constant, which the Laplacian annihilates: the solve is defined up to it.
     C[FSH.sph_mode(0, 0)] = zero(T)
-    FSH.sph_evaluate!(C; cache = state.cache)
+    FTB.with_fasttransforms_threads(() -> FSH.sph_evaluate!(C; cache = state.cache))
     @inbounds for j in 1:nlat, i in 1:nlon
         Φ[i, j] = C[j, i]
     end
@@ -253,10 +256,12 @@ function HD._decompose_spectral(
     # it owns a cache per task. See `_PLANNER_LOCK`.
     cache = FSH.SpinSphPlanCache{ComplexF64}()
     D = Base.lock(_PLANNER_LOCK) do
-        C = FSH.spinsph_transform!(V, 1; cache = cache)   # spin-1 coefficients, in place over `V`
-        S = FSH.spinsph_ethbar(C, 1)                      # spin-0 coefficients of ∇·u
-        _invert_and_project!(S)
-        return FSH.spinsph_evaluate!(FSH.spinsph_eth(S, 0), 1; cache = cache)   # ∇χ at the nodes
+        FTB.with_fasttransforms_threads() do
+            C = FSH.spinsph_transform!(V, 1; cache = cache)   # spin-1 coefficients, in place over `V`
+            S = FSH.spinsph_ethbar(C, 1)                      # spin-0 coefficients of ∇·u
+            _invert_and_project!(S)
+            return FSH.spinsph_evaluate!(FSH.spinsph_eth(S, 0), 1; cache = cache)   # ∇χ at the nodes
+        end
     end
 
     u_div = similar(U)
@@ -282,39 +287,6 @@ HD._decompose_spectral(
 ) where {T} = throw(ArgumentError(
     "FastSphericalHarmonics works in Float64; this grid carries $T. Load `NUFSHT`, whose spin " *
     "transforms follow the element type, or build the grid in Float64."))
-
-# `FastTransforms`' thread count and its FFTW planner count are process-global C state, reached
-# through the library `FastSphericalHarmonics` is built on.
-const _FT = FSH.FastTransforms
-
-# `FastTransforms.__init__` installs this count, and it is restored after a pinned section.
-_ft_default_threads() = max(1, ceil(Int, Sys.CPU_THREADS / 2))
-
-@inline function _pin_fasttransforms(n::Int)
-    _FT.ft_set_num_threads(n)
-    _FT.ft_fftw_plan_with_nthreads(n)
-    return nothing
-end
-
-"""
-    with_serial_transforms(f, ::SphericalSpectralSolver)
-
-Run `f` with `FastTransforms` pinned to one thread, restoring the count afterwards.
-
-Entering its OpenMP parallel region from a non-root Julia task returns a different result, at any
-Julia thread count, and a batch reaches `sph_transform!` from a worker task. Pinning leaves a
-root-task result bit-identical, so the count is the whole of it.
-"""
-function HD.with_serial_transforms(f, ::SphericalSpectralSolver)
-    _pin_fasttransforms(1)
-    try
-        return f()
-    finally
-        _pin_fasttransforms(_ft_default_threads())
-    end
-end
-
-HD.pin_serial_transforms(::SphericalSpectralSolver) = _pin_fasttransforms(1)
 
 function __init__()
     HD.register_spectral_solver!(SB.FSHTSpectralBackend, SphericalSpectralSolver; priority = 10)

@@ -711,35 +711,6 @@ stubs exist unconditionally, so it is always `true`.
 @inline _threading_available() = _extension_loaded(:HelmholtzDecompositionOhMyThreadsExt)
 
 """
-    with_serial_transforms(f, solver)
-
-Run `f` with `solver`'s transform library pinned to one thread, restoring its count afterwards.
-
-`FastTransforms`, which `FastSphericalHarmonics` is built on, returns a **different** result when
-its OpenMP parallel region is entered from a non-root Julia task, and does so at one Julia thread.
-On a Clenshaw–Curtis sphere `AutoSolver` resolves the primal solve to that transform, so a threaded
-batch reaches it from a worker task.
-
-The pin goes around the whole parallel section: the count is process-global, so tasks setting and
-restoring it individually write over each other. Pinning leaves a root-task result unchanged.
-
-`solver` carries the dispatch, so the pin costs a solver with no such library nothing and the
-extension that owns the library owns the method.
-"""
-with_serial_transforms(f, ::AbstractPoissonSolver) = f()
-
-"""
-    pin_serial_transforms(solver)
-
-Pin `solver`'s transform library to one thread for the remainder of this process.
-
-For a worker process, where the work arrives on a handler task and there is no root-task section to
-scope a restore to. A rank running its block on its own root task needs neither this nor
-[`with_serial_transforms`](@ref).
-"""
-pin_serial_transforms(::AbstractPoissonSolver) = nothing
-
-"""
     helmholtz_decompose_batch(plan, fields; backend = AutoBackend())
 
 Decompose many fields sharing one grid. The fields are independent, so the batch is the parallel
