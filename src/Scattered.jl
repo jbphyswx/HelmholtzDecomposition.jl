@@ -18,8 +18,8 @@ grid.
 
 Spectral Poisson/Helmholtz solver for scattered Cartesian samples in any dimension, over the NUFFT
 library `nufft` names: `FlowTransformBindings.NonuniformFFTsBackend()`,
-`FlowTransformBindings.FINUFFTBackend()`, or `AutoSpectralBackend()` for the first of the two that
-is loaded, in that order. `nk` is the mode count per axis and its length fixes the dimension;
+`FlowTransformBindings.FINUFFTBackend()`, or `AutoSpectralBackend()` for NonuniformFFTs when it is
+loaded and FINUFFT when only it is. `nk` is the mode count per axis and its length fixes the dimension;
 `rtol`/`maxiter` govern the conjugate gradients of the fit, and `tol` is the transforms' relative
 accuracy, by default the `rtol` the fit is asked for.
 

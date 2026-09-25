@@ -53,10 +53,13 @@ Spectral Poisson solver on FastSphericalHarmonics' Clenshaw–Curtis grid
 struct SphericalSpectralSolver <: AbstractPoissonSolver end
 
 """
-    SphericalNUSHTSolver(; lmax = nothing, tol = 1e-8, rtol = 1e-10, maxiter = 500)
+    SphericalNUSHTSolver(; lmax = nothing, tol = 1e-8, rtol = 1e-10, maxiter = 500,
+                         nufft = SpectralBackends.AutoSpectralBackend())
 
 Spectral Poisson solver for an arbitrary spherical node set covering `S²` (`using NUFSHT`).
-`rtol`/`maxiter` govern the least squares inside the exact inverse transform.
+`rtol`/`maxiter` govern the least squares inside the exact inverse transform, `tol` is the NUFFT
+accuracy, and `nufft` the NUFFT library NUFSHT runs: a FlowTransformBindings tag, or
+`AutoSpectralBackend()` for NUFSHT's own choice.
 
 `lmax = nothing` sizes the expansion from the grid. The fit recovers `(lmax+1)²` coefficients from
 `M` nodes, so a degree chosen without reference to `M` truncates a fine grid and outruns a coarse
@@ -70,16 +73,19 @@ split holds to round-off well past `(lmax+1)² = M` and degrades beyond roughly 
 crossing depends on the field and the node layout, so `lmax` is left to the caller and sized from
 the grid when it is unset.
 """
-struct SphericalNUSHTSolver{T<:AbstractFloat,L<:Union{Nothing,Int}} <: AbstractPoissonSolver
+struct SphericalNUSHTSolver{T<:AbstractFloat,L<:Union{Nothing,Int},N<:SpectralBackends.AbstractSpectralBackend} <:
+       AbstractPoissonSolver
     lmax::L
     tol::T
     rtol::T
     maxiter::Int
+    nufft::N
 end
 
 SphericalNUSHTSolver(; lmax::Union{Nothing,Int} = nothing, tol::AbstractFloat = 1e-8,
-                     rtol::AbstractFloat = 1e-10, maxiter::Int = 500) =
-    SphericalNUSHTSolver(lmax, promote(tol, rtol)..., maxiter)
+                     rtol::AbstractFloat = 1e-10, maxiter::Int = 500,
+                     nufft::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend()) =
+    SphericalNUSHTSolver(lmax, promote(tol, rtol)..., maxiter, nufft)
 
 library_loaded(::Union{CartesianSpectralSolver,CartesianBoundedSolver}) =
     _extension_loaded(:HelmholtzDecompositionFFTWExt)

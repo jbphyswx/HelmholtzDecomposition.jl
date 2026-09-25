@@ -17,6 +17,9 @@ using FlowGeometries: FlowGeometries as FG
 using ComputationalBackends: ComputationalBackends as CB
 using FastSphericalHarmonics: FastSphericalHarmonics
 using NUFSHT: NUFSHT
+using FINUFFT: FINUFFT
+using NonuniformFFTs: NonuniformFFTs
+using FlowTransformBindings: FlowTransformBindings as FTB
 using OhMyThreads: OhMyThreads
 using Random: Random
 
@@ -308,4 +311,16 @@ Test.@testset "a degree past the node count warns and runs" begin
     # Sized from the grid instead, the same field splits exactly.
     d = HD.helmholtz_decompose_spectral(U, grid; solver = HD.SphericalNUSHTSolver())
     Test.@test nrm(d.u_div) / nrm(U) < 1e-10
+end
+
+Test.@testset "the solver's NUFFT library reaches NUFSHT: $(nameof(typeof(lib)))" for lib in
+        (FTB.FINUFFTBackend(), FTB.NonuniformFFTsBackend())
+    grid = latlon(12)
+    solver = HD.SphericalNUSHTSolver(; tol = 1e-12, rtol = 1e-12, nufft = lib)
+    state = HD.prepare_solver(solver, grid, HD.Neumann())
+    Test.@test FTB._backend(NUFSHT._nufft2(state.plan).plan) === lib
+    NUFSHT.close!(state.plan)
+    U = solid_body(grid)
+    r = HD.helmholtz_decompose_spectral(U, grid; solver)
+    Test.@test nrm(r.u_div) / nrm(U) < 1e-10
 end

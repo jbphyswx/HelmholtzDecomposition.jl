@@ -163,7 +163,7 @@ function HD.prepare_solver(solver::HD.SphericalNUSHTSolver,
     R = T(FG.Geometry.radius(FG.Grids.grid_geometry(grid)))
     # The field element type is positional, as it is for `zeros(T, …)`; a real `T` selects
     # NUFSHT's real specialization.
-    plan = NUFSHT.make_plan(T, θ, Λ, lmax; tol = solver.tol)
+    plan = NUFSHT.make_plan(T, θ, Λ, lmax; tol = solver.tol, nufft = solver.nufft)
     rhs = Vector{T}(undef, nlon * nlat)
     return SphericalNUSHTState(plan, rhs, similar(rhs),
                                zeros(T, lmax + 1, 2 * lmax + 1), lmax, R)
@@ -316,8 +316,8 @@ function _spin_hodge(solver::HD.SphericalNUSHTSolver, θ, Λ, uθ, uφ, lmax::In
     _warn_underdetermined(lmax, length(θ), 1)
     Vp = uθ .+ im .* uφ
     Vm = uθ .- im .* uφ
-    planp = NUFSHT.make_spin_plan(CT, θ, Λ, lmax, +1; tol = solver.tol)
-    planm = NUFSHT.make_spin_plan(CT, θ, Λ, lmax, -1; tol = solver.tol)
+    planp = NUFSHT.make_spin_plan(CT, θ, Λ, lmax, +1; tol = solver.tol, nufft = solver.nufft)
+    planm = NUFSHT.make_spin_plan(CT, θ, Λ, lmax, -1; tol = solver.tol, nufft = solver.nufft)
     try
         shp = (lmax + 1, 2lmax + 1)
         ap = zeros(CT, shp)
