@@ -33,6 +33,7 @@ using AbstractFFTs: AbstractFFTs
 using FFTW: FFTW
 using FINUFFT: FINUFFT
 using FastSphericalHarmonics: FastSphericalHarmonics
+using FlowTransformBindings: FlowTransformBindings as FTB
 using LinearAlgebra: LinearAlgebra
 using NUFSHT: NUFSHT
 using NonuniformFFTs: NonuniformFFTs
@@ -100,7 +101,6 @@ end
 
 const EXTENSIONS = (:HelmholtzDecompositionFFTWExt, :HelmholtzDecompositionAbstractFFTsExt,
                     :HelmholtzDecompositionFSHExt, :HelmholtzDecompositionNUFSHTExt,
-                    :HelmholtzDecompositionFINUFFTExt, :HelmholtzDecompositionNonuniformFFTsExt,
                     :HelmholtzDecompositionOhMyThreadsExt,
                     :HelmholtzDecompositionKernelAbstractionsExt)
 
@@ -221,15 +221,15 @@ function spectral_case(label, grid)
 end
 
 """
-    scattered_case(label, npoints, nk)
+    scattered_case(label, npoints, nk, nufft)
 
-Scattered Cartesian samples through the non-uniform transform. Needs `FINUFFT` or `NonuniformFFTs`.
+Scattered Cartesian samples through the non-uniform transform of the library `nufft` names.
 
-`nk` sets the solver's mode count, so the label names what was measured. The default mode count is
-fixed at 64², and the fit is a conjugate-gradient solve on the normal equations whose cost and
-conditioning both track `prod(nk) / npoints`.
+`nk` sets the solver's mode count, so the label names what was measured. The fit is a
+conjugate-gradient solve on the normal equations whose cost and conditioning both track
+`prod(nk) / npoints`.
 """
-function scattered_case(label, npoints::Int, nk::Int)
+function scattered_case(label, npoints::Int, nk::Int, nufft)
     Random.seed!(14)
     Lx = Ly = 2π
     x = Lx .* rand(npoints)
@@ -239,11 +239,11 @@ function scattered_case(label, npoints::Int, nk::Int)
     measure = fill(Lx * Ly / npoints, npoints)
     grid = FG.Grids.UnstructuredGrid(CART, (x, y), measure;
                                      periodic = (true, true), period = (Lx, Ly))
-    ext = Base.get_extension(HD, :HelmholtzDecompositionFINUFFTExt)
-    solver = ext.CartesianNUFFTSolver(; nk = (nk, nk))
+    solver = HD.CartesianNUFFTSolver(nufft; nk = (nk, nk))
     U = randn(npoints, 2)
     t = bench(() -> HD.helmholtz_decompose_spectral(U, grid; solver); samples = 3)
-    record!(; case = label, solver = "NUFFT", plan = NA, workspace = NA, call = t, planbytes = -1)
+    record!(; case = label, solver = "NUFFT " * string(nameof(typeof(nufft))), plan = NA,
+            workspace = NA, call = t, planbytes = -1)
     return nothing
 end
 
@@ -279,9 +279,8 @@ function suite(set::Symbol)
     header()
     structured_case("clenshaw-curtis $nlat", _clenshaw_curtis(nlat))
     structured_case("lat-lon $nlat", _latlon(nlat))
-    # `_decompose_spectral` has no spherical method, so `helmholtz_decompose_spectral` on a sphere
-    # raises. Add the two rows here once it does.
-    println("  (spherical spectral entry point: no method)")
+    spectral_case("clenshaw-curtis $nlat, spectral", _clenshaw_curtis(nlat))
+    spectral_case("lat-lon $nlat, spectral", _latlon(nlat))
     println()
 
     println("Spectral entry point, Cartesian")
@@ -291,8 +290,8 @@ function suite(set::Symbol)
 
     println("Scattered Cartesian")
     header()
-    for (m, nk) in scatter
-        scattered_case("scattered M=$m, nk=$(nk)²", m, nk)
+    for (m, nk) in scatter, nufft in (FTB.NonuniformFFTsBackend(), FTB.FINUFFTBackend())
+        scattered_case("scattered M=$m, nk=$(nk)²", m, nk, nufft)
     end
     println()
 

@@ -22,10 +22,6 @@ using Random: Random
 
 const SPH = FG.Geometry.SphericalGeometry(1.0)
 
-# Extensions are reached through `Base.get_extension`; they are not properties of the module.
-nufsht_ext() = Base.get_extension(HD, :HelmholtzDecompositionNUFSHTExt)
-fsh_ext() = Base.get_extension(HD, :HelmholtzDecompositionFSHExt)
-
 nrm(A) = sqrt(sum(abs2, A))
 
 # A longitude–latitude grid whose cells tile the sphere.
@@ -94,7 +90,7 @@ Test.@testset "Clenshaw–Curtis spectral Hodge" begin
         grad[i, j, 2] = cos(φ[j])
     end
 
-    fsh = fsh_ext().SphericalSpectralSolver()
+    fsh = HD.SphericalSpectralSolver()
     Test.@testset "rotational" begin
         r = HD.helmholtz_decompose_spectral(rot, cc; solver = fsh)
         Test.@test nrm(r.u_div) / nrm(rot) < 1e-8
@@ -132,7 +128,7 @@ Test.@testset "Clenshaw–Curtis spectral Hodge" begin
     Test.@testset "agrees with the non-uniform transform" begin
         mixed = rot .+ grad
         a = HD.helmholtz_decompose_spectral(mixed, cc; solver = fsh)
-        nu = nufsht_ext().SphericalNUSHTSolver(; lmax = nlat - 1, tol = 1e-12, rtol = 1e-11)
+        nu = HD.SphericalNUSHTSolver(; lmax = nlat - 1, tol = 1e-12, rtol = 1e-11)
         b = HD.helmholtz_decompose_spectral(mixed, cc; solver = nu)
         Test.@test nrm(a.u_div .- b.u_div) / nrm(mixed) < 1e-6
     end
@@ -165,8 +161,8 @@ Test.@testset "spin E/B labels at m ≥ 2" begin
                                              nlat)
     cc = FG.Grids.StructuredGrid(SPH, ax.λ, ax.φ)
     ll = latlon(nlat)
-    fsh = fsh_ext().SphericalSpectralSolver()
-    nu = nufsht_ext().SphericalNUSHTSolver(; lmax = nlat - 1, tol = 1e-12, rtol = 1e-12)
+    fsh = HD.SphericalSpectralSolver()
+    nu = HD.SphericalNUSHTSolver(; lmax = nlat - 1, tol = 1e-12, rtol = 1e-12)
     cases = ((2, 2, 0), (2, 2, 1), (3, 3, 0), (4, 4, 0))    # (l, m) = (2,2), (3,2), (3,3), (4,4)
     for (label, grid, solver) in (("FSH, Clenshaw–Curtis", cc, fsh), ("NUFSHT, Clenshaw–Curtis", cc, nu),
                                   ("NUFSHT, longitude–latitude", ll, nu))
@@ -198,13 +194,16 @@ Test.@testset "quadrature samplings resolve and split" begin
         g = FG.Grids.StructuredGrid(SPH, ax.λ, ax.φ)
         nlon = length(ax.λ)
         Test.@test HD.select_solver(HD.AutoSolver(), g, HD.Neumann()) isa
-                   nufsht_ext().SphericalNUSHTSolver
+                   HD.SphericalNUSHTSolver
 
         U = zeros(nlon, nlat, 2)
         for j in 1:nlat, i in 1:nlon
             U[i, j, 1] = cos(ax.φ[j])
         end
-        r = HD.helmholtz_decompose_spectral(U, g)
+        # The split is held to 1e-10, so the fit and its transforms are asked for more.
+        r = HD.helmholtz_decompose_spectral(U, g;
+                                            solver = HD.SphericalNUSHTSolver(; tol = 1e-12,
+                                                                             rtol = 1e-12))
         Test.@test nrm(r.u_div) / nrm(U) < 1e-10
         Test.@test nrm(r.u_rot .+ r.u_div .+ r.u_harm .- U) / nrm(U) < 1e-10
     end
@@ -219,7 +218,7 @@ Test.@testset "spherical coverage" begin
     # there is nonlocal, so the band does not determine the solution even on the band.
     band = FG.Grids.StructuredGrid(SPH, λ, range(-1.3, 1.3; length = nlat);
                                    topology = (true, false), period = (2π, 0.0))
-    nu = nufsht_ext().SphericalNUSHTSolver()
+    nu = HD.SphericalNUSHTSolver()
     Test.@test !HD.supports_sampling(nu, band)
     Test.@test_throws ArgumentError HD.select_solver(nu, band, HD.Neumann())
     Test.@test HD.select_solver(nu, latlon(nlat), HD.Neumann()) === nu
@@ -230,7 +229,7 @@ Test.@testset "Clenshaw–Curtis sampling is read from the grid" begin
     ax = FG.SphericalSampling.spherical_axes(Float64, FG.SphericalSampling.ClenshawCurtisSampling(),
                                              nlat)
     cc = FG.Grids.StructuredGrid(SPH, ax.λ, ax.φ)
-    fsh = fsh_ext().SphericalSpectralSolver()
+    fsh = HD.SphericalSpectralSolver()
     Test.@test HD.supports_sampling(fsh, cc)
 
     # The node positions decide, and `N_λ = 2N_θ − 1` alone does not: an evenly spaced latitude
@@ -257,7 +256,7 @@ Test.@testset "a threaded batch on a Clenshaw–Curtis sphere matches serial" be
 
     plan = HD.plan_helmholtz(cc; boundary = HD.Neumann(), backend = CB.SerialBackend())
     # The exposure exists only if the primal solve is the Clenshaw–Curtis transform.
-    Test.@test plan.solver isa fsh_ext().SphericalSpectralSolver
+    Test.@test plan.solver isa HD.SphericalSpectralSolver
 
     Random.seed!(31)
     fields = [randn(nlon, nlat, 2) for _ in 1:6]
@@ -291,7 +290,7 @@ Test.@testset "an unconverged spherical fit is refused" begin
     # that does not match the samples.
     grid = latlon(12)
     U = solid_body(grid)
-    short = nufsht_ext().SphericalNUSHTSolver(; lmax = 8, rtol = 1e-14, maxiter = 1)
+    short = HD.SphericalNUSHTSolver(; lmax = 8, rtol = 1e-14, maxiter = 1)
     Test.@test_throws ArgumentError HD.helmholtz_decompose_spectral(U, grid; solver = short)
 end
 
@@ -300,13 +299,13 @@ Test.@testset "a degree past the node count warns and runs" begin
     # back to the input; the split does not survive, and the caller keeps the choice.
     grid = latlon(12)
     U = solid_body(grid)
-    over = nufsht_ext().SphericalNUSHTSolver(; lmax = 40)
+    over = HD.SphericalNUSHTSolver(; lmax = 40)
     r = Test.@test_logs (:warn,) match_mode = :any HD.helmholtz_decompose_spectral(U, grid;
                                                                                    solver = over)
     Test.@test nrm(r.u_rot .+ r.u_div .+ r.u_harm .- U) / nrm(U) < 1e-12
     Test.@test nrm(r.u_div) / nrm(U) > 0.1
 
     # Sized from the grid instead, the same field splits exactly.
-    d = HD.helmholtz_decompose_spectral(U, grid; solver = nufsht_ext().SphericalNUSHTSolver())
+    d = HD.helmholtz_decompose_spectral(U, grid; solver = HD.SphericalNUSHTSolver())
     Test.@test nrm(d.u_div) / nrm(U) < 1e-10
 end

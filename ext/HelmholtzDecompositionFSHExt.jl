@@ -19,17 +19,14 @@ module HelmholtzDecompositionFSHExt
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using ComputationalBackends: ComputationalBackends as CB
 using FlowGeometries: FlowGeometries as FG
-using SpectralBackends: SpectralBackends as SB
 using FlowTransformBindings: FlowTransformBindings as FTB
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
-
-struct SphericalSpectralSolver <: HD.AbstractPoissonSolver end
 
 # A grid this solver accepts covers the closed sphere, so there is no boundary anywhere and a
 # boundary condition is vacuous rather than honoured or refused. The transform reads every node,
 # so no cell may be masked out.
-HD.supports_boundary(::SphericalSpectralSolver, ::HD.AbstractBoundaryCondition) = true
-HD.requires_full_domain(::SphericalSpectralSolver) = true
+HD.supports_boundary(::HD.SphericalSpectralSolver, ::HD.AbstractBoundaryCondition) = true
+HD.requires_full_domain(::HD.SphericalSpectralSolver) = true
 
 """
     _is_clenshaw_curtis(grid) -> Bool
@@ -60,9 +57,9 @@ function _is_clenshaw_curtis(
            all(j -> abs(T(φ[j]) - want.φ[nlat - j + 1]) <= tol, 1:nlat)
 end
 
-HD.supports_sampling(::SphericalSpectralSolver, grid) = _is_clenshaw_curtis(grid)
+HD.supports_sampling(::HD.SphericalSpectralSolver, grid) = _is_clenshaw_curtis(grid)
 
-function HD._sampling_message(::SphericalSpectralSolver, grid)
+function HD._sampling_message(::HD.SphericalSpectralSolver, grid)
     sz = size(grid)
     nlat = length(sz) == 2 ? sz[2] : 0
     return "FastSphericalHarmonics is defined on the Clenshaw–Curtis node set, " *
@@ -102,7 +99,7 @@ corrupt each other through its internal scratch, so the cache lives on the per-t
 """
 const _PLANNER_LOCK = ReentrantLock()
 
-function HD.prepare_solver(::SphericalSpectralSolver,
+function HD.prepare_solver(::HD.SphericalSpectralSolver,
                            grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2},
                            ::HD.AbstractBoundaryCondition;
                            backend = CB.SerialBackend(), shared = nothing) where {T}
@@ -139,7 +136,7 @@ function HD.solve_poisson!(
     Φ::AbstractMatrix{T},
     RHS::AbstractMatrix{T},
     grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2},
-    solver::SphericalSpectralSolver;
+    solver::HD.SphericalSpectralSolver;
     boundary::HD.AbstractBoundaryCondition = HD.Neumann(),
     state::SphericalSpectralState = HD.prepare_solver(solver, grid, boundary),
     kwargs...,
@@ -231,7 +228,7 @@ Helmholtz decomposition of a tangent velocity field on the Clenshaw–Curtis gri
 quadrature. `U` is component-last carrying `(u_east, u_north)`.
 """
 function HD._decompose_spectral(
-    ::SphericalSpectralSolver,
+    ::HD.SphericalSpectralSolver,
     ::FG.Geometry.AbstractSphericalGeometry,
     U::AbstractArray{Float64,3},
     grid::FG.Grids.StructuredGrid{Float64,<:FG.Geometry.AbstractSphericalGeometry,2};
@@ -282,14 +279,10 @@ end
 # FastSphericalHarmonics is built on `Float64`/`ComplexF64`; another element type is refused here
 # with the alternative named, ahead of an assertion from inside the transform.
 HD._decompose_spectral(
-    ::SphericalSpectralSolver, ::FG.Geometry.AbstractSphericalGeometry, U::AbstractArray{T},
+    ::HD.SphericalSpectralSolver, ::FG.Geometry.AbstractSphericalGeometry, U::AbstractArray{T},
     grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2}; kwargs...,
 ) where {T} = throw(ArgumentError(
     "FastSphericalHarmonics works in Float64; this grid carries $T. Load `NUFSHT`, whose spin " *
     "transforms follow the element type, or build the grid in Float64."))
-
-function __init__()
-    HD.register_spectral_solver!(SB.FSHTSpectralBackend, SphericalSpectralSolver; priority = 10)
-end
 
 end # module

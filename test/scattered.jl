@@ -13,14 +13,19 @@ period guard, a hard crash inside the transform library rather than an error.
 using Test: Test
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using FlowGeometries: FlowGeometries as FG
+using FlowTransformBindings: FlowTransformBindings as FTB
+using SpectralBackends: SpectralBackends as SB
 using FINUFFT: FINUFFT
 using NonuniformFFTs: NonuniformFFTs
 using NearestNeighbors: NearestNeighbors
 using Logging: Logging
 using Random: Random
 
-const FIExt = Base.get_extension(HD, :HelmholtzDecompositionFINUFFTExt)
-const NUExt = Base.get_extension(HD, :HelmholtzDecompositionNonuniformFFTsExt)
+# One solver per library: FINUFFT carries the components in complex pairs, NonuniformFFTs one per
+# real transform.
+sc_solvers(; kw...) =
+    (("FINUFFT", HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); kw...)),
+     ("NonuniformFFTs", HD.CartesianNUFFTSolver(FTB.NonuniformFFTsBackend(); kw...)))
 
 # `areas` is supplied rather than triangulated: these solvers read only the coordinates, and the
 # Voronoi construction would pull in DelaunayTriangulation for a quantity none of them uses.
@@ -85,15 +90,27 @@ Test.@testset "scattered Cartesian in 1-D, 2-D and 3-D" begin
         grid, U, exact_div = scattered_nd(v, M)
         geo = FG.Grids.grid_geometry(grid)
         scale = maximum(abs, U)
-        for (name, s) in (("FINUFFT",
-                           FIExt.CartesianNUFFTSolver(; nk = nk, tol = 1e-12, rtol = 1e-12,
-                                                      maxiter = 300)),
-                          ("NonuniformFFTs",
-                           NUExt.CartesianNonuniformFFTSolver(; nk = nk, halfsupport = 8,
-                                                              rtol = 1e-12, maxiter = 300)))
+        for (name, s) in sc_solvers(; nk = nk, tol = 1e-12, rtol = 1e-12, maxiter = 300)
             Test.@testset "$D-D/$name" begin
                 r = HD._decompose_spectral(s, geo, U, grid)
                 Test.@test size(r.u_div) == (M, D)
+                Test.@test maximum(abs, r.u_div .- exact_div) / scale < 1e-7
+                Test.@test maximum(abs, (r.u_rot .+ r.u_div .+ r.u_harm) .- U) / scale < 1e-7
+            end
+        end
+    end
+end
+
+Test.@testset "odd mode counts" begin
+    # On an odd axis the centered frequencies run `−(n−1)/2 … (n−1)/2`, so every mode has its
+    # partner `−k` in the layout, and the complex pair `u + iv` unpacks through that reflection.
+    grid, U, exact_div = scattered_nd(Val(2), 4000)
+    geo = FG.Grids.grid_geometry(grid)
+    scale = maximum(abs, U)
+    for nk in ((15, 15), (15, 16), (16, 13))
+        for (name, s) in sc_solvers(; nk = nk, tol = 1e-12, rtol = 1e-12, maxiter = 300)
+            Test.@testset "$nk/$name" begin
+                r = HD._decompose_spectral(s, geo, U, grid)
                 Test.@test maximum(abs, r.u_div .- exact_div) / scale < 1e-7
                 Test.@test maximum(abs, (r.u_rot .+ r.u_div .+ r.u_harm) .- U) / scale < 1e-7
             end
@@ -107,12 +124,8 @@ Test.@testset "scattered Cartesian" begin
     grid, U, exact_div = scattered_case(M)
     geo = FG.Grids.grid_geometry(grid)
 
-    solvers = (("FINUFFT", FIExt.CartesianNUFFTSolver(; nk = nk, tol = 1e-12, rtol = 1e-12,
-                                                       maxiter = 200)),
-               ("NonuniformFFTs", NUExt.CartesianNonuniformFFTSolver(; nk = nk, halfsupport = 8,
-                                                                      rtol = 1e-12, maxiter = 200)))
     results = Dict{String,Any}()
-    for (name, s) in solvers
+    for (name, s) in sc_solvers(; nk = nk, tol = 1e-12, rtol = 1e-12, maxiter = 200)
         r = HD._decompose_spectral(s, geo, U, grid)
         results[name] = r
         scale = maximum(abs, U)
@@ -129,7 +142,8 @@ Test.@testset "scattered Cartesian" begin
           maximum(abs, U) < 1e-8
 
     Test.@testset "guards" begin
-        s = FIExt.CartesianNUFFTSolver(; nk = nk, tol = 1e-12, rtol = 1e-12, maxiter = 200)
+        s = HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); nk = nk, tol = 1e-12, rtol = 1e-12,
+                                    maxiter = 200)
 
         # A grid with no period reports 0; dividing by it fed the transform `Inf` coordinates,
         # which segfaults in the spreader rather than raising.
@@ -137,16 +151,22 @@ Test.@testset "scattered Cartesian" begin
         Test.@test_throws ArgumentError HD._decompose_spectral(s, geo, Ua, aperiodic)
 
         # More modes than samples leaves the normal equations singular.
-        toobig = FIExt.CartesianNUFFTSolver(; nk = (128, 128), tol = 1e-12, rtol = 1e-12,
-                                            maxiter = 50)
+        toobig = HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); nk = (128, 128), tol = 1e-12,
+                                         rtol = 1e-12, maxiter = 50)
         Test.@test_throws ArgumentError HD._decompose_spectral(toobig, geo, U, grid)
 
         # `prod(nk) ≤ M` is necessary and not sufficient: conditioning degrades well before the
         # normal equations go singular, so an unconverged fit is refused rather than returned.
         dense, Ud, _ = scattered_case(3000)
-        tight = FIExt.CartesianNUFFTSolver(; nk = (48, 48), tol = 1e-12, rtol = 1e-12,
-                                           maxiter = 400)
+        tight = HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); nk = (48, 48), tol = 1e-12,
+                                        rtol = 1e-12, maxiter = 400)
         Test.@test_throws ArgumentError HD._decompose_spectral(tight, geo, Ud, dense)
+
+        # A tag must name a NUFFT; one naming no library is refused where it is selected.
+        Test.@test_throws ArgumentError HD.CartesianNUFFTSolver(SB.FFTSpectralBackend(); nk = nk)
+        unnamed = HD.CartesianNUFFTSolver(SB.NUFFTSpectralBackend(); nk = nk)
+        Test.@test !HD.library_loaded(unnamed)
+        Test.@test_throws ArgumentError HD.select_solver(unnamed, grid, HD.Neumann())
     end
 
     Test.@testset "a rectilinear grid never selects the point-cloud solver" begin
@@ -171,17 +191,18 @@ Test.@testset "scattered Cartesian" begin
 
         # Named directly, each scattered solver refuses a rectilinear grid, and the refusal names
         # the layout it takes.
-        Test.@test_throws ArgumentError HD.select_solver(
-            FIExt.CartesianNUFFTSolver(; nk = (8, 8, 8)), g3, HD.Neumann())
-        Test.@test_throws ArgumentError HD.select_solver(
-            NUExt.CartesianNonuniformFFTSolver(; nk = (8, 8, 8)), g3, HD.Neumann())
+        for (_, s) in sc_solvers(; nk = (8, 8, 8))
+            Test.@test_throws ArgumentError HD.select_solver(s, g3, HD.Neumann())
+        end
 
         # On the point cloud it is built for, `AutoSolver` picks it and sizes it to the grid. The
         # direction count is the coordinate count: `ndims` of a point cloud is `1`, since its cells
-        # carry one flat address each.
+        # carry one flat address each. With both libraries loaded, Auto's library is NonuniformFFTs.
         pts, Up, _ = scattered_case(2000)
         auto = HD.select_solver(HD.AutoSolver(), pts, HD.Neumann())
-        Test.@test auto isa FIExt.CartesianNUFFTSolver
+        Test.@test auto isa HD.CartesianNUFFTSolver
+        Test.@test auto.nufft isa SB.AutoSpectralBackend
+        Test.@test HD._nufft_library(auto.nufft) === FTB.NonuniformFFTsBackend()
         Test.@test length(auto.nk) == length(FG.Grids.coordinates(pts))
         Test.@test prod(auto.nk) <= size(Up, 1)
     end
@@ -206,18 +227,20 @@ Test.@testset "scattered Cartesian" begin
         @. Ub[:, 2] = -sin(xb) * sin(yb)
 
         nk = (12, 12)
-        sb = FIExt.CartesianNUFFTSolver(; nk = nk, tol = 1e-12, rtol = 1e-10, maxiter = 2000)
+        sb = HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); nk = nk, tol = 1e-12, rtol = 1e-10,
+                                     maxiter = 2000)
         Test.@test prod(nk) <= Mb                       # the counting test it passes
         Test.@test_logs (:warn,) match_mode = :any HD._decompose_spectral(sb, geo, Ub, banded)
 
         # `condition_limit` is the caller's: `Inf` says nothing at all.
-        quiet = FIExt.CartesianNUFFTSolver(; nk = nk, tol = 1e-12, rtol = 1e-10,
-                                           maxiter = 2000, condition_limit = Inf)
+        quiet = HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); nk = nk, tol = 1e-12, rtol = 1e-10,
+                                        maxiter = 2000, condition_limit = Inf)
         Test.@test_logs min_level = Logging.Warn HD._decompose_spectral(quiet, geo, Ub, banded)
 
         # The same count of well-spread samples is quiet, so the report tracks the layout.
         uni, Uu, _ = scattered_case(Mb)
-        su = FIExt.CartesianNUFFTSolver(; nk = nk, tol = 1e-12, rtol = 1e-10, maxiter = 2000)
+        su = HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); nk = nk, tol = 1e-12, rtol = 1e-10,
+                                     maxiter = 2000)
         Test.@test_logs min_level = Logging.Warn HD._decompose_spectral(su, geo, Uu, uni)
 
         # With noise on such a point set the residual keeps falling long after the coefficients
@@ -230,9 +253,9 @@ Test.@testset "scattered Cartesian" begin
         δ = noise * sqrt(2 * Mb)
         common = (; nk = nk, tol = 1e-12, rtol = 1e-10, maxiter = 4000, condition_limit = Inf)
         loose = HD._decompose_spectral(
-            FIExt.CartesianNUFFTSolver(; common..., atol = 0.0), geo, Un, banded)
+            HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); common..., atol = 0.0), geo, Un, banded)
         stopped = HD._decompose_spectral(
-            FIExt.CartesianNUFFTSolver(; common..., atol = δ), geo, Un, banded)
+            HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); common..., atol = δ), geo, Un, banded)
         nrm(A) = sqrt(sum(abs2, A))
         Test.@test nrm(stopped.u_rot) < nrm(loose.u_rot) / 100
         Test.@test nrm(stopped.u_rot) / nrm(Ub) < 1.0

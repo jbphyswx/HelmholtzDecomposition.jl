@@ -71,16 +71,17 @@ transform: a rotational core plus a smaller divergent (Ekman-like) part.
 ## Solver extensions
 
 The base package solves any grid, mask and boundary condition with multigrid-preconditioned
-conjugate gradients. Where a transform applies it is `O(N log N)`, and each arrives with its
-package:
+conjugate gradients. Where a transform applies it is `O(N log N)`, and its solver runs once the
+library is loaded:
 
 | Geometry | Regular grid | Irregular grid |
 |----------|-------------|----------------|
-| **Cartesian** | `using FFTW` (periodic, bounded, channel) or `using AbstractFFTs` | `using FINUFFT` or `using NonuniformFFTs` |
+| **Cartesian** | `using FFTW` (periodic, bounded, channel) or `using AbstractFFTs` | `using NonuniformFFTs` or `using FINUFFT` |
 | **Spherical** | `using FastSphericalHarmonics` (Clenshaw–Curtis) | `using NUFSHT` (any covering node set) |
 
-`AutoSolver()` (the default) picks among the loaded ones on the grid's own properties — mask, axis
-uniformity, topology and node layout.
+`AutoSolver()` (the default) takes the first of those solvers, in the order of the table below, whose
+library is loaded and whose requirements the grid meets — mask, axis uniformity, topology and node
+layout.
 
 **Build axes from ranges.** FlowGeometries proves uniformity from the axis *type*, so a
 `collect`ed range is a `Vector`, carries no such proof, and quietly costs every transform fast
@@ -127,17 +128,23 @@ results = HD.helmholtz_decompose_batch(grid, fields; backend = HD.ThreadedBacken
 
 ### Scattered / unstructured data
 
-For data sampled at arbitrary point locations (not a grid — observation networks, floats,
-tracks), use `ScatteredPoints`. It routes through the non-uniform transforms: an accurate
-inverse NUFFT (conjugate-gradient least-squares, not the naive adjoint) → exact Leray
-projection → synthesis back to the points.
+For data sampled at arbitrary point locations (observation networks, floats, tracks), build an
+`UnstructuredGrid`. It routes through the non-uniform transforms: a least-squares fit of the Fourier
+coefficients (conjugate gradients on the normal equations) → exact Leray projection → synthesis
+back to the points. The NUFFTs are [FlowTransformBindings](https://github.com/jbphyswx/FlowTransformBindings.jl)
+plans over NonuniformFFTs or FINUFFT.
 
 ```julia
-using FINUFFT: FINUFFT
+using NonuniformFFTs: NonuniformFFTs
+using FlowTransformBindings: FlowTransformBindings as FTB
 # One coordinate vector per direction, plus a control volume per node.
 pts = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (x, y), areas;
                                 periodic = (true, true), period = (Lx, Ly))
 res = HD.helmholtz_decompose_spectral(U, pts)   # U is (M, 2) → (; u_rot, u_div, u_harm)
+
+# Or name the library and the mode count:
+solver = HD.CartesianNUFFTSolver(FTB.NonuniformFFTsBackend(); nk = (32, 32))
+res = HD.helmholtz_decompose_spectral(U, pts; solver)
 ```
 
 On the sphere the same entry point takes **any node set covering `S²`**, through NUFSHT's
@@ -203,13 +210,13 @@ The package keeps two orthogonal axes separate:
 
 | Solver | When to use |
 |--------|-------------|
-| `CGSolver` (base, dimension-generic) | any grid: masked domains, any boundary condition, any geometry. Multigrid-preconditioned by default |
-| `CartesianSpectralSolver` (FFTW) | uniform periodic Cartesian, any dimension |
-| `CartesianBoundedSolver` (FFTW) | uniform Cartesian with any mix of bounded and periodic directions, including a channel |
-| `CartesianRealTransformSolver` (AbstractFFTs) | the same, through whichever backend owns the array |
-| `CartesianNUFFTSolver` (FINUFFT) / NonuniformFFTs | scattered 2-D Cartesian |
-| `SphericalSpectralSolver` (FastSphericalHarmonics) | Clenshaw–Curtis lat/lon (`Nlon = 2·Nlat−1`) |
-| `SphericalNUSHTSolver` (NUFSHT) | any spherical node set covering `S²` |
+| `HD.CGSolver()` (base, dimension-generic) | any grid: masked domains, any boundary condition, any geometry. Multigrid-preconditioned by default |
+| `HD.CartesianSpectralSolver()` (FFTW) | uniform periodic Cartesian, any dimension |
+| `HD.CartesianBoundedSolver()` (FFTW) | uniform Cartesian with any mix of bounded and periodic directions, including a channel |
+| `HD.CartesianRealTransformSolver()` (AbstractFFTs) | the same, through whichever backend owns the array |
+| `HD.CartesianNUFFTSolver(nufft; nk)` (NonuniformFFTs or FINUFFT) | scattered Cartesian, any dimension |
+| `HD.SphericalSpectralSolver()` (FastSphericalHarmonics) | Clenshaw–Curtis lat/lon (`Nlon = 2·Nlat−1`) |
+| `HD.SphericalNUSHTSolver()` (NUFSHT) | any spherical node set covering `S²` |
 
 `AutoSolver` is mask-aware (never picks a periodic spectral solver on a masked domain) and
 prefers the regular FFT/SHT on structured grids.

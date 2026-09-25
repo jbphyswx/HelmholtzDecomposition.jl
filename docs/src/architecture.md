@@ -8,18 +8,18 @@ src/
   BoundaryConditions.jl       # Dirichlet, Neumann
   Staggering.jl               # face/corner counts and indexing (Arakawa C-grid / MAC)
   Operators.jl                # G, D = −G*, L = D G, curl, δ; face metrics; execution backend
-  Solvers.jl                  # AbstractPoissonSolver, CGSolver, AutoSolver, solver registry
+  Solvers.jl                  # AbstractPoissonSolver, CGSolver, AutoSolver
   Multigrid.jl                # geometric V-cycle preconditioner (Galerkin coarsening)
   DualGrid.jl                 # the corner grid the rotation potential lives on
   Decomposition.jl            # plan/workspace/result/batch and helmholtz_decompose[!]
   Spectral.jl                 # Leray projector in mode space
+  Scattered.jl                # scattered Cartesian: CartesianNUFFTSolver over FlowTransformBindings
+  SpectralSolvers.jl          # the transform solver types and the order AutoSolver tries them in
 reference_flows/
   reference_flows.jl          # analytic fields with known decompositions; NOT part of the library
 ext/
   HelmholtzDecompositionAbstractFFTsExt.jl        # bounded + channel + periodic, any FFT backend
   HelmholtzDecompositionFFTWExt.jl                # r2r fast path on the host
-  HelmholtzDecompositionFINUFFTExt.jl             # scattered Cartesian (binary NUFFT)
-  HelmholtzDecompositionNonuniformFFTsExt.jl      # scattered Cartesian (pure Julia, device-capable)
   HelmholtzDecompositionFSHExt.jl                 # Clenshaw–Curtis sphere
   HelmholtzDecompositionNUFSHTExt.jl              # arbitrary covering sphere
   HelmholtzDecompositionKernelAbstractionsExt.jl  # device memory for the buffers
@@ -33,8 +33,9 @@ Grids, geometries, masks, topology and the execution primitives come from
 [FlowGeometries](https://github.com/jbphyswx/FlowGeometries.jl); the backend taxonomy from
 [ComputationalBackends](https://github.com/jbphyswx/ComputationalBackends.jl); the names for
 transform algorithms from
-[SpectralBackends](https://github.com/jbphyswx/SpectralBackends.jl). This package defines none of
-them.
+[SpectralBackends](https://github.com/jbphyswx/SpectralBackends.jl); the NUFFT library plans from
+[FlowTransformBindings](https://github.com/jbphyswx/FlowTransformBindings.jl). This package defines
+none of them.
 
 ## One consistent operator family
 
@@ -69,25 +70,27 @@ a threaded batch would have every task writing the same ones.
 ## Two orthogonal backend axes
 
 - **Which transform** — `AbstractPoissonSolver`. `AutoSolver` chooses on capability: geometry,
-  node layout, mask, axis uniformity, boundary condition, and which extensions are loaded. It
-  throws rather than downgrading, because a solver that silently solves a *different* boundary
-  value problem returns a smooth, plausible, wrong field.
+  node layout, mask, axis uniformity, boundary condition, and which libraries are loaded. A solver
+  named directly that cannot solve the problem raises, because a solver that silently solves a
+  *different* boundary value problem returns a smooth, plausible, wrong field.
 - **Where it runs** — `ComputationalBackends.AbstractExecutionBackend`, passed to
   `plan_helmholtz`. Every hot loop is written once against `FlowGeometries.Execution.run_indices`,
   which resolves to a serial loop, threaded chunks, or a KernelAbstractions launch with no
   branching here.
 
-## Solver registration
+## Solver selection
 
-An extension declares which `SpectralBackends` algorithm it implements, with a priority:
+Every solver type is declared in the package; an extension adds the methods that run it on its
+library, and `library_loaded(solver)` says whether that library is loaded. `AutoSolver` walks one
+fixed list per geometry (`_auto_candidates`) and takes the first solver whose library is loaded
+and whose requirements the grid meets:
 
-```julia
-HelmholtzDecomposition.register_spectral_solver!(SpectralBackends.FFTSpectralBackend,
-                                                 CartesianBoundedSolver; priority = 10)
-```
+- Cartesian: `CartesianSpectralSolver`, `CartesianBoundedSolver`, `CartesianRealTransformSolver`,
+  `CartesianNUFFTSolver`;
+- spherical: `SphericalSpectralSolver`, `SphericalNUSHTSolver`;
+- otherwise, and when none applies, `CGSolver`.
 
-Two extensions may implement the same algorithm — `FFTW.r2r` and the `AbstractFFTs` even/odd
-extension are both the bounded FFT — so the priority is explicit and load order decides nothing.
+The order is written down once, so load order decides nothing.
 
 ## Type hierarchy
 
@@ -95,13 +98,12 @@ extension are both the bounded FFT — so the priority is explicit and load orde
 AbstractPoissonSolver
 ├── AutoSolver
 ├── CGSolver{R}                       # multigrid-preconditioned by default; R the tolerance type
-├── CartesianSpectralSolver           (ext: FFTW)          periodic rfft
-├── CartesianBoundedSolver            (ext: FFTW)          r2r, per-direction kind
-├── CartesianRealTransformSolver      (ext: AbstractFFTs)  bounded/channel/periodic, any backend
-├── CartesianNUFFTSolver{T}           (ext: FINUFFT)
-├── CartesianNonuniformFFTSolver{T}   (ext: NonuniformFFTs)
-├── SphericalSpectralSolver           (ext: FastSphericalHarmonics)
-└── SphericalNUSHTSolver{T}           (ext: NUFSHT)
+├── CartesianSpectralSolver           (FFTW)            periodic rfft
+├── CartesianBoundedSolver            (FFTW)            r2r, per-direction kind
+├── CartesianRealTransformSolver      (AbstractFFTs)    bounded/channel/periodic, any backend
+├── CartesianNUFFTSolver{L,D,T}       (NonuniformFFTs or FINUFFT, through FlowTransformBindings)
+├── SphericalSpectralSolver           (FastSphericalHarmonics)
+└── SphericalNUSHTSolver{T}           (NUFSHT)
 ```
 
 ## Import style

@@ -27,8 +27,23 @@ HelmholtzDecomposition._nullspace
 HelmholtzDecomposition._require_converged
 HelmholtzDecomposition._require_domain
 HelmholtzDecomposition._require_sampling
-HelmholtzDecomposition._spectral_algorithms
+HelmholtzDecomposition._unavailable_message
+HelmholtzDecomposition._auto_candidates
 HelmholtzDecomposition._spectral_dispatch
+```
+
+## Scattered Cartesian fit
+
+```@docs
+HelmholtzDecomposition._nufft_library
+HelmholtzDecomposition._auto_nufft_solver
+HelmholtzDecomposition.ScatteredState
+HelmholtzDecomposition.close!
+HelmholtzDecomposition.CGBuffers
+HelmholtzDecomposition.inverse_nufft!
+HelmholtzDecomposition._coldot
+HelmholtzDecomposition._reflect
+HelmholtzDecomposition._unpack!
 ```
 
 ## Grid walking

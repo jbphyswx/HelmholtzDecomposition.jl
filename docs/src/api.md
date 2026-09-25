@@ -81,6 +81,19 @@ HelmholtzDecomposition.select_solver
 HelmholtzDecomposition.SolverResult
 ```
 
+### Transform solvers
+
+Each runs once its library is loaded; see [`library_loaded`](@ref HelmholtzDecomposition.library_loaded).
+
+```@docs
+HelmholtzDecomposition.CartesianSpectralSolver
+HelmholtzDecomposition.CartesianBoundedSolver
+HelmholtzDecomposition.CartesianRealTransformSolver
+HelmholtzDecomposition.CartesianNUFFTSolver
+HelmholtzDecomposition.SphericalSpectralSolver
+HelmholtzDecomposition.SphericalNUSHTSolver
+```
+
 ### Capability
 
 `AutoSolver` chooses on these, and a solver named directly is refused rather than allowed to solve
@@ -91,7 +104,7 @@ HelmholtzDecomposition.supports_boundary
 HelmholtzDecomposition.requires_full_domain
 HelmholtzDecomposition.requires_uniform_axes
 HelmholtzDecomposition.requires_periodic_domain
-HelmholtzDecomposition.register_spectral_solver!
+HelmholtzDecomposition.library_loaded
 ```
 
 ## Operators

@@ -261,9 +261,11 @@ function _resolve_spectral_solver(grid::FlowGeometries.Grids.AbstractGrid, solve
     # entry point is an error, not a fallback: the caller asked for the spectral path by name.
     s isa CGSolver && throw(ArgumentError(
         "helmholtz_decompose_spectral found no spectral solver for this grid. Load one that " *
-        "applies (`using FFTW` for a periodic uniform Cartesian grid, `FINUFFT` for scattered " *
-        "Cartesian samples, `FastSphericalHarmonics` for a Clenshaw–Curtis sphere, `NUFSHT` for " *
-        "an arbitrary covering sphere), or call `helmholtz_decompose` to solve it iteratively."))
+        "applies (`using FFTW` for a periodic uniform Cartesian grid, `NonuniformFFTs` or `FINUFFT` " *
+        "for scattered Cartesian samples, `FastSphericalHarmonics` for a Clenshaw–Curtis sphere, " *
+        "`NUFSHT` for an arbitrary covering sphere), or call `helmholtz_decompose` to solve it " *
+        "iteratively."))
+    _require_library(s)
     _require_domain(s, grid)
     return s
 end

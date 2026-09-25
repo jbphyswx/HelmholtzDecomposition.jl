@@ -15,9 +15,10 @@ over the faces of `I`, where a face with `A_f = 0` — masked, or a no-flux doma
 does not appear, and a Dirichlet edge appears with `Φ_nbr = 0`. Both the relaxation below and
 the Krylov/multigrid solvers read the same coefficients.
 
-Spectral solvers (FFTW, FINUFFT, FastSphericalHarmonics, NUFSHT) arrive through package
-extensions and invert the continuous symbol instead; they are exact on the domains they apply
-to and refuse the ones they do not.
+The spectral solvers (`SpectralSolvers.jl`, `Scattered.jl`) run on the transform a library provides:
+FFTW, AbstractFFTs, FastSphericalHarmonics and NUFSHT through this package's extensions, the NUFFT
+libraries through FlowTransformBindings. They are exact on the domains they apply to and refuse the
+ones they do not.
 """
 
 # ---------------------------------------------------------------------------
@@ -147,6 +148,25 @@ the mask, axis uniformity and topology.
     throw(ArgumentError(_sampling_message(solver, grid)))
 
 """
+    library_loaded(solver) -> Bool
+
+Whether the library `solver` transforms with is loaded. [`AutoSolver`](@ref) passes over a solver
+whose library is not, and a solver named directly raises, naming the package to load.
+"""
+library_loaded(::AbstractPoissonSolver) = true
+
+"""
+    _unavailable_message(solver) -> String
+
+Which package `solver` needs loaded. Solvers that run on a library override it.
+"""
+_unavailable_message(solver::AbstractPoissonSolver) =
+    "$(nameof(typeof(solver))) needs a library that is not loaded."
+
+@inline _require_library(solver::AbstractPoissonSolver) =
+    library_loaded(solver) ? nothing : throw(ArgumentError(_unavailable_message(solver)))
+
+"""
     prepare_solver(solver, grid, boundary) -> state
 
 Whatever `solver` can compute once for a `(grid, boundary)` pair and reuse on every solve —
@@ -238,56 +258,13 @@ end
 
 Sentinel for automatic selection. The only thing permitted to choose a solver on the caller's
 behalf, and it chooses on real capability — geometry, node layout, mask, axis uniformity, the
-requested boundary condition, and which extensions are loaded.
+requested boundary condition, and which libraries are loaded — taking the first of
+[`_auto_candidates`](@ref) that applies.
 """
 struct AutoSolver <: AbstractPoissonSolver end
 
-"""
-    _SPECTRAL_SOLVERS
-
-Which solvers implement each `SpectralBackends` algorithm, populated by the extensions.
-
-Keyed on the algorithm **type** rather than a `Symbol`: which transform a solver performs is
-exactly what `SpectralBackends` names, so that vocabulary is shared with the rest of the ecosystem
-instead of being re-invented as bare names only this file knows how to read.
-
-The value is a list because more than one extension can implement the same algorithm — `FFTW.r2r`
-and the `AbstractFFTs` even/odd extension are both the bounded FFT. They are ordered by an explicit
-priority, not by load order, so which one runs does not depend on which package was imported first.
-"""
-const _SPECTRAL_SOLVERS =
-    Dict{Type{<:SpectralBackends.AbstractSpectralBackend},Vector{Tuple{Int,Type}}}()
-# The solver slot holds a `Type`: a solver parameterised on its tolerance type is a `UnionAll`.
-
-"""
-    register_spectral_solver!(algorithm, solver_type; priority)
-
-Declare that `solver_type` implements `algorithm`. Lower `priority` is tried first: a native
-implementation takes a lower number than a generic one that would also work.
-"""
-function register_spectral_solver!(algorithm::Type{<:SpectralBackends.AbstractSpectralBackend},
-                                   solver_type::Type{<:AbstractPoissonSolver}; priority::Int)
-    entries = get!(() -> Tuple{Int,Type{<:AbstractPoissonSolver}}[], _SPECTRAL_SOLVERS, algorithm)
-    filter!(e -> e[2] !== solver_type, entries)     # idempotent across reloads
-    push!(entries, (priority, solver_type))
-    sort!(entries; by = first)
-    return nothing
-end
-
-"""
-    _spectral_algorithms(geometry_type) -> Tuple
-
-The algorithms worth trying on a geometry, in preference order: the uniform transform first, then
-the non-uniform one, which subsumes it at greater cost. A candidate that does not apply refuses
-itself through its own capability check, so this order only decides between several that do.
-"""
-_spectral_algorithms(::Type{<:FlowGeometries.Geometry.AbstractSphericalGeometry}) =
-    (SpectralBackends.FSHTSpectralBackend, SpectralBackends.NUFSHTSpectralBackend)
-_spectral_algorithms(::Type{<:FlowGeometries.Geometry.AbstractCartesianGeometry}) =
-    (SpectralBackends.FFTSpectralBackend, SpectralBackends.NUFFTSpectralBackend)
-_spectral_algorithms(::Type{<:FlowGeometries.Geometry.AbstractGeometry}) = ()
-
 function _applicable(solver::AbstractPoissonSolver, grid, boundary)
+    library_loaded(solver) || return false
     supports_boundary(solver, boundary) || return false
     requires_full_domain(solver) && !all(FlowGeometries.Grids.mask(grid)) && return false
     if requires_uniform_axes(solver)
@@ -300,25 +277,9 @@ function _applicable(solver::AbstractPoissonSolver, grid, boundary)
     return true
 end
 
-"""
-    default_solver(solver_type, grid) -> solver
-
-The candidate [`AutoSolver`](@ref) tries for `grid`.
-
-A solver carrying a setting that has to match the grid — a mode count per direction, and with it the
-dimension in its own type — gives a method here. The fallback builds it from its own defaults, which
-is right for a solver whose configuration is independent of the grid.
-"""
-default_solver(solver_type::Type, grid) = solver_type()
-
-function _resolve_auto_solver(grid::FlowGeometries.Grids.AbstractGrid{G}, boundary) where {G}
-    for algorithm in _spectral_algorithms(G)
-        entries = get(_SPECTRAL_SOLVERS, algorithm, nothing)
-        entries === nothing && continue
-        for (_, solver_type) in entries
-            candidate = default_solver(solver_type, grid)
-            _applicable(candidate, grid, boundary) && return candidate
-        end
+function _resolve_auto_solver(grid::FlowGeometries.Grids.AbstractGrid, boundary)
+    for candidate in _auto_candidates(grid)
+        _applicable(candidate, grid, boundary) && return candidate
     end
     return CGSolver()
 end
@@ -332,6 +293,7 @@ mask, so a caller with several right-hand sides on one grid — which a decompos
 """
 function select_solver(solver::AbstractPoissonSolver, grid, boundary)
     concrete = solver isa AutoSolver ? _resolve_auto_solver(grid, boundary) : solver
+    _require_library(concrete)
     _require_boundary(concrete, boundary)
     _require_domain(concrete, grid)
     return concrete

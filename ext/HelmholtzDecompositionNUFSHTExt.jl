@@ -15,37 +15,7 @@ module HelmholtzDecompositionNUFSHTExt
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using ComputationalBackends: ComputationalBackends as CB
 using FlowGeometries: FlowGeometries as FG
-using SpectralBackends: SpectralBackends as SB
 using NUFSHT: NUFSHT
-
-"""
-    SphericalNUSHTSolver(; lmax = nothing, tol = 1e-8, rtol = 1e-10, maxiter = 500)
-
-Spectral Poisson solver for an arbitrary spherical node set. `rtol`/`maxiter` govern the least
-squares inside the exact inverse transform.
-
-`lmax = nothing` sizes the expansion from the grid — see [`_resolve_lmax`](@ref). A fixed degree is
-wrong on every grid but one: the fit recovers `(lmax+1)²` coefficients from `M` nodes, so a degree
-chosen without reference to `M` truncates a fine grid and outruns a coarse one.
-
-A degree that outruns the nodes by enough corrupts the **split** while leaving the fit exact: the
-samples are reproduced, the three parts sum back to the input, and the rotational/divergent share
-is wrong, because that share reads the coefficient vector and the samples stop pinning it down. The
-residual is at round-off throughout, so it reports nothing about this. Measured on a lat-lon grid
-the split holds to round-off well past `(lmax+1)² = M` and degrades beyond roughly twice it; the
-crossing depends on the field and the node layout, so `lmax` is left to the caller and sized from
-the grid when it is unset.
-"""
-struct SphericalNUSHTSolver{T<:AbstractFloat,L<:Union{Nothing,Int}} <: HD.AbstractPoissonSolver
-    lmax::L
-    tol::T
-    rtol::T
-    maxiter::Int
-end
-
-SphericalNUSHTSolver(; lmax::Union{Nothing,Int} = nothing, tol::AbstractFloat = 1e-8,
-                     rtol::AbstractFloat = 1e-10, maxiter::Int = 500) =
-    SphericalNUSHTSolver(lmax, promote(tol, rtol)..., maxiter)
 
 """
     _resolve_lmax(solver, grid) -> Int
@@ -57,7 +27,7 @@ the fit and its split hold past that — and it needs no knowledge of the field.
 at the degree the node set represents, which `FlowGeometries` answers from the recipe where the grid
 carries one and from the latitude count otherwise.
 """
-function _resolve_lmax(solver::SphericalNUSHTSolver, grid)
+function _resolve_lmax(solver::HD.SphericalNUSHTSolver, grid)
     solver.lmax === nothing || return solver.lmax
     npoints = length(FG.Grids.mask(grid))
     from_nodes = isqrt(npoints) - 1
@@ -69,34 +39,25 @@ end
 
 # The expansion is in spherical harmonics over the whole sphere, so the samples must cover it and
 # none may be masked out; a covering set has no boundary, making a boundary condition vacuous.
-HD.supports_boundary(::SphericalNUSHTSolver, ::HD.AbstractBoundaryCondition) = true
-HD.requires_full_domain(::SphericalNUSHTSolver) = true
-
-"""
-    _require_covering_sphere(grid)
-
-Throw unless the nodes cover `S²`.
-
-Spherical-harmonic analysis integrates over the whole sphere and the inverse Laplacian there is
-nonlocal, so a field known on part of the surface does not determine `Φ` even on that part. For a
-fitting-based transform the same fact appears as ill-conditioning: bandlimited functions
-concentrated off the sampled region are nearly invisible to the fit (the Slepian spatiospectral
-concentration problem). A regional patch is a boundary value problem — a different problem, and
-the one the iterative solver handles.
-"""
+HD.supports_boundary(::HD.SphericalNUSHTSolver, ::HD.AbstractBoundaryCondition) = true
+HD.requires_full_domain(::HD.SphericalNUSHTSolver) = true
 
 """
     _covers_sphere(grid) -> Bool
 
 Whether `grid`'s nodes cover `S²`.
 
+Spherical-harmonic analysis integrates over the whole sphere and the inverse Laplacian there is
+nonlocal, so a field known on part of the surface does not determine `Φ` even on that part. For a
+fitting-based transform the same fact appears as ill-conditioning: bandlimited functions
+concentrated off the sampled region are nearly invisible to the fit (the Slepian spatiospectral
+concentration problem). A regional patch is a boundary value problem, which the iterative solver
+handles.
+
 A rectilinear grid is judged geometrically: longitude wraps, and latitude reaches both poles to
 within one cell. The polar cap the samples leave is then smaller than the resolution and the metric
 closes it. One cell and no more — at two, a ±74.5° band passes, which is a regional patch. The
 largest cell sets the bar, so a stretched latitude axis is judged by its coarsest part.
-
-A cell measure cannot answer this on a rectilinear grid: summing `R²cos φ ΔφΔλ` is the midpoint
-rule for `∫cos φ dφ`, so it carries the discretisation error.
 
 Any other layout is a pixelization whose cells tile the sphere exactly, and there the total measure
 against `4πR²` is the statement — `Grids.measure` is lazy with `sum` specialised per layout, so it
@@ -121,9 +82,9 @@ function _covers_sphere(
     return isapprox(T(sum(FG.Grids.measure(grid))), 4 * T(π) * R^2; rtol = sqrt(eps(T)))
 end
 
-HD.supports_sampling(::SphericalNUSHTSolver, grid) = _covers_sphere(grid)
+HD.supports_sampling(::HD.SphericalNUSHTSolver, grid) = _covers_sphere(grid)
 
-function HD._sampling_message(::SphericalNUSHTSolver, grid)
+function HD._sampling_message(::HD.SphericalNUSHTSolver, grid)
     detail = if grid isa FG.Grids.StructuredGrid && ndims(grid) == 2
         lo, hi = extrema(FG.Grids.coordinates(grid, 2))
         "longitude wraps: $(FG.Grids.isperiodic(grid, 1)); latitude spans " *
@@ -191,7 +152,7 @@ end
 Base.show(io::IO, s::SphericalNUSHTState{T}) where {T} =
     print(io, "SphericalNUSHTState{", T, "}(", length(s.rhs), " nodes, lmax = ", s.lmax, ")")
 
-function HD.prepare_solver(solver::SphericalNUSHTSolver,
+function HD.prepare_solver(solver::HD.SphericalNUSHTSolver,
                            grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2},
                            ::HD.AbstractBoundaryCondition;
                            backend = CB.SerialBackend(), shared = nothing) where {T}
@@ -212,7 +173,7 @@ function HD.solve_poisson!(
     Φ::AbstractMatrix{T},
     RHS::AbstractMatrix{T},
     grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2},
-    solver::SphericalNUSHTSolver;
+    solver::HD.SphericalNUSHTSolver;
     boundary::HD.AbstractBoundaryCondition = HD.Neumann(),
     state::SphericalNUSHTState = HD.prepare_solver(solver, grid, boundary),
     kwargs...,
@@ -350,7 +311,7 @@ end
 
 The spin±1 split at the nodes, each part returned as `(u_θ, u_φ)`.
 """
-function _spin_hodge(solver::SphericalNUSHTSolver, θ, Λ, uθ, uφ, lmax::Int, ::Type{T}) where {T}
+function _spin_hodge(solver::HD.SphericalNUSHTSolver, θ, Λ, uθ, uφ, lmax::Int, ::Type{T}) where {T}
     CT = Complex{T}
     _warn_underdetermined(lmax, length(θ), 1)
     Vp = uθ .+ im .* uφ
@@ -395,7 +356,7 @@ Helmholtz decomposition of a tangent velocity field on any spherical node set. `
 component-last carrying `(u_east, u_north)`, and the three parts come back in that layout.
 """
 function HD._decompose_spectral(
-    solver::SphericalNUSHTSolver,
+    solver::HD.SphericalNUSHTSolver,
     ::FG.Geometry.AbstractSphericalGeometry,
     U::AbstractArray{T},
     grid::FG.Grids.AbstractGrid{<:FG.Geometry.AbstractSphericalGeometry,T};
@@ -418,10 +379,6 @@ function HD._decompose_spectral(
     copyto!(HD._component(u_div, 2, nd), reshape(.-divθ, size(grid)))
     u_harm = U .- u_rot .- u_div
     return (; u_rot, u_div, u_harm)
-end
-
-function __init__()
-    HD.register_spectral_solver!(SB.NUFSHTSpectralBackend, SphericalNUSHTSolver; priority = 10)
 end
 
 end # module

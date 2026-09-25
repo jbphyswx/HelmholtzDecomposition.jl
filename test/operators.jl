@@ -11,7 +11,7 @@ Every grid architecture the package supports is exercised, because several of th
 unmasked grid while failing on a curved or masked one.
 """
 
-using Test: @testset, @test
+using Test: Test
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using FlowGeometries: FlowGeometries as FG
 using Random: Random
@@ -57,7 +57,7 @@ function operator_properties(grid, bc)
     HD.gradient!(g, χ, grid, bc, fm)
     HD.divergence!(Dv, v, grid, bc, fm)
     # D = −G*, under the cell-measure inner product on one side and A·g on the other.
-    @test rel(dot_faces(g, v, grid, fm, T, Val(N)), -dot_cells(χ, Dv, grid, T)) < 1e-10
+    Test.@test rel(dot_faces(g, v, grid, fm, T, Val(N)), -dot_cells(χ, Dv, grid, T)) < 1e-10
 
     c = HD.laplacian_coefficients(grid, bc, fm)
     Lχ = zeros(T, dims); HD.apply_laplacian!(Lχ, χ, grid, c)
@@ -67,16 +67,16 @@ function operator_properties(grid, bc)
     LDG = zeros(T, dims)
     HD.gradient!(scratch, χ, grid, bc, fm)
     HD.divergence!(LDG, scratch, grid, bc, fm)
-    @test sqrt(dot_cells(Lχ .- LDG, Lχ .- LDG, grid, T)) < 1e-8
+    Test.@test sqrt(dot_cells(Lχ .- LDG, Lχ .- LDG, grid, T)) < 1e-8
     # Self-adjoint, and negative semidefinite.
-    @test rel(dot_cells(Lχ, ψ, grid, T), dot_cells(χ, Lψ, grid, T)) < 1e-10
-    @test dot_cells(Lχ, χ, grid, T) <= 1e-9
+    Test.@test rel(dot_cells(Lχ, ψ, grid, T), dot_cells(χ, Lψ, grid, T)) < 1e-10
+    Test.@test dot_cells(Lχ, χ, grid, T) <= 1e-9
 
     # curl ∘ G = 0: the two parts are independent, not merely nearly so.
     if N >= 2
         W = HD.allocate_corners(T, grid)
         HD.curl!(W, g, grid, bc, fm)
-        @test sqrt(sum(a -> sum(abs2, a), W)) < 1e-8
+        Test.@test sqrt(sum(a -> sum(abs2, a), W)) < 1e-8
     end
 end
 
@@ -88,7 +88,7 @@ function warped_grid(nx::Int, ny::Int, ::Type{T} = Float64) where {T}
     return FG.Grids.CurvilinearGrid(CART, avg(kx), avg(ky); corners = (kx, ky))
 end
 
-@testset "operator family" begin
+Test.@testset "operator family" begin
     xs = range(0.0, 1.0; length = 12)
     ys = range(0.0, 0.8; length = 9)
     stretched = cumsum(vcat(0.0, 0.05 .+ 0.03 .* sin.(range(0, 3π; length = 11))))
@@ -112,13 +112,13 @@ end
         ("curvilinear, Dirichlet",       warped_grid(11, 9), HD.Dirichlet()),
     ]
     for (name, grid, bc) in cases
-        @testset "$name" begin
+        Test.@testset "$name" begin
             operator_properties(grid, bc)
         end
     end
 end
 
-@testset "face metric storage" begin
+Test.@testset "face metric storage" begin
     xs = range(0.0, 1.0; length = 12)
     ys = range(0.0, 0.8; length = 9)
     stretched = cumsum(vcat(0.0, 0.05 .+ 0.03 .* sin.(range(0, 3π; length = 11))))
@@ -143,10 +143,10 @@ end
     ]
 
     for (name, grid, want_layout) in cases, bc in (HD.Neumann(), HD.Dirichlet())
-        @testset "$name/$(nameof(typeof(bc)))" begin
+        Test.@testset "$name/$(nameof(typeof(bc)))" begin
             T = Float64
             N = ndims(grid)
-            @test HD.metric_layout(grid) isa want_layout
+            Test.@test HD.metric_layout(grid) isa want_layout
 
             fm = HD.face_metrics(grid, bc)
             # Every face, against the scalar functions the operators are defined by. The factored
@@ -158,18 +158,18 @@ end
                 g = HD.face_gap(grid, F, d, T)
                 worst = max(worst, abs(fm.area[d][F] - a), abs(fm.gap[d][F] - g))
             end
-            @test worst <= 8 * eps(T)
+            Test.@test worst <= 8 * eps(T)
 
             # `∑ n_d` numbers against `∏ n_d`, asserted so the saving is gated.
             if want_layout === HD.SeparableMetrics
                 dense = sum(d -> 2 * prod(HD.face_dims(grid, d)) * sizeof(T), 1:N)
-                @test Base.summarysize(fm) < dense
+                Test.@test Base.summarysize(fm) < dense
             end
         end
     end
 end
 
-@testset "dual Laplacian is curl of the codifferential" begin
+Test.@testset "dual Laplacian is curl of the codifferential" begin
     # The rotation potential's operator must be the one the reconstruction composes, or the solve
     # inverts something else — which showed up as a rotational part that would not converge.
     n = 16; L = 1.0
@@ -183,10 +183,10 @@ end
     HD.apply_laplacian!(LA, R[1], plan.dual_grids[1], plan.dual_coefficients[1])
     uf = HD.allocate_faces(Float64, grid); HD.rotational_velocity!(uf, R, grid, bc)
     W = HD.allocate_corners(Float64, grid); HD.curl!(W, uf, grid, bc)
-    @test sqrt(sum(abs2, LA .- W[1])) / sqrt(sum(abs2, LA)) < 1e-12
+    Test.@test sqrt(sum(abs2, LA .- W[1])) / sqrt(sum(abs2, LA)) < 1e-12
 end
 
-@testset "decomposition identities" begin
+Test.@testset "decomposition identities" begin
     xs = range(0.0, 1.0; length = 14)
     ys = range(0.0, 0.8; length = 11)
     mask = trues(14, 11); mask[6:8, 5:6] .= false
@@ -195,7 +195,7 @@ end
         ("bounded Dirichlet", FG.Grids.StructuredGrid(CART, xs, ys), HD.Dirichlet()),
         ("masked hole",       FG.Grids.StructuredGrid(CART, xs, ys; mask = mask), HD.Neumann()),
     ]
-        @testset "$name" begin
+        Test.@testset "$name" begin
             T = Float64; N = ndims(grid); dims = size(grid)
             Random.seed!(3)
             u = randn(T, dims..., N)
@@ -207,15 +207,15 @@ end
             plan.coefficients.singular && HD.project_out_constant!(δu, grid, plan.coefficients)
             δd = zeros(T, dims); HD.divergence!(δd, ws.gχ, grid, bc)
             # The divergent part reproduces the divergence it was built from.
-            @test sqrt(sum(abs2, δd .- δu)) < 1e-7
+            Test.@test sqrt(sum(abs2, δd .- δu)) < 1e-7
             δr = zeros(T, dims); HD.divergence!(δr, ws.urot, grid, bc)
-            @test sqrt(sum(abs2, δr)) < 1e-7
-            @test res.χ_solve.converged
+            Test.@test sqrt(sum(abs2, δr)) < 1e-7
+            Test.@test res.χ_solve.converged
         end
     end
 end
 
-@testset "count_holes" begin
+Test.@testset "count_holes" begin
     n = 41
     xs = range(-1.0, 1.0; length = n)
     disk = trues(n, n)
@@ -224,9 +224,9 @@ end
     end
     two = trues(n, n); two[8:12, 8:12] .= false; two[28:32, 28:32] .= false
     notch = trues(n, n); notch[1:5, 18:22] .= false
-    @test HD.count_holes(FG.Grids.StructuredGrid(CART, xs, xs)) == 0
-    @test HD.count_holes(FG.Grids.StructuredGrid(CART, xs, xs; mask = disk)) == 1
-    @test HD.count_holes(FG.Grids.StructuredGrid(CART, xs, xs; mask = two)) == 2
+    Test.@test HD.count_holes(FG.Grids.StructuredGrid(CART, xs, xs)) == 0
+    Test.@test HD.count_holes(FG.Grids.StructuredGrid(CART, xs, xs; mask = disk)) == 1
+    Test.@test HD.count_holes(FG.Grids.StructuredGrid(CART, xs, xs; mask = two)) == 2
     # A notch open to the edge is not enclosed, so it is not a hole.
-    @test HD.count_holes(FG.Grids.StructuredGrid(CART, xs, xs; mask = notch)) == 0
+    Test.@test HD.count_holes(FG.Grids.StructuredGrid(CART, xs, xs; mask = notch)) == 0
 end

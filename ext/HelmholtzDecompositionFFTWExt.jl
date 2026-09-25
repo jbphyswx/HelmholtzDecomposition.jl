@@ -12,28 +12,20 @@ using ComputationalBackends: ComputationalBackends as CB
 using FFTW: FFTW
 using FlowGeometries: FlowGeometries as FG
 using LinearAlgebra: LinearAlgebra
-using SpectralBackends: SpectralBackends as SB
 # The periodic path goes through the `AbstractFFTs` interface rather than FFTW's own functions, so
 # it dispatches to whatever backend owns the array — CUFFT for a device array, FFTW for a host one
 # — from one implementation. The bounded path below has no such option: `r2r` is FFTW-specific.
 using AbstractFFTs: AbstractFFTs
-
-"""
-    CartesianSpectralSolver <: AbstractPoissonSolver
-
-Spectral Poisson solver for regular periodic Cartesian grids (any dimension) using FFTW.
-"""
-struct CartesianSpectralSolver <: HD.AbstractPoissonSolver end
 
 # `rfft`/`irfft` expand in a periodic basis over every cell of the array. That makes three
 # separate demands, each checked as itself rather than conflated into one flag: the grid must
 # wrap in every direction, its axes must be evenly spaced, and no cell may be masked out. On a
 # grid meeting those there is no boundary anywhere, so a boundary condition is vacuous — which
 # is why this accepts any of them rather than naming one.
-HD.supports_boundary(::CartesianSpectralSolver, ::HD.AbstractBoundaryCondition) = true
-HD.requires_full_domain(::CartesianSpectralSolver) = true
-HD.requires_uniform_axes(::CartesianSpectralSolver) = true
-HD.requires_periodic_domain(::CartesianSpectralSolver) = true
+HD.supports_boundary(::HD.CartesianSpectralSolver, ::HD.AbstractBoundaryCondition) = true
+HD.requires_full_domain(::HD.CartesianSpectralSolver) = true
+HD.requires_uniform_axes(::HD.CartesianSpectralSolver) = true
+HD.requires_periodic_domain(::HD.CartesianSpectralSolver) = true
 
 # Per-axis angular wavenumbers matching an rfft layout (axis 1 reduced).
 function _rfft_wavenumbers(::Type{T}, dims::NTuple{N,Int}, spacing::NTuple{N,T}) where {T,N}
@@ -86,7 +78,7 @@ function _periodic_symbols(::Type{T}, dims::NTuple{N,Int}, kdims::NTuple{N,Int},
 end
 
 function HD.prepare_solver(
-    ::CartesianSpectralSolver,
+    ::HD.CartesianSpectralSolver,
     grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
     ::HD.AbstractBoundaryCondition;
     backend = CB.SerialBackend(), shared = nothing,
@@ -106,7 +98,7 @@ function HD.solve_poisson!(
     Φ::AbstractArray{T,N},
     RHS::AbstractArray{T,N},
     grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
-    solver::CartesianSpectralSolver;
+    solver::HD.CartesianSpectralSolver;
     boundary::HD.AbstractBoundaryCondition = HD.Neumann(),
     state::PeriodicSpectralState = HD.prepare_solver(solver, grid, boundary),
     kwargs...,
@@ -123,7 +115,7 @@ function HD.solve_poisson!(
 end
 
 function HD._decompose_spectral(
-    ::CartesianSpectralSolver,
+    ::HD.CartesianSpectralSolver,
     ::FG.Geometry.AbstractCartesianGeometry,
     U::AbstractArray{T,M},
     grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N};
@@ -152,33 +144,10 @@ end
 # Bounded domains: the cosine and sine transforms
 # ---------------------------------------------------------------------------
 
-"""
-    CartesianBoundedSolver
-
-Direct `O(N log N)` Poisson solve on a uniform Cartesian grid with **any** mix of bounded and
-periodic directions — including a channel, which no single transform kind covers.
-
-A complex-exponential basis diagonalizes the periodic Laplacian and nothing else, which is why
-`CartesianSpectralSolver` refuses a bounded grid. The remedy is not to abandon the transform but
-to use the one matched to the boundary: DCT-II/III (`REDFT10`/`REDFT01`) diagonalizes the
-cell-centred **Neumann** Laplacian, DST-II/III (`RODFT10`/`RODFT01`) the **Dirichlet** one. Both
-are FFTs — of the even and odd extension — so a bounded domain costs the same `O(N log N)` as a
-periodic one instead of falling back to an iterative solve.
-
-The eigenvalues are the *discrete* operator's, so this inverts exactly the `L = D G` the
-decomposition differentiates with:
-
-| condition | kinds | eigenvalue |
-|---|---|---|
-| Neumann   | `REDFT10`/`REDFT01` | `−(4/h²)·sin²(πk/2N)`, `k = 0…N−1`; `λ₀ = 0`, the constant |
-| Dirichlet | `RODFT10`/`RODFT01` | `−(4/h²)·sin²(π(k+1)/2N)`, with no null mode |
-"""
-struct CartesianBoundedSolver <: HD.AbstractPoissonSolver end
-
-HD.supports_boundary(::CartesianBoundedSolver, ::HD.Dirichlet) = true
-HD.supports_boundary(::CartesianBoundedSolver, ::HD.Neumann) = true
-HD.requires_full_domain(::CartesianBoundedSolver) = true
-HD.requires_uniform_axes(::CartesianBoundedSolver) = true
+HD.supports_boundary(::HD.CartesianBoundedSolver, ::HD.Dirichlet) = true
+HD.supports_boundary(::HD.CartesianBoundedSolver, ::HD.Neumann) = true
+HD.requires_full_domain(::HD.CartesianBoundedSolver) = true
+HD.requires_uniform_axes(::HD.CartesianBoundedSolver) = true
 
 # The transform kind is chosen per direction, so a grid may mix them: a channel — periodic in `x`,
 # bounded in `y` — is one plan, `R2HC` along `x` and `REDFT10` along `y`. This is why the kind is
@@ -251,7 +220,7 @@ Base.show(io::IO, s::BoundedState{T}) where {T} =
     print(io, "BoundedState{", T, "}(", join(size(s.scratch), "×"), ")")
 
 function HD.prepare_solver(
-    ::CartesianBoundedSolver,
+    ::HD.CartesianBoundedSolver,
     grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
     boundary::HD.AbstractBoundaryCondition;
     backend = CB.SerialBackend(), shared = nothing,
@@ -279,7 +248,7 @@ function HD.solve_poisson!(
     Φ::AbstractArray{T,N},
     RHS::AbstractArray{T,N},
     grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
-    solver::CartesianBoundedSolver;
+    solver::HD.CartesianBoundedSolver;
     boundary::HD.AbstractBoundaryCondition = HD.Neumann(),
     state::BoundedState = HD.prepare_solver(solver, grid, boundary),
     kwargs...,
@@ -292,13 +261,6 @@ function HD.solve_poisson!(
     state.inverse * state.scratch
     @. Φ = state.scratch * state.norm
     return HD.SolverResult{T}(true, 1, zero(T))
-end
-
-function __init__()
-    # Priority 10: FFTW's native real-to-real transform, against 20 for the generic even/odd
-    # extension in the AbstractFFTs extension, which also works but builds a `2n` array.
-    HD.register_spectral_solver!(SB.FFTSpectralBackend, CartesianSpectralSolver; priority = 5)
-    HD.register_spectral_solver!(SB.FFTSpectralBackend, CartesianBoundedSolver; priority = 10)
 end
 
 end # module

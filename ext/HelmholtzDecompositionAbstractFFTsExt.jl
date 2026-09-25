@@ -30,23 +30,13 @@ module HelmholtzDecompositionAbstractFFTsExt
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using ComputationalBackends: ComputationalBackends as CB
 using FlowGeometries: FlowGeometries as FG
-using SpectralBackends: SpectralBackends as SB
 using AbstractFFTs: AbstractFFTs
 using LinearAlgebra: LinearAlgebra
 
-"""
-    CartesianRealTransformSolver
-
-Direct `O(N log N)` Poisson solve on a uniform Cartesian grid with any mix of bounded and periodic
-directions, using only the `AbstractFFTs` interface — so it follows the array to whatever backend
-owns it.
-"""
-struct CartesianRealTransformSolver <: HD.AbstractPoissonSolver end
-
-HD.supports_boundary(::CartesianRealTransformSolver, ::HD.Dirichlet) = true
-HD.supports_boundary(::CartesianRealTransformSolver, ::HD.Neumann) = true
-HD.requires_full_domain(::CartesianRealTransformSolver) = true
-HD.requires_uniform_axes(::CartesianRealTransformSolver) = true
+HD.supports_boundary(::HD.CartesianRealTransformSolver, ::HD.Dirichlet) = true
+HD.supports_boundary(::HD.CartesianRealTransformSolver, ::HD.Neumann) = true
+HD.requires_full_domain(::HD.CartesianRealTransformSolver) = true
+HD.requires_uniform_axes(::HD.CartesianRealTransformSolver) = true
 
 # `AbstractFFTs` is an interface, not an implementation: loading it does not mean a transform can be
 # planned, and packages pull it in without a backend. So capability is asked of the array type the
@@ -57,10 +47,10 @@ HD.requires_uniform_axes(::CartesianRealTransformSolver) = true
 
 @inline _storage_vector(grid) = typeof(similar(FG.Grids.measure(grid), eltype(grid), 1))
 
-HD.supports_sampling(::CartesianRealTransformSolver, grid) =
+HD.supports_sampling(::HD.CartesianRealTransformSolver, grid) =
     _has_backend(_storage_vector(grid))
 
-HD._sampling_message(::CartesianRealTransformSolver, grid) =
+HD._sampling_message(::HD.CartesianRealTransformSolver, grid) =
     "CartesianRealTransformSolver needs an FFT backend for $(_storage_vector(grid)); " *
     "`AbstractFFTs` alone is an interface and provides none. Load one (`using FFTW` on the " *
     "host, or the array's own package on a device)."
@@ -167,7 +157,7 @@ Base.show(io::IO, ::RealBoundedState{T,N}) where {T,N} =
 Base.show(io::IO, ::MixedTopologyState{T,N}) where {T,N} =
     print(io, "MixedTopologyState{", T, ",", N, "}(…)")
 
-function HD.prepare_solver(::CartesianRealTransformSolver,
+function HD.prepare_solver(::HD.CartesianRealTransformSolver,
                            grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
                            boundary::HD.AbstractBoundaryCondition;
                            backend = CB.SerialBackend(), shared = nothing) where {T,N}
@@ -287,18 +277,13 @@ function HD.solve_poisson!(
     Φ::AbstractArray{T,N},
     RHS::AbstractArray{T,N},
     grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
-    solver::CartesianRealTransformSolver;
+    solver::HD.CartesianRealTransformSolver;
     boundary::HD.AbstractBoundaryCondition = HD.Neumann(),
     state = HD.prepare_solver(solver, grid, boundary),
     kwargs...,
 ) where {T<:AbstractFloat,N}
     HD._require_boundary(solver, boundary)
     return _solve!(Φ, RHS, state, boundary)
-end
-
-function __init__()
-    HD.register_spectral_solver!(SB.FFTSpectralBackend, CartesianRealTransformSolver;
-                                 priority = 20)
 end
 
 end # module
