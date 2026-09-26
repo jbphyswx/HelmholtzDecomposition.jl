@@ -21,6 +21,7 @@ using ComputationalBackends: ComputationalBackends as CB
 using FlowGeometries: FlowGeometries as FG
 using FlowTransformBindings: FlowTransformBindings as FTB
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
+using FFTW: FFTW
 
 # A grid this solver accepts covers the closed sphere, so there is no boundary anywhere and a
 # boundary condition is vacuous rather than honoured or refused. The transform reads every node,
@@ -85,19 +86,11 @@ struct SphericalSpectralState{T,A<:AbstractMatrix{T},E<:AbstractVector{T},C}
     cache::C        # this task's own FastTransforms plans
 end
 
-"""
-    _PLANNER_LOCK
-
-Held while FastTransforms builds a plan.
-
-Its sphere plans are built by `fftw_plan_many_r2r` inside the bundled FFTW, whose planner keeps one
-process-global table and is not thread safe; two tasks planning at once abort in `malloc`. FFTW.jl
-serialises its own planning, and a C library calling the planner directly sits outside that.
-
-Execution needs no lock **when each task owns its plans**. Two tasks executing one shared plan
-corrupt each other through its internal scratch, so the cache lives on the per-task state.
-"""
-const _PLANNER_LOCK = ReentrantLock()
+# FastTransforms builds its sphere plans with `fftw_plan_many_r2r` on the libfftw3 FFTW.jl loads, whose
+# planner keeps one process-global table; two tasks planning at once abort in `malloc`. So every plan
+# here is built under FFTW.jl's planner lock, `FFTW.set_num_threads(f, n)`, at the thread count of the
+# backend the plan runs on. Execution needs no lock when each task owns its plans; two tasks executing
+# one plan corrupt each other through its scratch, so the cache lives on the per-task state.
 
 function HD.prepare_solver(::HD.SphericalSpectralSolver,
                            grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2},
@@ -122,7 +115,7 @@ function HD.prepare_solver(::HD.SphericalSpectralSolver,
     # Both plans are built here, on this task, so a solve executes and plans nothing. The warm-up
     # runs one transform and one evaluation over `coeffs`, which is left zeroed for the first solve.
     cache = FSH.SphPlanCache{T}()
-    Base.lock(_PLANNER_LOCK) do
+    FFTW.set_num_threads(HD._library_threads(backend)) do
         FTB.with_fasttransforms_threads() do
             FSH.sph_transform!(coeffs; cache = cache)
             FSH.sph_evaluate!(coeffs; cache = cache)
@@ -232,7 +225,7 @@ function HD._decompose_spectral(
     ::FG.Geometry.AbstractSphericalGeometry,
     U::AbstractArray{Float64,3},
     grid::FG.Grids.StructuredGrid{Float64,<:FG.Geometry.AbstractSphericalGeometry,2};
-    kwargs...,
+    backend = CB.SerialBackend(), kwargs...,
 )
     nlon, nlat = size(grid)
     φ = FG.Grids.coordinates(grid, 2)
@@ -248,11 +241,11 @@ function HD._decompose_spectral(
     end
 
     # One cache for both transforms: `spinsph_transform!` and `spinsph_evaluate!` key on `(s, N)`
-    # and share the `spinsph2fourier` plan. This entry point carries no per-task state, so the whole
-    # section is held under the planner lock — the batch path is the one that runs concurrently, and
-    # it owns a cache per task. See `_PLANNER_LOCK`.
+    # and share the `spinsph2fourier` plan. The cache plans on first use and this entry point holds no
+    # per-task state, so the whole section runs under FFTW.jl's planner lock — see the note above
+    # `prepare_solver`.
     cache = FSH.SpinSphPlanCache{ComplexF64}()
-    D = Base.lock(_PLANNER_LOCK) do
+    D = FFTW.set_num_threads(HD._library_threads(backend)) do
         FTB.with_fasttransforms_threads() do
             C = FSH.spinsph_transform!(V, 1; cache = cache)   # spin-1 coefficients, in place over `V`
             S = FSH.spinsph_ethbar(C, 1)                      # spin-0 coefficients of ∇·u
