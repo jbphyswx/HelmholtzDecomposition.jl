@@ -22,7 +22,7 @@ ext/
   HelmholtzDecompositionFFTWExt.jl                # r2r fast path on the host
   HelmholtzDecompositionFSHExt.jl                 # Clenshaw–Curtis sphere
   HelmholtzDecompositionNUFSHTExt.jl              # arbitrary covering sphere
-  HelmholtzDecompositionKernelAbstractionsExt.jl  # device memory for the buffers
+  HelmholtzDecompositionAdaptExt.jl               # how a plan's structs move to a device
   HelmholtzDecompositionOhMyThreadsExt.jl         # threaded batch
   HelmholtzDecompositionDistributedExt.jl         # multiprocess batch
   HelmholtzDecompositionMPIExt.jl                 # MPI batch

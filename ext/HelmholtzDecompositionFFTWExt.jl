@@ -69,7 +69,7 @@ Base.show(io::IO, ::PeriodicSpectralState{T}) where {T} =
 function _periodic_symbols(::Type{T}, dims::NTuple{N,Int}, kdims::NTuple{N,Int}, h, backend) where {T,N}
     return ntuple(Val(N)) do d
         n, nk = dims[d], kdims[d]
-        v = HD.allocate_zeros(backend, T, (nk,))
+        v = HD._zeros(backend, T, (nk,))
         i = reshape(1:nk, nk)
         s = sin.(T(π) .* min.(i .- 1, n .- i .+ 1) ./ T(n))
         v .= .-4 .* s .^ 2 ./ (h[d] * h[d])
@@ -86,8 +86,8 @@ function HD.prepare_solver(
     dims = size(grid)
     h = ntuple(d -> abs(FG.Grids.spacing(grid, d)), Val(N))
     kdims = ntuple(d -> d == 1 ? dims[1] ÷ 2 + 1 : dims[d], Val(N))
-    work = HD.allocate_zeros(backend, T, dims)
-    spec = HD.allocate_zeros(backend, complex(T), kdims)
+    work = HD._zeros(backend, T, dims)
+    spec = HD._zeros(backend, complex(T), kdims)
     return PeriodicSpectralState(spec, AbstractFFTs.plan_rfft(work),
                                  AbstractFFTs.plan_brfft(spec, dims[1]),
                                  _periodic_symbols(T, dims, kdims, h, backend),
@@ -230,7 +230,7 @@ function HD.prepare_solver(
     per = ntuple(d -> FG.Grids.isperiodic(grid, d), Val(N))
     # `FFTW.plan_r2r!` plans against host memory; a device array takes
     # `CartesianRealTransformSolver`, which goes through `AbstractFFTs`.
-    scratch = HD.allocate_zeros(backend, T, dims)
+    scratch = HD._zeros(backend, T, dims)
     scratch isa Array || throw(ArgumentError(
         "CartesianBoundedSolver uses FFTW's real-to-real transform, which is host-only. Load " *
         "`AbstractFFTs` and let `CartesianRealTransformSolver` take this grid, or plan it on the " *

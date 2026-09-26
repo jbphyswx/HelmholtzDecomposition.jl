@@ -146,10 +146,7 @@ HelmholtzDecomposition.dual_grid
 ## Execution
 
 ```@docs
-HelmholtzDecomposition.execution_backend
 HelmholtzDecomposition.resolve_execution_backend
-HelmholtzDecomposition.allocate_zeros
-HelmholtzDecomposition.to_backend
 ```
 
 ## Multigrid

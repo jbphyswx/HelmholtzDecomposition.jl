@@ -51,8 +51,7 @@ end
 function LevelBuffers(grid, ::Type{T};
                       backend = ComputationalBackends.SerialBackend()) where {T}
     dims = size(grid)
-    return LevelBuffers(allocate_zeros(backend, T, dims), allocate_zeros(backend, T, dims),
-                        allocate_zeros(backend, T, dims))
+    return LevelBuffers(_zeros(backend, T, dims), _zeros(backend, T, dims), _zeros(backend, T, dims))
 end
 
 """

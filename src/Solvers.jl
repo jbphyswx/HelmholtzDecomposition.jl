@@ -846,8 +846,8 @@ function prepare_solver(solver::CGSolver, grid, boundary::AbstractBoundaryCondit
                         backend = ComputationalBackends.SerialBackend(), shared = nothing)
     T = eltype(grid)
     dims = size(grid)
-    ws = CGWorkspace(allocate_zeros(backend, T, dims), allocate_zeros(backend, T, dims),
-                     allocate_zeros(backend, T, dims), allocate_zeros(backend, T, dims))
+    ws = CGWorkspace(_zeros(backend, T, dims), _zeros(backend, T, dims),
+                     _zeros(backend, T, dims), _zeros(backend, T, dims))
     # A plan built before `prepare_shared` existed, or a solver used without one, still works: the
     # hierarchy is built here instead.
     pre = shared === nothing && solver.multigrid ?

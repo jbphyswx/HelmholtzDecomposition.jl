@@ -36,32 +36,17 @@ Storage and counts are in `Staggering.jl`.
 # ---------------------------------------------------------------------------
 
 """
-    execution_backend(backend)
-
-The object `FlowGeometries.Execution` dispatches on, given a `ComputationalBackends` one.
-
-The two libraries answer different questions: `ComputationalBackends` names *what kind* of
-execution is wanted, while `Execution`'s device methods dispatch on the KernelAbstractions device
-object itself. A `GPUBackend` therefore hands over the device it names; serial and threaded
-backends pass through, FlowGeometries' own ComputationalBackends extension having methods for
-them. Anything else reaches `run_indices` unchanged and raises a `MethodError` there rather than
-running serially in silence.
-"""
-@inline execution_backend(b::ComputationalBackends.GPUBackend) = b.backend
-@inline execution_backend(b) = b
-
-"""
     resolve_execution_backend(backend) -> concrete backend
 
-The backend a single decomposition's own loops run on, resolved once so nothing below has to ask.
+The backend a single decomposition's own loops run on, resolved once at plan time and passed to
+`FlowGeometries.Execution` as it is.
 
-`AutoBackend` reads the thread count — the defect that made every documented parallel path dead
-at defaults was resolving it to serial unconditionally. A `GPUBackend` is checked here, at plan
-time, against whether FlowGeometries' KernelAbstractions extension is actually loaded, so the
-error names the package to load rather than surfacing as a `MethodError` from inside a loop.
+`AutoBackend` is `ThreadedBackend()` when Julia runs more than one thread and `SerialBackend()`
+otherwise. A `GPUBackend` needs FlowGeometries' KernelAbstractions extension, checked here so the
+error names the package to load.
 
-`DistributedBackend` and `MPIBackend` are refused: they spread *fields across processes*, which is
-[`helmholtz_decompose_batch`](@ref)'s axis, not the index space inside one field.
+`DistributedBackend` and `MPIBackend` spread *fields across processes*, which is
+[`helmholtz_decompose_batch`](@ref)'s axis, and are refused for the index space inside one field.
 """
 resolve_execution_backend(b::ComputationalBackends.AbstractSerialBackend) = b
 resolve_execution_backend(b::ComputationalBackends.AbstractThreadedBackend) = b
@@ -83,26 +68,9 @@ resolve_execution_backend(b::ComputationalBackends.AbstractExecutionBackend) = t
     "to `helmholtz_decompose_batch` instead; `plan_helmholtz`'s `backend` selects how the loops " *
     "inside a single decomposition run."))
 
-"""
-    allocate_zeros(backend, T, dims) -> zeroed array
-
-Every buffer this package owns goes through here, so that a device backend gets device memory
-rather than a host array a kernel cannot reach. The default is a host `Array`; the
-KernelAbstractions extension adds the device method.
-"""
-allocate_zeros(::Any, ::Type{T}, dims::Dims) where {T} = zeros(T, dims)
-
-"""
-    to_backend(backend, x) -> x on the backend's memory
-
-Move an already-built array — or a struct of them — to where `backend` executes.
-
-The plan's coefficients and face metrics are built by walking the grid's geometry, which is host
-work done once; only their *results* are read in the inner loops. So they are assembled on the
-host and moved here, rather than every geometry accessor being made device-callable to build them
-in place. Identity by default; the KernelAbstractions extension routes it through `Adapt`.
-"""
-to_backend(::Any, x) = x
+# Every buffer this package owns: zeroed, in the memory `backend`'s loops write.
+@inline _zeros(backend, ::Type{T}, dims::Dims) where {T} =
+    fill!(FlowGeometries.Execution.allocate(backend, T, dims...), zero(T))
 
 # ---------------------------------------------------------------------------
 # Rotation-component bookkeeping

@@ -102,7 +102,7 @@ end
 const EXTENSIONS = (:HelmholtzDecompositionFFTWExt, :HelmholtzDecompositionAbstractFFTsExt,
                     :HelmholtzDecompositionFSHExt, :HelmholtzDecompositionNUFSHTExt,
                     :HelmholtzDecompositionOhMyThreadsExt,
-                    :HelmholtzDecompositionKernelAbstractionsExt)
+                    :HelmholtzDecompositionAdaptExt)
 
 function configuration()
     println("HelmholtzDecomposition.jl benchmark")

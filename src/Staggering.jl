@@ -60,7 +60,7 @@ collocated, so nothing outside this package sees it.
 """
 allocate_faces(::Type{T}, grid::FaceIndexedGrid{TT,G,N};
                backend = ComputationalBackends.SerialBackend()) where {T,G,TT,N} =
-    ntuple(d -> allocate_zeros(backend, T, face_dims(grid, d)), Val(N))
+    ntuple(d -> _zeros(backend, T, face_dims(grid, d)), Val(N))
 
 """
     ncorners(grid, d) -> Int
@@ -111,7 +111,7 @@ One zeroed corner array per rotation pair, shaped by [`corner_dims`](@ref).
 """
 allocate_corners(::Type{T}, grid::FaceIndexedGrid{TT,G,N};
                  backend = ComputationalBackends.SerialBackend()) where {T,G,TT,N} =
-    ntuple(p -> allocate_zeros(backend, T, corner_dims(grid, rotation_pairs(Val(N))[p]...)),
+    ntuple(p -> _zeros(backend, T, corner_dims(grid, rotation_pairs(Val(N))[p]...)),
            Val(n_rotation_components(N)))
 
 # ---------------------------------------------------------------------------

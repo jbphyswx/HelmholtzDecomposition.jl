@@ -61,7 +61,7 @@ function HD._decompose_batch!(
         # The rank's own inner backend, as named on the `MPIBackend`: a rank owns a block of the
         # batch, so how it works through that block is a separate choice from how ranks divide it.
         HD._decompose_slice!(batch, i, items[i], plan, ws;
-                             backend = HD.execution_backend(b.inner), kwargs...)
+                             backend = HD.resolve_execution_backend(b.inner), kwargs...)
     end
 
     for A in _arrays(batch)

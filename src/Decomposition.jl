@@ -73,7 +73,7 @@ function plan_helmholtz(
     backend::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
 ) where {G,T,N}
     P = n_rotation_components(N)
-    exec = execution_backend(resolve_execution_backend(backend))
+    exec = resolve_execution_backend(backend)
     pairs = rotation_pairs(Val(N))
 
     # Everything geometric is assembled on the host, where the coordinates and scale factors are:
@@ -97,15 +97,16 @@ function plan_helmholtz(
     hshared = prepare_shared(concrete, grid, boundary)
     hdshared = ntuple(p -> prepare_shared(dsolvers[p], hduals[p], dbc), Val(P))
 
-    g = to_backend(exec, grid)
-    coeff = to_backend(exec, hcoeff)
-    metrics = to_backend(exec, hmetrics)
-    duals = ntuple(p -> to_backend(exec, hduals[p]), Val(P))
-    dcoef = ntuple(p -> to_backend(exec, hdcoef[p]), Val(P))
+    move(x) = FlowGeometries.Execution.on_backend(exec, x)
+    g = move(grid)
+    coeff = move(hcoeff)
+    metrics = move(hmetrics)
+    duals = ntuple(p -> move(hduals[p]), Val(P))
+    dcoef = ntuple(p -> move(hdcoef[p]), Val(P))
     # The shared solver state is assembled on the host alongside the coefficients and moves with
     # them; a kernel reads it during every solve.
-    shared = to_backend(exec, hshared)
-    dshared = ntuple(p -> to_backend(exec, hdshared[p]), Val(P))
+    shared = move(hshared)
+    dshared = ntuple(p -> move(hdshared[p]), Val(P))
 
     return HelmholtzPlan{N,P,T,typeof(g),typeof(boundary),typeof(coeff),typeof(metrics),
                          typeof(duals),typeof(dcoef),typeof(concrete),typeof(dsolvers),
@@ -260,9 +261,9 @@ function allocate_potentials(plan::HelmholtzPlan{N,P,T}) where {N,P,T}
     b = plan.backend
     dummy = SolverResult{T}(false, 0, zero(T))
     Rpot = allocate_corners(T, plan.grid; backend = b)
-    χ = allocate_zeros(b, T, dims)
+    χ = _zeros(b, T, dims)
     return PotentialsResult{N,P,T,typeof(χ),typeof(Rpot)}(
-        χ, Rpot, allocate_zeros(b, T, dims), dummy, ntuple(_ -> dummy, Val(P)),
+        χ, Rpot, _zeros(b, T, dims), dummy, ntuple(_ -> dummy, Val(P)),
     )
 end
 
@@ -280,11 +281,11 @@ function allocate_result(plan::HelmholtzPlan{N,P,T}) where {N,P,T}
     # The array types come from what the backend actually returned rather than being written as
     # `Array`: a device-resident result has to be expressible, and hardcoding the host type is
     # what made it not be.
-    u_rot = allocate_zeros(b, T, (dims..., N))
-    u_div = allocate_zeros(b, T, (dims..., N))
-    u_harm = allocate_zeros(b, T, (dims..., N))
-    χ = allocate_zeros(b, T, dims)
-    div = allocate_zeros(b, T, dims)
+    u_rot = _zeros(b, T, (dims..., N))
+    u_div = _zeros(b, T, (dims..., N))
+    u_harm = _zeros(b, T, (dims..., N))
+    χ = _zeros(b, T, dims)
+    div = _zeros(b, T, dims)
     return HelmholtzResult{N,P,T,typeof(u_rot),typeof(χ),typeof(Rpot)}(
         u_rot, u_div, u_harm, χ, Rpot, div,
         zero(T), dummy, ntuple(_ -> dummy, Val(P)),
@@ -325,15 +326,15 @@ function allocate_batch(plan::HelmholtzPlan{N,P,T}, nfields::Int) where {N,P,T}
     dims = size(plan.grid)
     bk = plan.backend
     pairs = rotation_pairs(Val(N))
-    u_rot = allocate_zeros(bk, T, (dims..., N, nfields))
-    u_div = allocate_zeros(bk, T, (dims..., N, nfields))
-    u_harm = allocate_zeros(bk, T, (dims..., N, nfields))
-    χ = allocate_zeros(bk, T, (dims..., nfields))
-    div = allocate_zeros(bk, T, (dims..., nfields))
-    Rpot = ntuple(p -> allocate_zeros(bk, T, (corner_dims(plan.grid, pairs[p]...)..., nfields)),
+    u_rot = _zeros(bk, T, (dims..., N, nfields))
+    u_div = _zeros(bk, T, (dims..., N, nfields))
+    u_harm = _zeros(bk, T, (dims..., N, nfields))
+    χ = _zeros(bk, T, (dims..., nfields))
+    div = _zeros(bk, T, (dims..., nfields))
+    Rpot = ntuple(p -> _zeros(bk, T, (corner_dims(plan.grid, pairs[p]...)..., nfields)),
                   Val(P))
     dummy = SolverResult{T}(false, 0, zero(T))
-    frac = allocate_zeros(bk, T, (nfields,))
+    frac = _zeros(bk, T, (nfields,))
     # Convergence diagnostics stay where they are read — on the host — while the fields follow the
     # backend; the types are parameters either way.
     χs = fill(dummy, nfields)

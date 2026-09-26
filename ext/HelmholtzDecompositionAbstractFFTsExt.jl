@@ -80,8 +80,8 @@ struct DirPlan{E,S,FP,BP,W}
 end
 
 function _dir_plan(::Type{T}, dims::Dims{N}, d::Int, off::Int, backend) where {T,N}
-    ext = HD.allocate_zeros(backend, T, ntuple(e -> e == d ? 2dims[e] : dims[e], Val(N)))
-    spec = HD.allocate_zeros(backend, complex(T),
+    ext = HD._zeros(backend, T, ntuple(e -> e == d ? 2dims[e] : dims[e], Val(N)))
+    spec = HD._zeros(backend, complex(T),
                              ntuple(e -> e == d ? dims[e] + 1 : dims[e], Val(N)))
     return DirPlan(ext, spec, AbstractFFTs.plan_rfft(ext, d:d),
                    AbstractFFTs.plan_brfft(spec, 2dims[d], d:d),
@@ -107,7 +107,7 @@ function _axis_symbols(::Type{T}, dims::NTuple{N,Int}, kdims::NTuple{N,Int}, h, 
                        off::Int, first_periodic::Int, backend) where {T,N}
     return ntuple(Val(N)) do d
         n, nk = dims[d], kdims[d]
-        v = HD.allocate_zeros(backend, T, (nk,))
+        v = HD._zeros(backend, T, (nk,))
         i = reshape(1:nk, nk)
         if !per[d] || d == first_periodic
             # A bounded direction indexes its own modes; the halved periodic one runs `0 : n÷2`.
@@ -165,7 +165,7 @@ function HD.prepare_solver(::HD.CartesianRealTransformSolver,
     off = boundary isa HD.Dirichlet ? 1 : 0
     per = ntuple(d -> FG.Grids.isperiodic(grid, d), Val(N))
     h = ntuple(d -> abs(FG.Grids.spacing(grid, d)), Val(N))
-    work = HD.allocate_zeros(backend, T, dims)
+    work = HD._zeros(backend, T, dims)
 
     if !any(per)
         dirs = ntuple(d -> _dir_plan(T, dims, d, off, backend), Val(N))
@@ -176,7 +176,7 @@ function HD.prepare_solver(::HD.CartesianRealTransformSolver,
     bdims = Tuple(d for d in 1:N if !per[d])
     pdims = Tuple(d for d in 1:N if per[d])
     dirs = map(d -> _dir_plan(T, dims, d, off, backend), bdims)
-    spec = HD.allocate_zeros(backend, complex(T),
+    spec = HD._zeros(backend, complex(T),
                              ntuple(e -> e == pdims[1] ? dims[e] ÷ 2 + 1 : dims[e], Val(N)))
     pplan = AbstractFFTs.plan_rfft(work, pdims)
     iplan = AbstractFFTs.plan_brfft(spec, dims[pdims[1]], pdims)
@@ -260,7 +260,7 @@ function _solve!(Φ::AbstractArray{T,N}, RHS, st::MixedTopologyState, boundary) 
 end
 
 function _twiddle(::Type{T}, n::Int, off::Int, nd::Int, d::Int, backend) where {T}
-    w = HD.allocate_zeros(backend, complex(T), (n,))
+    w = HD._zeros(backend, complex(T), (n,))
     k = reshape(0:(n - 1), n)
     w .= cis.(.-T(π) .* T.(k .+ off) ./ T(2n))
     return reshape(w, ntuple(e -> e == d ? n : 1, nd))

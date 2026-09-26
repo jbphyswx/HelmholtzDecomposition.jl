@@ -106,7 +106,7 @@ function HD.prepare_solver(::HD.SphericalSpectralSolver,
     # FastSphericalHarmonics wraps FastTransforms, which is a host library, so this solver's state
     # is host memory. A backend that allocates elsewhere is refused here, where the message can
     # name an alternative, ahead of a `MethodError` raised from inside the transform.
-    HD.allocate_zeros(backend, T, (1,)) isa Array || throw(ArgumentError(
+    FG.Execution.allocate(backend, T, 1) isa Array || throw(ArgumentError(
         "SphericalSpectralSolver runs on the host: FastSphericalHarmonics has no device " *
         "implementation. Use `SphericalNUSHTSolver`, whose non-uniform backend follows the array, " *
         "or plan this grid with a host backend."))
