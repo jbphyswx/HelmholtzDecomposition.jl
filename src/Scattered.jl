@@ -1,15 +1,11 @@
-"""
-    Scattered.jl — spectral decomposition of scattered Cartesian samples.
-
-The velocity's Fourier coefficients are the least-squares fit to the samples: conjugate gradients
-on `AᴴA F = Aᴴ u`, with `A` the type-2 NUFFT at the sample points and `Aᴴ` its adjoint, the type 1.
-The fit is projected exactly in mode space, and each part returns to the points through one type 2.
-The transforms are FlowTransformBindings plans over the library the solver names.
-
-A single adjoint is the inverse only when the nodes carry quadrature weights, as on a uniform set;
-at scattered points it is a different operator, the same error as an adjoint SHT off its quadrature
-grid.
-"""
+# Spectral decomposition of scattered Cartesian samples. The velocity's Fourier coefficients are the
+# least-squares fit to the samples: conjugate gradients on `AᴴA F = Aᴴ u`, with `A` the type-2 NUFFT at
+# the sample points and `Aᴴ` its adjoint, the type 1. The fit is projected exactly in mode space, and each
+# part returns to the points through one type 2. The transforms are FlowTransformBindings plans over the
+# library the solver names.
+#
+# A single adjoint is the inverse only when the nodes carry quadrature weights, as on a uniform set; at
+# scattered points it is a different operator.
 
 """
     CartesianNUFFTSolver(nufft = SpectralBackends.AutoSpectralBackend(); nk = (64, 64),
@@ -20,8 +16,8 @@ Spectral Poisson/Helmholtz solver for scattered Cartesian samples in any dimensi
 library `nufft` names: `FlowTransformBindings.NonuniformFFTsBackend()`,
 `FlowTransformBindings.FINUFFTBackend()`, or `AutoSpectralBackend()` for NonuniformFFTs when it is
 loaded and FINUFFT when only it is. `nk` is the mode count per axis and its length fixes the dimension;
-`rtol`/`maxiter` govern the conjugate gradients of the fit, and `tol` is the transforms' relative
-accuracy, by default the `rtol` the fit is asked for.
+the fitted series spans `|k_d| ≤ ⌊nk_d/2⌋`. `rtol`/`maxiter` govern the conjugate gradients of the fit,
+and `tol` is the transforms' relative accuracy, by default the `rtol` the fit is asked for.
 
 The iterations a fit needs grow with the mode-to-point ratio, and any ratio below one is accepted.
 `maxiter` is sized so that conditioning is what an unconvergeable fit runs into: a budget set for a
@@ -160,6 +156,12 @@ _value_type(::_ComplexPairs, ::Type{T}) where {T} = Complex{T}
 # the reflection `k → −k`, which the centered order makes an index formula.
 _mode_order(::_RealComponents) = FlowTransformBindings.FFTModes()
 _mode_order(::_ComplexPairs) = FlowTransformBindings.CenteredModes()
+
+# The modes a fit's transform holds for the requested counts `nk`. A real-data transform's series spans
+# `|k_d| ≤ nk_d/2` on every axis. The complex pairs take one more mode on an even axis, so `+nk_d/2`
+# sits beside `−nk_d/2`: the same space, and every mode has its reflection.
+_plan_modes(::_RealComponents, nk::NTuple) = nk
+_plan_modes(::_ComplexPairs, nk::NTuple) = map(n -> n + iseven(n), nk)
 
 # The fits a velocity of `D` components takes.
 _nfits(::_RealComponents, D::Int) = D
@@ -327,20 +329,16 @@ end
 """
     _reflect(i, n) -> Int
 
-Index of mode `−k` given the index `i` of `k`, in the centered layout `−⌊n/2⌋ : ⌈n/2⌉ − 1`.
-
-On an even axis index 1 holds `−n/2`, whose partner `+n/2` lies outside the layout; it maps to
-itself, `n/2 ≡ −n/2 mod n` on the lattice.
+Index of mode `−k` given the index `i` of `k`, in the centered layout `−(n−1)/2 : (n−1)/2` of an odd
+axis.
 """
-@inline function _reflect(i::Int, n::Int)
-    j = 2 * (n ÷ 2) + 2 - i
-    return j > n ? i : j
-end
+@inline _reflect(i::Int, n::Int) = n + 1 - i
 
 """
     _unpack!(Fu, Fv, H)
 
-Split the spectrum of `u + iv` into the spectra of the real fields `u` and `v`.
+Split the spectrum of `u + iv`, odd along every axis (see `_plan_modes`), into the spectra of the
+real fields `u` and `v`.
 
 For real `u`, `û(−k) = conj(û(k))`, so with `ĥ = û + i v̂`
 
@@ -463,7 +461,7 @@ function _scattered_state(packing, lib, solver::CartesianNUFFTSolver, grid, ::Ty
     nk = solver.nk
     _require_resolvable(nk, M)
     VT = _value_type(packing, T)
-    plan = FlowTransformBindings.plan_nufft(lib, VT, coords, nk; tol = solver.tol,
+    plan = FlowTransformBindings.plan_nufft(lib, VT, coords, _plan_modes(packing, nk); tol = solver.tol,
         order = _mode_order(packing), period = periods, origin = zero(T),
         nthreads = _library_threads(backend))
     kdims = FlowTransformBindings.mode_size(plan)

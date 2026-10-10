@@ -118,6 +118,31 @@ Test.@testset "odd mode counts" begin
     end
 end
 
+Test.@testset "Nyquist modes of an even mode count" begin
+    # `nk = 16` spans `|k| ≤ 8`, and at scattered points `e^{8ix}` and `e^{-8ix}` are different
+    # functions. A gradient along a Nyquist wavevector plus a rotational Nyquist mode across it, each
+    # with its split in closed form.
+    T = Float64
+    L = 2π
+    M = 4000
+    Random.seed!(29)
+    x = L .* rand(T, M)
+    y = L .* rand(T, M)
+    grid = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{T}(), (x, y);
+                                     areas = fill(L^2 / M, M), period = (L, L), periodic = (true, true))
+    exact_div = hcat(cos.(8 .* x .+ 3 .* y), (3 / 8) .* cos.(8 .* x .+ 3 .* y))    # ∇ sin(8x + 3y) / 8
+    exact_rot = hcat(-sin.(8 .* y), zeros(T, M))                                    # ∇⊥ cos(8y) / 8
+    U = exact_div .+ exact_rot
+    geo = FG.Grids.grid_geometry(grid)
+    for (name, s) in sc_solvers(; nk = (16, 16), tol = 1e-12, rtol = 1e-12, maxiter = 300)
+        Test.@testset "$name" begin
+            r = HD._decompose_spectral(s, geo, U, grid)
+            Test.@test maximum(abs, r.u_div .- exact_div) < 1e-7
+            Test.@test maximum(abs, r.u_rot .+ r.u_harm .- exact_rot) < 1e-7
+        end
+    end
+end
+
 Test.@testset "scattered Cartesian" begin
     M = 4000
     nk = (16, 16)
