@@ -1,17 +1,13 @@
-"""
-    Spectral.jl — Spectral-space Helmholtz decomposition (dimension-generic).
-
-The Helmholtz (Leray) projection in Fourier space is dimension-trivial: for every
-wavevector `k`,
-
-    û_div(k) = (k̂ ⊗ k̂) û(k)        (curl-free / divergent)
-    û_rot(k) = (I − k̂ ⊗ k̂) û(k)    (divergence-free / rotational)
-
-with the `k = 0` mode separated out as the harmonic part — a constant field is both curl-free
-and divergence-free, so it belongs to neither of the other two. Implemented as fused broadcasts
-over the component-last spectral array, so the same code runs on CPU and GPU arrays in any
-number of dimensions.
-"""
+# Spectral-space Helmholtz decomposition in any dimension. The Helmholtz (Leray) projection in
+# Fourier space is, for every wavevector `k`,
+#
+#     û_div(k) = (k̂ ⊗ k̂) û(k)        (curl-free / divergent)
+#     û_rot(k) = (I − k̂ ⊗ k̂) û(k)    (divergence-free / rotational)
+#
+# with the `k = 0` mode separated out as the harmonic part: a constant field is both curl-free and
+# divergence-free. `k` is the symbol of the first derivative, which on a grid is zero at an even
+# axis's Nyquist slot, so the projection is Hermitian there and the parts of a real field are exact.
+# Fused broadcasts over the component-last spectral array, on host and device arrays alike.
 
 
 """
@@ -63,28 +59,38 @@ end
 # Generic Fourier-space Leray projection
 # ---------------------------------------------------------------------------
 
-# Reshape an axis wavenumber vector to broadcast along spectral dimension `d` of an
-# `N`-dimensional spectral grid.
-@inline function _reshape_k(k::AbstractVector, d::Integer, ::Val{N}) where {N}
-    return reshape(k, ntuple(i -> i == d ? length(k) : 1, Val(N)))
+# The derivative symbol along each axis, shaped to broadcast along it and allocated like `proto`. On
+# FlowTransformBindings axes it is the derivative wavenumber, zero at an even axis's Nyquist slot; a
+# plain vector is the symbol as given.
+_derivative_symbol(proto, ::Type{T}, ks::Tuple{Vararg{FlowTransformBindings.AbstractWavenumberAxis}}) where {T} =
+    FlowTransformBindings.wavenumber_arrays(proto, T, ks; derivative = true)
+_derivative_symbol(proto, ::Type{T}, ks::Tuple) where {T} =
+    FlowTransformBindings.wavenumber_arrays(proto, T, ks)
+
+# The mean, the harmonic part on a periodic box, from `ûa` into `harma`: the first slot of every
+# FlowTransformBindings axis. A mode at an even axis's Nyquist slot has a zero derivative symbol but is
+# not the mean, and stays with the rotational part. On plain vectors, where `k2` vanishes.
+function _harmonic!(harma, ûa, ::Tuple{Vararg{FlowTransformBindings.AbstractWavenumberAxis}}, k2)
+    fill!(harma, zero(eltype(harma)))
+    first_slot = ntuple(_ -> 1:1, ndims(harma))
+    view(harma, first_slot...) .= view(ûa, first_slot...)
+    return harma
 end
+_harmonic!(harma, ûa, ::Tuple, k2) = (harma .= ifelse.(iszero.(k2), ûa, zero(eltype(harma))); harma)
 
 """
     helmholtz_project_spectral!(û_rot, û_div, û_harm, velocity_hat, ks::NTuple{N})
 
 In-place Leray projection. `velocity_hat` and the three outputs are component-last spectral
-arrays of size `(kdims..., N)`; `ks` holds the per-axis wavenumber vectors. Writes the
-rotational (divergence-free) part into `û_rot`, the divergent (curl-free) part into `û_div`,
-and the `k = 0` mode into `û_harm`, so that the three sum to `velocity_hat`.
-
-The `k = 0` mode is separated rather than left in `û_rot` because a constant field is both
-curl-free and divergence-free: it is the harmonic part, not the rotational one.
-GPU-compatible (pure broadcast).
+arrays of size `(kdims..., N)`. `ks` holds the per-axis wavenumbers: FlowTransformBindings axes
+(`FlowTransformBindings.wavenumber_axes`), on which the projection takes the derivative wavenumber, or
+plain vectors, used as given. Writes the rotational (divergence-free) part into `û_rot`, the divergent
+(curl-free) part into `û_div`, and the `k = 0` mode, the harmonic part, into `û_harm`, so that the
+three sum to `velocity_hat`.
 """
 function helmholtz_project_spectral!(û_rot, û_div, û_harm, velocity_hat, ks::NTuple{N,Any}) where {N}
     T = real(eltype(velocity_hat))
-    CT = complex(T)
-    K = ntuple(d -> _reshape_k(T.(ks[d]), d, Val(N)), Val(N))
+    K = _derivative_symbol(velocity_hat, T, ks)
 
     k2 = K[1] .^ 2
     for d in 2:N
@@ -106,7 +112,7 @@ function helmholtz_project_spectral!(û_rot, û_div, û_harm, velocity_hat, ks::
         rota = comp(û_rot, a)
         harma = comp(û_harm, a)
         @. diva = K[a] * kdotu * inv_k2
-        @. harma = ifelse(k2 == zero(T), ûa, zero(CT))
+        _harmonic!(harma, ûa, ks, k2)
         @. rota = ûa - diva - harma
     end
     return nothing
@@ -118,12 +124,13 @@ end
 Compute the spectral scalar velocity potential `χ_hat` (size `(kdims...)`) and the
 rotation-potential components `R_hat` (component-last, size `(kdims..., P)`, `P = N(N-1)/2`)
 from a component-last spectral velocity array. Uses the spectral Poisson inverses
-`χ̂ = −i (k·û)/k²` and `R̂_ab = −i (k_a û_b − k_b û_a)/k²`, with the `k = 0` mode set to zero.
+`χ̂ = −i (k·û)/k²` and `R̂_ab = −i (k_a û_b − k_b û_a)/k²`, with the `k = 0` mode set to zero; `ks`
+as in [`helmholtz_project_spectral!`](@ref).
 """
 function helmholtz_potentials_spectral(velocity_hat::AbstractArray, ks::NTuple{N,Any}) where {N}
     T = real(eltype(velocity_hat))
     CT = Complex{T}
-    K = ntuple(d -> _reshape_k(T.(ks[d]), d, Val(N)), Val(N))
+    K = _derivative_symbol(velocity_hat, T, ks)
     k2 = K[1] .^ 2
     for d in 2:N
         k2 = k2 .+ K[d] .^ 2
@@ -193,22 +200,15 @@ end
 """
     _grid_wavenumbers(velocity_hat, grid) -> NTuple{N}
 
-Reconstruct the per-axis angular wavenumber vectors for a component-last spectral array
-on a Cartesian grid. Axis 1 is treated as an `rfft` axis when its spectral length equals
-`N₁÷2 + 1`, otherwise as a full `fft` axis.
+The FlowTransformBindings wavenumber axes of a component-last spectral array on a Cartesian grid:
+axis 1 halved (`rfft`) when its spectral length is `N₁÷2 + 1`, every axis full otherwise.
 """
 function _grid_wavenumbers(velocity_hat::AbstractArray{<:Complex}, grid::FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,N}) where {N,T}
     dims = size(grid)
-    kdims = size(velocity_hat)[1:N]
-    return ntuple(Val(N)) do d
-        Nd = dims[d]
-        L = Nd * abs(FlowGeometries.Grids.spacing(grid, d))
-        if d == 1 && kdims[1] == Nd ÷ 2 + 1
-            T[T(2π) * (i - 1) / L for i in 1:kdims[1]]
-        else
-            T[T(2π) * (i - 1 <= Nd ÷ 2 ? i - 1 : i - 1 - Nd) / L for i in 1:kdims[d]]
-        end
-    end
+    Ls = ntuple(d -> T(FlowGeometries.Grids.domain_length(grid, d)), Val(N))
+    return size(velocity_hat, 1) == dims[1] ÷ 2 + 1 ?
+           FlowTransformBindings.wavenumber_axes(Ls, dims, Val(true)) :
+           FlowTransformBindings.wavenumber_axes(Ls, dims, Val(false))
 end
 
 # ---------------------------------------------------------------------------
@@ -220,9 +220,9 @@ end
     helmholtz_decompose_spectral(u, v, grid; kwargs...)        # 2D convenience
     helmholtz_decompose_spectral(u, v, w, grid; kwargs...)     # 3D convenience
 
-Decompose a physical velocity field on `grid` using a spectral transform, returning a
-physical [`HelmholtzResult`](@ref) (CPU) — or, on the GPU path, a `(; u_rot, u_div, u_harm)`
-NamedTuple of `CuArray`s. Requires the appropriate extension (`using FFTW`,
+Decompose a physical velocity field on `grid` using a spectral transform: a physical
+[`HelmholtzResult`](@ref) on a periodic Cartesian grid, the named tuple `(; u_rot, u_div, u_harm)` from
+the scattered and spherical solvers. Requires the appropriate extension (`using FFTW`,
 `using FastSphericalHarmonics`, …). Pass `solver=` to select among loaded spectral backends.
 
 For raw spectral coefficients, use the lower-level [`helmholtz_project_spectral`](@ref).
@@ -245,8 +245,7 @@ end
 Resolve a spectral solver (extensions register them; `AutoSolver` picks the best available)
 and dispatch to the extension's `_decompose_spectral(solver, geometry, u, grid; …)`.
 Dispatching on the solver *type* lets several spectral backends (FFTW + FINUFFT, FSH +
-NUFSHT) coexist for the same geometry without method clashes. The CUDA extension overrides
-this for `CuArray` inputs to take the CUFFT path directly.
+NUFSHT) coexist for the same geometry without method clashes.
 """
 function _spectral_dispatch(u::AbstractArray, grid::FlowGeometries.Grids.AbstractGrid; solver::AbstractPoissonSolver = AutoSolver(), kwargs...)
     s = _resolve_spectral_solver(grid, solver)
@@ -296,7 +295,7 @@ function build_cartesian_result(grid::FlowGeometries.Grids.StructuredGrid{T,<:Fl
     proj = helmholtz_project_spectral(velocity_hat, ks)
     χ_hat, R_hat = helmholtz_potentials_spectral(velocity_hat, ks)
 
-    K = ntuple(d -> _reshape_k(T.(ks[d]), d, Val(N)), Val(N))
+    K = _derivative_symbol(velocity_hat, T, ks)
     comp(A, c) = _component(A, c, Val(N))
 
     # δ_hat = i k·û, accumulated in place rather than by rebinding — the rebinding form

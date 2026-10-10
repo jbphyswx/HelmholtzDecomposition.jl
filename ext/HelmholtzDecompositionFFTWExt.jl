@@ -2,8 +2,8 @@
     HelmholtzDecompositionFFTWExt — Cartesian spectral solver via FFTW (any dimension).
 
 Provides `O(N log N)` spectral Poisson solves and full Helmholtz decomposition for regular
-periodic Cartesian grids in 1D/2D/3D/ND using the real FFT: forward `rfft` → divide by
-`-Σ k_d²` → inverse `irfft`. Returns physical-space fields via `build_cartesian_result`.
+periodic Cartesian grids in 1D/2D/3D/ND using the real FFT: forward `rfft` → divide by the discrete
+Laplacian's symbol → inverse `irfft`. Returns physical-space fields via `build_cartesian_result`.
 """
 module HelmholtzDecompositionFFTWExt
 
@@ -11,6 +11,7 @@ using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using ComputationalBackends: ComputationalBackends as CB
 using FFTW: FFTW
 using FlowGeometries: FlowGeometries as FG
+using FlowTransformBindings: FlowTransformBindings as FTB
 using LinearAlgebra: LinearAlgebra
 # The periodic path goes through the `AbstractFFTs` interface rather than FFTW's own functions, so
 # it dispatches to whatever backend owns the array — CUFFT for a device array, FFTW for a host one
@@ -26,17 +27,6 @@ HD.supports_boundary(::HD.CartesianSpectralSolver, ::HD.AbstractBoundaryConditio
 HD.requires_full_domain(::HD.CartesianSpectralSolver) = true
 HD.requires_uniform_axes(::HD.CartesianSpectralSolver) = true
 HD.requires_periodic_domain(::HD.CartesianSpectralSolver) = true
-
-# Per-axis angular wavenumbers matching an rfft layout (axis 1 reduced).
-function _rfft_wavenumbers(::Type{T}, dims::NTuple{N,Int}, spacing::NTuple{N,T}) where {T,N}
-    return ntuple(Val(N)) do d
-        if d == 1
-            T(2π) .* AbstractFFTs.rfftfreq(dims[1], one(T) / spacing[1])
-        else
-            T(2π) .* AbstractFFTs.fftfreq(dims[d], one(T) / spacing[d])
-        end
-    end
-end
 
 """
     PeriodicSpectralState
@@ -122,7 +112,7 @@ function HD._decompose_spectral(
     backend = CB.SerialBackend(), kwargs...,
 ) where {T,M,N}
     dims = size(grid)
-    ks = _rfft_wavenumbers(T, dims, ntuple(d -> abs(FG.Grids.spacing(grid, d)), Val(N)))
+    ks = FTB.wavenumber_axes(ntuple(d -> T(FG.Grids.domain_length(grid, d)), Val(N)), dims, Val(true))
 
     # Forward transform each velocity component → component-last spectral array.
     ĉ1 = AbstractFFTs.rfft(HD._component(U, 1, Val(N)))

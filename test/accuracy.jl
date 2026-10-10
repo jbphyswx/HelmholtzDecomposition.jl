@@ -10,7 +10,9 @@ part at zero.
 using Test: Test
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using FlowGeometries: FlowGeometries as FG
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FFTW: FFTW
+using Random: Random
 
 include(joinpath(@__DIR__, "..", "reference_flows", "reference_flows.jl"))
 using .ReferenceFlows: ReferenceFlows
@@ -39,6 +41,40 @@ Test.@testset "spectral path is exact on its own basis" begin
     rr = HD.helmholtz_decompose_spectral(Ur, grid)
     Test.@test nrm(rr.u_div) / nrm(Ur) < 1e-12
     Test.@test maximum(abs.(rr.u_rot .+ rr.u_div .+ rr.u_harm .- Ur)) < 1e-12
+end
+
+# White noise fills every Nyquist slot. The first derivative of a real field is zero at an even axis's
+# Nyquist slot (Trefethen, *Spectral Methods in MATLAB*, ch. 3), and under that derivative `u_rot` is
+# divergence-free, `u_div` curl-free and the two orthogonal. Checked by full-length FFTs.
+Test.@testset "spectral path is exact at the Nyquist slots" begin
+    rng = Random.Xoshiro(3)
+    for dims in ((8, 6), (7, 6), (8, 5), (7, 5), (6, 4, 5))
+        N = length(dims)
+        Ls = ntuple(d -> 1.0 + d / 4, N)
+        xs = ntuple(d -> range(0.0, Ls[d] - Ls[d] / dims[d]; length = dims[d]), N)
+        grid = FG.Grids.StructuredGrid(CARTA, xs...; topology = ntuple(_ -> true, N), period = Ls)
+        U = randn(rng, dims..., N)
+        res = HD.helmholtz_decompose_spectral(U, grid)
+        K = FTB.wavenumber_arrays(zeros(dims), Float64, FTB.wavenumber_axes(Ls, dims, Val(false));
+                                  derivative = true)
+        comp(A, c) = selectdim(A, N + 1, c)
+        ûr = [FFTW.fft(comp(res.u_rot, c)) for c in 1:N]
+        ûd = [FFTW.fft(comp(res.u_div, c)) for c in 1:N]
+        scale = maximum(abs, FFTW.fft(comp(U, 1))) * maximum(k -> maximum(abs, k), K)
+        Test.@test maximum(abs, sum(K[c] .* ûr[c] for c in 1:N)) < 1e-12 * scale
+        for a in 1:N, b in (a + 1):N
+            Test.@test maximum(abs, K[a] .* ûd[b] .- K[b] .* ûd[a]) < 1e-12 * scale
+        end
+        Test.@test abs(sum(res.u_rot .* res.u_div)) < 1e-12 * sum(abs2, U)
+        # The harmonic part is the mean alone; a mode at Nyquist on every axis has a zero derivative
+        # symbol and stays in the rotational part.
+        V̂ = cat((FFTW.rfft(comp(U, c)) for c in 1:N)...; dims = N + 1)
+        p = HD.helmholtz_project_spectral(V̂, grid)
+        mean_slot = ntuple(_ -> 1, N)
+        Test.@test p.u_harm[mean_slot..., :] == V̂[mean_slot..., :]
+        Test.@test count(!iszero, p.u_harm) == count(!iszero, V̂[mean_slot..., :])
+        Test.@test p.u_rot .+ p.u_div .+ p.u_harm ≈ V̂ rtol = 1e-14
+    end
 end
 
 Test.@testset "Taylor-Green, an independent analytic field" begin
