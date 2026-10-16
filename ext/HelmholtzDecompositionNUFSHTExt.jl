@@ -1,20 +1,13 @@
-"""
-    HelmholtzDecompositionNUFSHTExt — spherical spectral Poisson solve via NUFSHT.
-
-Analysis → divide by `−ℓ(ℓ+1)/R²` → synthesis, on an arbitrary spherical node set.
-
-Analysis uses `NUFSHT.nusht_solve!`, not `nusht_type1!`. NUFSHT's own docstring is explicit that
-type 1 is the exact inverse of type 2 *only on the Clenshaw–Curtis grid*, and "at general scattered
-points it is only the adjoint — use `nusht_solve!` for exact inversion there". An arbitrary node
-set is the entire reason this extension exists, so using the adjoint would apply `A†` where `A⁻¹`
-is required — a wrong answer on precisely the grids it is meant to serve, and only on those, since
-the two coincide where the old tests happened to look.
-"""
+# Spherical Poisson solves and the spectral decomposition through NUFSHT, on any node set covering the
+# sphere: analysis, divide by `−ℓ(ℓ+1)/R²`, synthesis. The analysis is the least-squares fit
+# `NUFSHT.nusht_solve!`, the inverse of synthesis at any node set; `nusht_type1!` is its adjoint, the
+# inverse only on the Clenshaw–Curtis grid.
 module HelmholtzDecompositionNUFSHTExt
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using ComputationalBackends: ComputationalBackends as CB
 using FlowGeometries: FlowGeometries as FG
+using FlowTransformBindings: FlowTransformBindings as FTB
 using NUFSHT: NUFSHT
 
 """
@@ -39,7 +32,7 @@ end
 
 # The expansion is in spherical harmonics over the whole sphere, so the samples must cover it and
 # none may be masked out; a covering set has no boundary, making a boundary condition vacuous.
-HD.supports_boundary(::HD.SphericalNUSHTSolver, ::HD.AbstractBoundaryCondition) = true
+HD.supports_boundary(::HD.SphericalNUSHTSolver, ::FG.Operators.AbstractBoundaryCondition) = true
 HD.requires_full_domain(::HD.SphericalNUSHTSolver) = true
 
 """
@@ -54,10 +47,10 @@ concentrated off the sampled region are nearly invisible to the fit (the Slepian
 concentration problem). A regional patch is a boundary value problem, which the iterative solver
 handles.
 
-A rectilinear grid is judged geometrically: longitude wraps, and latitude reaches both poles to
-within one cell. The polar cap the samples leave is then smaller than the resolution and the metric
-closes it. One cell and no more — at two, a ±74.5° band passes, which is a regional patch. The
-largest cell sets the bar, so a stretched latitude axis is judged by its coarsest part.
+A rectilinear grid is judged geometrically: longitude wraps, and the outermost latitude lies within
+one and a half of the largest latitude spacing `Δ` of each pole. A cell-centred grid sits `Δ/2` from
+the pole and the dual grid of one sits `Δ`, so neither decision rests on a rounding; a ±74.5° band of
+16 rows sits `1.56Δ` from the poles and is a regional patch.
 
 Any other layout is a pixelization whose cells tile the sphere exactly, and there the total measure
 against `4πR²` is the statement — `Grids.measure` is lazy with `sum` specialised per layout, so it
@@ -72,7 +65,8 @@ function _covers_sphere(
     φ = FG.Grids.coordinates(grid, 2)
     lo, hi = extrema(φ)
     dφ = length(φ) > 1 ? T(FG.Grids.maximum_spacing(grid, 2)) : zero(T)
-    return (lo + T(π) / 2) <= dφ && (T(π) / 2 - hi) <= dφ
+    reach = 3 * dφ / 2
+    return (lo + T(π) / 2) <= reach && (T(π) / 2 - hi) <= reach
 end
 
 function _covers_sphere(
@@ -129,19 +123,16 @@ end
 """
     SphericalNUSHTState
 
-The NUFSHT plan with its nodes uploaded, the flattened right-hand side and output, and the
-coefficient array — `(lmax+1) × (2lmax+1)` in FastSphericalHarmonics' `sph_mode` layout, which is
-what `_divide_eigenvalues!` indexes.
+The NUFSHT plan with its nodes uploaded, the LSMR workspace its fit runs in, the flattened
+right-hand side and output, and the coefficient array — `(lmax+1) × (2lmax+1)` in
+FastSphericalHarmonics' `sph_mode` layout, which `_divide_eigenvalues!` indexes.
 
-**One per task.** Every buffer here is written during a solve and the plan carries internal scratch,
-so concurrent solves need one each.
-
-This is also where the plan is built, which keeps `NUFSHT.make_plan` off the parallel section: it
-reaches FastTransforms, whose plans come from FFTW's process-global planner. Plan-owning, hence the
-explicit `show`.
+One per task: every buffer here is written during a solve. It owns the plan's NUFFT plans, which
+[`close!`](@ref HelmholtzDecomposition.close!) releases.
 """
-struct SphericalNUSHTState{T,P,V<:AbstractVector{T},M<:AbstractMatrix{T}}
+struct SphericalNUSHTState{T,P,W,V<:AbstractVector{T},M<:AbstractMatrix{T}}
     plan::P
+    ws::W
     rhs::V
     out::V
     coeffs::M
@@ -152,9 +143,12 @@ end
 Base.show(io::IO, s::SphericalNUSHTState{T}) where {T} =
     print(io, "SphericalNUSHTState{", T, "}(", length(s.rhs), " nodes, lmax = ", s.lmax, ")")
 
+HD.close!(s::SphericalNUSHTState) = (NUFSHT.close!(s.plan); s)
+HD._close_state!(s::SphericalNUSHTState) = HD.close!(s)
+
 function HD.prepare_solver(solver::HD.SphericalNUSHTSolver,
                            grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2},
-                           ::HD.AbstractBoundaryCondition;
+                           ::FG.Operators.AbstractBoundaryCondition;
                            backend = CB.SerialBackend(), shared = nothing) where {T}
     nlon, nlat = size(grid)
     lmax = _resolve_lmax(solver, grid)
@@ -165,7 +159,7 @@ function HD.prepare_solver(solver::HD.SphericalNUSHTSolver,
     # NUFSHT's real specialization.
     plan = NUFSHT.make_plan(T, θ, Λ, lmax; tol = solver.tol, nufft = solver.nufft)
     rhs = Vector{T}(undef, nlon * nlat)
-    return SphericalNUSHTState(plan, rhs, similar(rhs),
+    return SphericalNUSHTState(plan, FTB.LSMRWorkspace(plan), rhs, similar(rhs),
                                zeros(T, lmax + 1, 2 * lmax + 1), lmax, R)
 end
 
@@ -174,10 +168,25 @@ function HD.solve_poisson!(
     RHS::AbstractMatrix{T},
     grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2},
     solver::HD.SphericalNUSHTSolver;
-    boundary::HD.AbstractBoundaryCondition = HD.Neumann(),
+    boundary::FG.Operators.AbstractBoundaryCondition = FG.Operators.Neumann(),
     state::SphericalNUSHTState = HD.prepare_solver(solver, grid, boundary),
     kwargs...,
 ) where {T<:AbstractFloat}
+    iters, resid, converged = _inverse!(Φ, RHS, grid, solver, state)
+    return HD.SolverResult{T}(converged, iters, T(resid))
+end
+
+function HD.spectral_inverse!(
+    Φ::AbstractMatrix{T}, RHS::AbstractMatrix{T},
+    grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2},
+    solver::HD.SphericalNUSHTSolver, state::SphericalNUSHTState,
+) where {T<:AbstractFloat}
+    _inverse!(Φ, RHS, grid, solver, state)
+    return Φ
+end
+
+# Fit, divide by the eigenvalues, synthesize. Returns the fit's iterations, residual and convergence.
+function _inverse!(Φ, RHS, grid, solver::HD.SphericalNUSHTSolver, state::SphericalNUSHTState{T}) where {T}
     nlon, nlat = size(grid)
     rhs, out, C = state.rhs, state.out, state.coeffs
     k = 0
@@ -185,17 +194,10 @@ function HD.solve_poisson!(
         k += 1
         rhs[k] = RHS[i, j]
     end
-
     fill!(C, zero(T))
-    # `nusht_solve!` inverts; `nusht_type1!` is the adjoint — see the module docstring.
-    _, iters, resid, converged =
-        NUFSHT.nusht_solve!(C, rhs, state.plan; rtol = solver.rtol, maxiter = solver.maxiter)
-    # An unconverged fit gives a smooth field that does not match the samples, with nothing in
-    # the output to say so.
-    converged || throw(ArgumentError(
-        "the spherical fit did not reach rtol=$(solver.rtol) in $(solver.maxiter) iterations " *
-        "(residual $(resid) after $(iters)). $(nlon * nlat) samples, $((state.lmax + 1)^2) " *
-        "coefficients at lmax=$(state.lmax); lower `lmax`, supply more nodes, or raise `maxiter`."))
+    # `nusht_solve!` inverts synthesis at any node set; `nusht_type1!` is its adjoint.
+    _, iters, resid, converged = NUFSHT.nusht_solve!(C, rhs, state.plan; ws = state.ws,
+                                                     rtol = solver.rtol, maxiter = solver.maxiter)
     _divide_eigenvalues!(C, state.lmax, state.radius)
     NUFSHT.nusht_type2!(out, C, state.plan)
     k = 0
@@ -203,7 +205,7 @@ function HD.solve_poisson!(
         k += 1
         Φ[i, j] = out[k]
     end
-    return HD.SolverResult{T}(true, iters, T(resid))
+    return iters, resid, converged
 end
 
 # ---------------------------------------------------------------------------
@@ -307,17 +309,25 @@ and leaves the choice with the caller.
 end
 
 """
-    _spin_hodge(solver, θ, Λ, uθ, uφ, lmax, T) -> (rot, div)
+    _spin_hodge(solver, θ, Λ, uθ, uφ, lmax, R, T) -> (rot, div, Φ, δ, fit)
 
-The spin±1 split at the nodes, each part returned as `(u_θ, u_φ)`.
+The spin±1 split at the nodes, each velocity part returned as `(u_θ, u_φ)`, with `Φ = χ + iψ` and
+`δ = ∇·u` at the nodes and the least converged of the two fits.
+
+With `ₛY_ℓm = N_ℓ d^ℓ_{m,−s}(θ) e^{imφ}` (NUFSHT's convention) and the Wigner-d derivative relations,
+`∇Y_ℓm` has `u_θ + i u_φ = L ₁Y_ℓm` and `u_θ − i u_φ = −L ₋₁Y_ℓm`, `L = √(ℓ(ℓ+1))`; `k̂ × ∇` multiplies
+both by `i`. So for `u = (∇χ + k̂×∇ψ)/R` the fits are `₊a = L(χ + iψ)/R` and `₋a = −L(χ − iψ)/R`: their
+mean is the rotational part and their half difference the divergent one, `χ + iψ = R ₊a/L`, and
+`∇·u = −L·(₊a − ₋a)/(2R)` per mode.
 """
-function _spin_hodge(solver::HD.SphericalNUSHTSolver, θ, Λ, uθ, uφ, lmax::Int, ::Type{T}) where {T}
+function _spin_hodge(solver::HD.SphericalNUSHTSolver, θ, Λ, uθ, uφ, lmax::Int, R, ::Type{T}) where {T}
     CT = Complex{T}
     _warn_underdetermined(lmax, length(θ), 1)
     Vp = uθ .+ im .* uφ
     Vm = uθ .- im .* uφ
     planp = NUFSHT.make_spin_plan(CT, θ, Λ, lmax, +1; tol = solver.tol, nufft = solver.nufft)
     planm = NUFSHT.make_spin_plan(CT, θ, Λ, lmax, -1; tol = solver.tol, nufft = solver.nufft)
+    plan0 = NUFSHT.make_spin_plan(CT, θ, Λ, lmax, 0; tol = solver.tol, nufft = solver.nufft)
     try
         shp = (lmax + 1, 2lmax + 1)
         ap = zeros(CT, shp)
@@ -326,18 +336,28 @@ function _spin_hodge(solver::HD.SphericalNUSHTSolver, θ, Λ, uθ, uφ, lmax::In
                                                   maxiter = solver.maxiter)
         _, iM, rm, okm = NUFSHT.nusht_solve_spin!(am, Vm, planm; rtol = solver.rtol,
                                                   maxiter = solver.maxiter)
-        (okp && okm) || throw(ArgumentError(
-            "the spin±1 fit did not reach rtol=$(solver.rtol) (spin +1: residual $rp after $ip; " *
-            "spin −1: residual $rm after $iM). $(length(θ)) nodes, $((lmax + 1)^2) coefficients " *
-            "at lmax=$lmax; lower `lmax`, supply more nodes, or raise `maxiter`."))
+        fit = HD._worst(HD.SolverResult{T}(okp, ip, T(rp)), HD.SolverResult{T}(okm, iM, T(rm)))
 
-        sym = (ap .+ am) ./ 2       # E-type: the rotational part
-        anti = (ap .- am) ./ 2      # B-type: the divergent part
+        sym = (ap .+ am) ./ 2       # the rotational part
+        anti = (ap .- am) ./ 2      # the divergent part
+        cΦ = similar(ap)
+        cδ = similar(ap)
+        @inbounds for ℓ in 0:lmax, m in (-ℓ):ℓ
+            I = NUFSHT.spin_coeff_index(ℓ, m, lmax)
+            L = sqrt(T(ℓ * (ℓ + 1)))
+            cΦ[I] = iszero(ℓ) ? zero(CT) : R * ap[I] / L
+            cδ[I] = -L * anti[I] / R
+        end
+        Φ = similar(Vp)
+        δ = similar(Vp)
+        NUFSHT.nusht_type2_spin!(Φ, cΦ, plan0)
+        NUFSHT.nusht_type2_spin!(δ, cδ, plan0)
         return (_spin_synthesize(sym, sym, planp, planm, Vp, Vm),
-                _spin_synthesize(anti, .-anti, planp, planm, Vp, Vm))
+                _spin_synthesize(anti, .-anti, planp, planm, Vp, Vm), Φ, real.(δ), fit)
     finally
         NUFSHT.close!(planp)
         NUFSHT.close!(planm)
+        NUFSHT.close!(plan0)
     end
 end
 
@@ -350,10 +370,11 @@ function _spin_synthesize(a_plus, a_minus, planp, planm, Vp, Vm)
 end
 
 """
-    _decompose_spectral(solver, geometry, U, grid)
+    _decompose_spectral(solver, geometry, U, grid) -> HelmholtzResult
 
 Helmholtz decomposition of a tangent velocity field on any spherical node set. `U` is
-component-last carrying `(u_east, u_north)`, and the three parts come back in that layout.
+component-last carrying `(u_east, u_north)`, and the parts come back in that layout. `S²` is simply
+connected, so `u_harm` is zero; the fit's residual at the nodes is `residual_fraction`.
 """
 function HD._decompose_spectral(
     solver::HD.SphericalNUSHTSolver,
@@ -367,18 +388,25 @@ function HD._decompose_spectral(
     nd = Val(ndims(grid))
     ue = reshape(HD._component(U, 1, nd), m)
     un = reshape(HD._component(U, 2, nd), m)
+    R = T(FG.Geometry.radius(FG.Grids.grid_geometry(grid)))
     # `θ̂` points south and `φ̂` east.
     lmax = _resolve_lmax(solver, grid)
-    (rotθ, rotφ), (divθ, divφ) = _spin_hodge(solver, θ, Λ, .-un, ue, lmax, T)
+    (rotθ, rotφ), (divθ, divφ), Φ, δ, fit = _spin_hodge(solver, θ, Λ, .-un, ue, lmax, R, T)
 
-    u_rot = similar(U, T, (size(grid)..., 2))
-    u_div = similar(U, T, (size(grid)..., 2))
-    copyto!(HD._component(u_rot, 1, nd), reshape(rotφ, size(grid)))
-    copyto!(HD._component(u_rot, 2, nd), reshape(.-rotθ, size(grid)))
-    copyto!(HD._component(u_div, 1, nd), reshape(divφ, size(grid)))
-    copyto!(HD._component(u_div, 2, nd), reshape(.-divθ, size(grid)))
-    u_harm = U .- u_rot .- u_div
-    return (; u_rot, u_div, u_harm)
+    sz = size(grid)
+    u_rot = similar(U, T, (sz..., 2))
+    u_div = similar(U, T, (sz..., 2))
+    copyto!(HD._component(u_rot, 1, nd), reshape(rotφ, sz))
+    copyto!(HD._component(u_rot, 2, nd), reshape(.-rotθ, sz))
+    copyto!(HD._component(u_div, 1, nd), reshape(divφ, sz))
+    copyto!(HD._component(u_div, 2, nd), reshape(.-divθ, sz))
+    u_harm = zero(u_rot)
+    χ = reshape(real.(Φ), sz)
+    ψ = reshape(imag.(Φ), sz)
+    divergence = reshape(δ, sz)
+    rfrac = HD._measure_ratio(U .- u_rot .- u_div, U, grid)
+    return HD.HelmholtzResult{2,1,T,typeof(u_rot),typeof(χ),Tuple{typeof(ψ)}}(
+        u_rot, u_div, u_harm, χ, (ψ,), divergence, zero(T), rfrac, fit, (fit,))
 end
 
 end # module

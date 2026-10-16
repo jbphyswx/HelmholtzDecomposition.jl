@@ -2,18 +2,18 @@
 
 ## The Commutativity Problem on the Sphere
 
-Aluie (2019, doi:10.1007/s13137-019-0123-9) proves that on the sphere S², filtering vector fields by converting to Cartesian components and filtering each as a scalar does **NOT** commute with differential operators:
+Aluie (2019, doi:10.1007/s13137-019-0123-9) proves that on the sphere S², filtering vector fields by converting to Cartesian components and filtering each as a scalar does not commute with differential operators:
 
 ```
 G * (∇·u) ≠ ∇·(G * u)    on S²
 G * (∇×u) ≠ ∇×(G * u)    on S²
 ```
 
-This means that filtering a divergence-free velocity field via Cartesian components does NOT produce a divergence-free filtered field.
+Filtering a divergence-free velocity field through its Cartesian components gives a filtered field that is in general not divergence-free.
 
 ## The Helmholtz Solution
 
-Aluie (2019, Section 7, Proposition 2) proves that the generalized convolution that DOES commute with derivatives is mathematically equivalent to:
+Aluie (2019, Section 7, Proposition 2) proves that the generalized convolution that commutes with derivatives is equivalent to:
 
 1. Decomposing u into scalar potentials: u → (ψ, χ, u_r)
 2. Filtering each scalar separately: ψ̄, χ̄, ū_r
@@ -38,11 +38,17 @@ dimension equal to the first Betti number `b₁` of the domain (the number of ho
 single-valued `ψ`/`χ` can represent.
 
 The decomposition is **not unique on a bounded domain** without boundary conditions. The
-"natural HHD" (Bhatia et al. 2013) fixes uniqueness and orthogonality by assigning the
-normal trace to `∇χ` (Neumann `∂χ/∂n = u·n̂`) and the tangential trace to `rot R`
-(Dirichlet `ψ = const` per boundary component). This package computes `h` as the residual
-`h = u − ∇χ − rot R` after the potential solves (`harmonic_fraction = ‖h‖/‖u‖` is reported),
-and detects topology with `count_holes` / `betti1_estimate`.
+natural HHD (Bhatia et al. 2013) fixes uniqueness and orthogonality by assigning the normal trace to
+`∇χ` (`∂χ/∂n = u·n̂`) and none to `rot R` (`R = 0` on every boundary component). Under `Neumann` this
+package computes that on a two-dimensional staggered grid: the divergent part carries the face
+velocity on every bounded edge, the rotation potential is zero on the corners the dual grid drops or
+masks, and `h = u − ∇χ − rot R` is formed on faces, where it is divergence-free, curl-free on every
+corner of the complex and of dimension the first Betti number. In three dimensions each rotation
+component is solved with its own dual Laplacian under `R = 0`, which is `curl ∘ δ` on a periodic
+Cartesian grid; on a bounded or curved one `h` is divergence-free and also carries that solve's
+departure from `curl ∘ δ`. `harmonic_fraction = ‖h‖/‖u‖` is the face-space ratio; `residual_fraction`
+is the share of the collocated field the face representation does not carry. `count_holes` counts the
+enclosed holes of a two-dimensional mask.
 
 ### N-dimensional potentials
 

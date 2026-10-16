@@ -110,17 +110,49 @@ const _CartesianGrid =
 const _SphericalGrid =
     FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry}
 
+# The Cartesian transforms divide by the discrete operator's symbol. The spherical ones divide by
+# `−ℓ(ℓ+1)/R²`, the continuous Laplacian's eigenvalue, and the scattered fit has no `L` at all.
+inverts_discrete_laplacian(::Union{CartesianSpectralSolver,CartesianBoundedSolver,
+                                   CartesianRealTransformSolver}) = true
+
+# The solvers with a `helmholtz_decompose_spectral` route.
+has_spectral_route(::AbstractPoissonSolver) = false
+has_spectral_route(::Union{CartesianSpectralSolver,CartesianNUFFTSolver,SphericalSpectralSolver,
+                           SphericalNUSHTSolver}) = true
+
+const _SphericalTransform = Union{SphericalSpectralSolver,SphericalNUSHTSolver}
+preconditions(::_SphericalTransform) = true
+# Both hold their transform state in host memory.
+supports_backend(::_SphericalTransform, backend) = backend isa _HostBackend
+supports_backend(::CartesianBoundedSolver, backend) = backend isa _HostBackend
+
+"""
+    _preconditioner_candidates(grid) -> Tuple
+
+The transforms [`AutoSolver`](@ref) tries as the preconditioner of [`CGSolver`](@ref) when no solver of
+[`_auto_candidates`](@ref) applies: on a spherical grid FastSphericalHarmonics, then NUFSHT.
+"""
+_preconditioner_candidates(::_SphericalGrid) = (SphericalSpectralSolver(), SphericalNUSHTSolver())
+_preconditioner_candidates(::FlowGeometries.Grids.AbstractGrid) = ()
+
 """
     _auto_candidates(grid) -> Tuple
 
-The solvers [`AutoSolver`](@ref) tries on `grid`, in order. On a Cartesian grid: the periodic
-FFT, FFTW's bounded transform, the bounded transform through any `AbstractFFTs` backend, then the
-scattered NUFFT. On a spherical grid: FastSphericalHarmonics, then NUFSHT. The first whose library
-is loaded and whose requirements the grid meets is taken, and the iterative [`CGSolver`](@ref)
-otherwise.
+The transform solvers [`AutoSolver`](@ref) tries for the staggered decomposition on `grid`, in
+order: on a Cartesian grid the periodic FFT, FFTW's bounded transform, then the bounded transform
+through any `AbstractFFTs` backend. Each inverts the discrete `L`. The first whose library is loaded
+and whose requirements the grid meets is taken, and the iterative [`CGSolver`](@ref) otherwise.
 """
-_auto_candidates(grid::_CartesianGrid) =
-    (CartesianSpectralSolver(), CartesianBoundedSolver(), CartesianRealTransformSolver(),
-     _auto_nufft_solver(grid))
-_auto_candidates(::_SphericalGrid) = (SphericalSpectralSolver(), SphericalNUSHTSolver())
+_auto_candidates(::_CartesianGrid) =
+    (CartesianSpectralSolver(), CartesianBoundedSolver(), CartesianRealTransformSolver())
 _auto_candidates(::FlowGeometries.Grids.AbstractGrid) = ()
+
+"""
+    _spectral_candidates(grid) -> Tuple
+
+The solvers [`helmholtz_decompose_spectral`](@ref) tries under `AutoSolver`, in order. Cartesian:
+the periodic FFT, then the scattered NUFFT. Spherical: FastSphericalHarmonics, then NUFSHT.
+"""
+_spectral_candidates(grid::_CartesianGrid) = (CartesianSpectralSolver(), _auto_nufft_solver(grid))
+_spectral_candidates(::_SphericalGrid) = (SphericalSpectralSolver(), SphericalNUSHTSolver())
+_spectral_candidates(::FlowGeometries.Grids.AbstractGrid) = ()

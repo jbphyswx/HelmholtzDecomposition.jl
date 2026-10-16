@@ -1,9 +1,9 @@
 """
 Spherical mixed flow (Kelvin–Ekman).
 
-A spherical flow with both rotational and divergent parts, on a lat–lon grid. `FastSphericalHarmonics`
-or `NUFSHT` give an `O(N log N)` spectral solve on a covering node set; this grid is not one of
-theirs, so it takes the multigrid-preconditioned iterative path.
+A spherical flow with both rotational and divergent parts, on a lat–lon grid, solved by
+multigrid-preconditioned conjugate gradients on the grid's own Laplacian. Loading `NUFSHT` makes its
+transform the preconditioner instead.
 """
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
@@ -29,4 +29,4 @@ println("Mean |u_rot|:          $(round(Statistics.mean(speed(result.u_rot)), si
 println("Mean |u_div|:          $(round(Statistics.mean(speed(result.u_div)), sigdigits = 4))")
 println("Harmonic fraction:     $(round(result.harmonic_fraction, sigdigits = 4))")
 println("χ solve:               $(result.χ_solve.iterations) iterations, converged = $(result.χ_solve.converged)")
-println("Reconstruction error:  $(round(maximum(abs.(result.u_rot .+ result.u_div .+ result.u_harm .- U)), sigdigits = 4))")
+println("Residual fraction:     $(round(result.residual_fraction, sigdigits = 4))")

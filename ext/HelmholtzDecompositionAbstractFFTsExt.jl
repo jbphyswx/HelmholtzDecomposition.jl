@@ -1,29 +1,15 @@
 """
     HelmholtzDecompositionAbstractFFTsExt — bounded and channel domains on any FFT backend.
 
-A DCT-II/DST-II **is** an FFT — of the even/odd extension — so the cosine and sine transforms that
-diagonalize the bounded Laplacian need no library beyond the `AbstractFFTs` interface. `FFTW.r2r`
-is a faster *host implementation* of them, not the only one, which is why this exists: through
-`AbstractFFTs` the same solver runs wherever the array's own backend provides a transform, with no
-vendor-specific code.
-
-The relations, each verified term by term against `FFTW.r2r` (see the plan's Stage 7a):
+A DCT-II/DST-II is an FFT of the even/odd extension, so the cosine and sine transforms that
+diagonalize the bounded Laplacian run on any array whose backend provides an `AbstractFFTs`
+transform:
 
     even extension y = [x; reverse(x)]      ⇒  DCT-II[k] = real( rfft(y)[k+1] · e^{-iπk/2N} )
     odd  extension y = [x; −reverse(x)]     ⇒  DST-II[k] = −imag( rfft(y)[k+2] · e^{-iπ(k+1)/2N} )
 
 and the inverse by reading the first backwards: rebuild `Z[k+1] = C[k]·e^{+iπk/2N}`, pad one zero
 to the `rfft` layout of a length-`2N` real signal, `brfft(Z, 2N)`, take the first `N` over `2N`.
-
-The `2N` extension is this form's cost, and it is not worth removing. The length-`N`
-pre-permutation variant (Makhoul) was implemented and measured: it matches `r2r` to 2e-16 including
-odd `N`, but runs at 1.03×/0.99× the extension form at 256²/512² — neutral. It halves the bytes and
-gives them back by reading with stride 2, where the extension fill is two contiguous copies.
-
-What remains, ~1.8× against `FFTW.r2r`, is inherent to building a cosine transform out of an FFT:
-any such construction materialises an intermediate, and `r2r` does the transform natively with
-none. That gap is only ever paid where `r2r` does not exist — a non-FFTW backend, or a device —
-which is exactly when this solver runs at all.
 """
 module HelmholtzDecompositionAbstractFFTsExt
 
@@ -33,15 +19,12 @@ using FlowGeometries: FlowGeometries as FG
 using AbstractFFTs: AbstractFFTs
 using LinearAlgebra: LinearAlgebra
 
-HD.supports_boundary(::HD.CartesianRealTransformSolver, ::HD.Dirichlet) = true
-HD.supports_boundary(::HD.CartesianRealTransformSolver, ::HD.Neumann) = true
+HD.supports_boundary(::HD.CartesianRealTransformSolver, ::FG.Operators.Dirichlet) = true
+HD.supports_boundary(::HD.CartesianRealTransformSolver, ::FG.Operators.Neumann) = true
 HD.requires_full_domain(::HD.CartesianRealTransformSolver) = true
 HD.requires_uniform_axes(::HD.CartesianRealTransformSolver) = true
 
-# `AbstractFFTs` is an interface, not an implementation: loading it does not mean a transform can be
-# planned, and packages pull it in without a backend. So capability is asked of the array type the
-# grid's own storage uses — asking it of `Array` would answer for the host while the solver ran on
-# a device.
+# Whether `AbstractFFTs` has a `plan_rfft` method for the grid's own storage type.
 @inline _has_backend(::Type{A}) where {A<:AbstractVector} =
     hasmethod(AbstractFFTs.plan_rfft, Tuple{A,UnitRange{Int}})
 
@@ -59,11 +42,9 @@ HD._sampling_message(::HD.CartesianRealTransformSolver, grid) =
 # Real path: every direction bounded
 # ---------------------------------------------------------------------------
 #
-# A cosine or sine transform of real data is real, so with no periodic direction nothing in the
-# pipeline ever needs to be complex — only the length-`2n` half-spectrum in between. Doing it in
-# the complex domain anyway, through the one-shot interface that plans and allocates per call,
-# measured 15-22x slower than `FFTW.r2r` and **176 MiB per solve** at 512². Plans and buffers held
-# here bring that to zero allocations, and this is the path a device takes, where `r2r` cannot go.
+# A cosine or sine transform of real data is real, so with no periodic direction only the
+# length-`2n` half-spectrum in between is complex. The plans and buffers live in the state, so a
+# solve allocates nothing.
 
 """
     DirPlan
@@ -83,8 +64,8 @@ function _dir_plan(::Type{T}, dims::Dims{N}, d::Int, off::Int, backend) where {T
     ext = HD._zeros(backend, T, ntuple(e -> e == d ? 2dims[e] : dims[e], Val(N)))
     spec = HD._zeros(backend, complex(T),
                              ntuple(e -> e == d ? dims[e] + 1 : dims[e], Val(N)))
-    return DirPlan(ext, spec, AbstractFFTs.plan_rfft(ext, d:d),
-                   AbstractFFTs.plan_brfft(spec, 2dims[d], d:d),
+    return DirPlan(ext, spec, AbstractFFTs.plan_rfft(ext, d:d; HD._plan_kwargs(ext, backend)...),
+                   AbstractFFTs.plan_brfft(spec, 2dims[d], d:d; HD._plan_kwargs(spec, backend)...),
                    _twiddle(T, dims[d], off, N, d, backend))
 end
 
@@ -159,10 +140,10 @@ Base.show(io::IO, ::MixedTopologyState{T,N}) where {T,N} =
 
 function HD.prepare_solver(::HD.CartesianRealTransformSolver,
                            grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
-                           boundary::HD.AbstractBoundaryCondition;
+                           boundary::FG.Operators.AbstractBoundaryCondition;
                            backend = CB.SerialBackend(), shared = nothing) where {T,N}
     dims = size(grid)
-    off = boundary isa HD.Dirichlet ? 1 : 0
+    off = boundary isa FG.Operators.Dirichlet ? 1 : 0
     per = ntuple(d -> FG.Grids.isperiodic(grid, d), Val(N))
     h = ntuple(d -> abs(FG.Grids.spacing(grid, d)), Val(N))
     work = HD._zeros(backend, T, dims)
@@ -178,16 +159,16 @@ function HD.prepare_solver(::HD.CartesianRealTransformSolver,
     dirs = map(d -> _dir_plan(T, dims, d, off, backend), bdims)
     spec = HD._zeros(backend, complex(T),
                              ntuple(e -> e == pdims[1] ? dims[e] ÷ 2 + 1 : dims[e], Val(N)))
-    pplan = AbstractFFTs.plan_rfft(work, pdims)
-    iplan = AbstractFFTs.plan_brfft(spec, dims[pdims[1]], pdims)
+    pplan = AbstractFFTs.plan_rfft(work, pdims; HD._plan_kwargs(work, backend)...)
+    iplan = AbstractFFTs.plan_brfft(spec, dims[pdims[1]], pdims; HD._plan_kwargs(spec, backend)...)
     λ = _axis_symbols(T, dims, size(spec), h, per, off, pdims[1], backend)
     nrm = T(prod(d -> dims[d], pdims))
     return MixedTopologyState{T,N,typeof(dirs),typeof(pplan),typeof(iplan),typeof(λ),typeof(work),
                               typeof(spec)}(dirs, bdims, pdims, pplan, iplan, λ, work, spec, nrm)
 end
 
-# x -> [x; ±reverse(x)] along `d`, into the preallocated buffer. `selectdim` with a descending
-# range is a view, where `reverse` would build the whole array.
+# x -> [x; ±reverse(x)] along `d`, into the preallocated buffer, reading `X` backwards through a
+# view.
 function _extend!(ext, X, d::Int, odd::Bool)
     n = size(X, d)
     copyto!(selectdim(ext, d, 1:n), X)
@@ -224,7 +205,7 @@ function _inverse_real!(X::AbstractArray{T}, dp::DirPlan, d::Int, odd::Bool) whe
 end
 
 function _solve!(Φ::AbstractArray{T,N}, RHS, st::RealBoundedState, boundary) where {T,N}
-    odd = boundary isa HD.Dirichlet
+    odd = boundary isa FG.Operators.Dirichlet
     copyto!(st.work, RHS)
     for d in 1:N
         _forward_real!(st.work, st.dirs[d], d, odd)
@@ -239,10 +220,9 @@ function _solve!(Φ::AbstractArray{T,N}, RHS, st::RealBoundedState, boundary) wh
 end
 
 # Bounded directions first, in real arithmetic; the periodic ones then take a single `rfft`, which
-# halves the first of them. Promoting everything to complex would double the spectral storage and
-# carry an imaginary part that is zero by construction.
+# halves the first of them.
 function _solve!(Φ::AbstractArray{T,N}, RHS, st::MixedTopologyState, boundary) where {T,N}
-    odd = boundary isa HD.Dirichlet
+    odd = boundary isa FG.Operators.Dirichlet
     copyto!(st.work, RHS)
     for (i, d) in enumerate(st.bdims)
         _forward_real!(st.work, st.dirs[i], d, odd)
@@ -269,16 +249,15 @@ end
 """
     solve_poisson!(Φ, RHS, grid, solver; boundary, state)
 
-`state` comes from [`prepare_solver`](@ref) and selects the implementation — positionally, on
-`_solve!`, because Julia does not dispatch on keyword arguments: two methods differing only in a
-keyword's type are the *same* method, and the second silently replaces the first.
+`state` comes from [`prepare_solver`](@ref) and selects the implementation through the positional
+`_solve!`.
 """
 function HD.solve_poisson!(
     Φ::AbstractArray{T,N},
     RHS::AbstractArray{T,N},
     grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
     solver::HD.CartesianRealTransformSolver;
-    boundary::HD.AbstractBoundaryCondition = HD.Neumann(),
+    boundary::FG.Operators.AbstractBoundaryCondition = FG.Operators.Neumann(),
     state = HD.prepare_solver(solver, grid, boundary),
     kwargs...,
 ) where {T<:AbstractFloat,N}

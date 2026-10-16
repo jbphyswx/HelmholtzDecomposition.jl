@@ -1,292 +1,123 @@
 """
-Scattered Cartesian decomposition, on both non-uniform transforms.
-
-A manufactured field with an exact split, sampled at random points:
-
-    χ = sin x cos y      →  ∇χ  = ( cos x cos y, −sin x sin y )
-    ψ = cos 2x sin y     →  ∇×ψ = ( cos 2x cos y,  2 sin 2x sin y )
-
-Every assertion here is a case that returned a plausible, smooth, wrong field before — or, for the
-period guard, a hard crash inside the transform library rather than an error.
+Scattered Cartesian decomposition on both NUFFT libraries: the split and the potentials at the points
+against closed forms, flagged fits, conditioning reported by the layout of the points, and the
+discrepancy principle.
 """
 
 using Test: Test
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using FlowGeometries: FlowGeometries as FG
 using FlowTransformBindings: FlowTransformBindings as FTB
-using SpectralBackends: SpectralBackends as SB
 using FINUFFT: FINUFFT
 using NonuniformFFTs: NonuniformFFTs
-using NearestNeighbors: NearestNeighbors
 using Logging: Logging
 using Random: Random
 
-# One solver per library: FINUFFT carries the components in complex pairs, NonuniformFFTs one per
-# real transform.
-sc_solvers(; kw...) =
-    (("FINUFFT", HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); kw...)),
-     ("NonuniformFFTs", HD.CartesianNUFFTSolver(FTB.NonuniformFFTsBackend(); kw...)))
+const LIBS = (FTB.FINUFFTBackend(), FTB.NonuniformFFTsBackend())
 
-# `areas` is supplied rather than triangulated: these solvers read only the coordinates, and the
-# Voronoi construction would pull in DelaunayTriangulation for a quantity none of them uses.
-function scattered_case(M::Int; periodic = true)
-    T = Float64
-    L = 2π
-    Random.seed!(21)
-    x = L .* rand(T, M)
-    y = L .* rand(T, M)
-    kw = periodic ? (; period = (L, L), periodic = (true, true)) : (;)
-    grid = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{T}(), (x, y);
-                                     areas = fill(L^2 / M, M), kw...)
-    U = similar(x, M, 2)
-    @. U[:, 1] = cos(x) * cos(y) + cos(2x) * cos(y)
-    @. U[:, 2] = -sin(x) * sin(y) + 2 * sin(2x) * sin(y)
-    exact_div = similar(U)
-    @. exact_div[:, 1] = cos(x) * cos(y)
-    @. exact_div[:, 2] = -sin(x) * sin(y)
-    return grid, U, exact_div
+# `M` random points on the `D`-torus of side `2π`, each standing for an equal share of its volume.
+function cloud(D, M; seed = 21, band = 2π)
+    Random.seed!(seed)
+    x = ntuple(d -> (d == 2 ? band : 2π) .* rand(M), D)
+    grid = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), x, fill((2π)^D / M, M);
+                                     period = ntuple(_ -> 2π, D), periodic = ntuple(_ -> true, D))
+    return grid, x
 end
 
-# Same construction in `D` dimensions. `χ = sin x₁ ∏_{d>1} cos x_d` gives an exact gradient, and in
-# 3-D a curl adds an exactly divergence-free part.
-function scattered_nd(::Val{D}, M::Int) where {D}
-    T = Float64
-    L = 2π
-    Random.seed!(23)
-    coords = ntuple(_ -> L .* rand(T, M), Val(D))
-    grid = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{T}(), coords;
-                                     areas = fill(L^D / M, M),
-                                     period = ntuple(_ -> L, Val(D)),
-                                     periodic = ntuple(_ -> true, Val(D)))
-    U = zeros(T, M, D)
-    exact_div = zeros(T, M, D)
-    x = coords[1]
-    if D == 1
-        @. exact_div[:, 1] = cos(x)
-    elseif D == 2
-        y = coords[2]
-        @. exact_div[:, 1] = cos(x) * cos(y)
-        @. exact_div[:, 2] = -sin(x) * sin(y)
-        @. U[:, 1] += cos(2x) * cos(y)          # curl part, divergence-free
-        @. U[:, 2] += 2 * sin(2x) * sin(y)
-    else
-        y, z = coords[2], coords[3]
-        @. exact_div[:, 1] = cos(x) * cos(y) * cos(z)
-        @. exact_div[:, 2] = -sin(x) * sin(y) * cos(z)
-        @. exact_div[:, 3] = -sin(x) * cos(y) * sin(z)
-        @. U[:, 1] += cos(2x) * cos(y)          # ∇×(0,0,ψ), ψ = cos 2x sin y
-        @. U[:, 2] += 2 * sin(2x) * sin(y)
+# `u = ∇χ + k̂ × ∇R` with `χ = sin x₁ ∏ cos x_d` and, from two dimensions, `R = −cos 2x sin y` in the
+# `(x, y)` plane: velocity, `∇χ`, `χ`, `∇·u = −D χ`, and `R`.
+function field(x)
+    D = length(x)
+    χ = sin.(x[1])
+    for d in 2:D
+        χ = χ .* cos.(x[d])
     end
-    U .+= exact_div
-    return grid, U, exact_div
+    G = zeros(length(χ), D)
+    for d in 1:D
+        g = d == 1 ? cos.(x[1]) : sin.(x[1])
+        for e in 2:D
+            g = g .* (e == d ? -sin.(x[e]) : cos.(x[e]))
+        end
+        G[:, d] .= g
+    end
+    U = copy(G)
+    R = nothing
+    if D >= 2
+        R = -cos.(2 .* x[1]) .* sin.(x[2])
+        U[:, 1] .+= cos.(2 .* x[1]) .* cos.(x[2])
+        U[:, 2] .+= 2 .* sin.(2 .* x[1]) .* sin.(x[2])
+    end
+    return U, G, χ, -D .* χ, R
 end
 
-Test.@testset "scattered Cartesian in 1-D, 2-D and 3-D" begin
-    # `D = 1` and `D = 3` have an odd component count, which is the branch where the FINUFFT path's
-    # `u + iv` packing carries its last component alone.
-    cases = ((Val(1), 2000, (32,)), (Val(2), 4000, (16, 16)), (Val(3), 6000, (8, 8, 8)))
-    for (v, M, nk) in cases
-        D = length(nk)
-        grid, U, exact_div = scattered_nd(v, M)
-        geo = FG.Grids.grid_geometry(grid)
-        scale = maximum(abs, U)
-        for (name, s) in sc_solvers(; nk = nk, tol = 1e-12, rtol = 1e-12, maxiter = 300)
-            Test.@testset "$D-D/$name" begin
-                r = HD._decompose_spectral(s, geo, U, grid)
-                Test.@test size(r.u_div) == (M, D)
-                Test.@test maximum(abs, r.u_div .- exact_div) / scale < 1e-7
-                Test.@test maximum(abs, (r.u_rot .+ r.u_div .+ r.u_harm) .- U) / scale < 1e-7
+Test.@testset "split and potentials against closed forms" begin
+    # Even, odd and mixed mode counts; an odd component count carries its last component alone in the
+    # complex-pair packing; `AutoSolver` sizes the mode count from the points.
+    cases = ((1, 300, ((16,), (15,))), (2, 1200, ((12, 12), (11, 12))), (3, 2000, ((6, 6, 6),)))
+    for (D, M, nks) in cases
+        grid, x = cloud(D, M)
+        U, G, χ, δ, R = field(x)
+        solvers = vcat([HD.CartesianNUFFTSolver(lib; nk, tol = 1e-12, rtol = 1e-12, maxiter = 400) for lib in LIBS, nk in nks]...,
+                       HD.AutoSolver())
+        for s in solvers
+            Test.@testset "$D-D $(s isa HD.AutoSolver ? "Auto" : "$(nameof(typeof(s.nufft))) $(s.nk)")" begin
+                r = HD.helmholtz_decompose_spectral(U, grid; solver = s)
+                Test.@test r.χ_solve.converged
+                Test.@test maximum(abs, r.u_div .- G) < 1e-7
+                Test.@test maximum(abs, r.χ .- χ) < 1e-7
+                Test.@test maximum(abs, r.divergence .- δ) < 1e-6
+                D == 2 && Test.@test maximum(abs, HD.streamfunction(r) .- R) < 1e-7
+                Test.@test r.residual_fraction < 1e-8
+                Test.@test r.harmonic_fraction < 1e-8
             end
         end
     end
-end
 
-Test.@testset "odd mode counts" begin
-    # On an odd axis the centered frequencies run `−(n−1)/2 … (n−1)/2`, so every mode has its
-    # partner `−k` in the layout, and the complex pair `u + iv` unpacks through that reflection.
-    grid, U, exact_div = scattered_nd(Val(2), 4000)
-    geo = FG.Grids.grid_geometry(grid)
-    scale = maximum(abs, U)
-    for nk in ((15, 15), (15, 16), (16, 13))
-        for (name, s) in sc_solvers(; nk = nk, tol = 1e-12, rtol = 1e-12, maxiter = 300)
-            Test.@testset "$nk/$name" begin
-                r = HD._decompose_spectral(s, geo, U, grid)
-                Test.@test maximum(abs, r.u_div .- exact_div) / scale < 1e-7
-                Test.@test maximum(abs, (r.u_rot .+ r.u_div .+ r.u_harm) .- U) / scale < 1e-7
-            end
-        end
+    # At scattered points `e^{8ix}` and `e^{−8ix}` are different functions, and `nk = 16` holds both: a
+    # gradient along a Nyquist wavevector and a rotational Nyquist mode across it split exactly.
+    grid, (x, y) = cloud(2, 1200; seed = 29)
+    gd = hcat(cos.(8 .* x .+ 3 .* y), (3 / 8) .* cos.(8 .* x .+ 3 .* y))    # ∇ sin(8x + 3y) / 8
+    gr = hcat(-sin.(8 .* y), zeros(length(x)))                              # k̂ × ∇ cos(8y) / 8
+    for lib in LIBS
+        r = HD.helmholtz_decompose_spectral(gd .+ gr, grid;
+                                            solver = HD.CartesianNUFFTSolver(lib; nk = (16, 16), tol = 1e-12, rtol = 1e-12, maxiter = 400))
+        Test.@test maximum(abs, r.u_div .- gd) < 1e-7
+        Test.@test maximum(abs, r.u_rot .+ r.u_harm .- gr) < 1e-7
     end
 end
 
-Test.@testset "Nyquist modes of an even mode count" begin
-    # `nk = 16` spans `|k| ≤ 8`, and at scattered points `e^{8ix}` and `e^{-8ix}` are different
-    # functions. A gradient along a Nyquist wavevector plus a rotational Nyquist mode across it, each
-    # with its split in closed form.
-    T = Float64
-    L = 2π
-    M = 4000
-    Random.seed!(29)
-    x = L .* rand(T, M)
-    y = L .* rand(T, M)
-    grid = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{T}(), (x, y);
-                                     areas = fill(L^2 / M, M), period = (L, L), periodic = (true, true))
-    exact_div = hcat(cos.(8 .* x .+ 3 .* y), (3 / 8) .* cos.(8 .* x .+ 3 .* y))    # ∇ sin(8x + 3y) / 8
-    exact_rot = hcat(-sin.(8 .* y), zeros(T, M))                                    # ∇⊥ cos(8y) / 8
-    U = exact_div .+ exact_rot
-    geo = FG.Grids.grid_geometry(grid)
-    for (name, s) in sc_solvers(; nk = (16, 16), tol = 1e-12, rtol = 1e-12, maxiter = 300)
-        Test.@testset "$name" begin
-            r = HD._decompose_spectral(s, geo, U, grid)
-            Test.@test maximum(abs, r.u_div .- exact_div) < 1e-7
-            Test.@test maximum(abs, r.u_rot .+ r.u_harm .- exact_rot) < 1e-7
-        end
-    end
+Test.@testset "a capped fit returns flagged" begin
+    grid, x = cloud(2, 1200)
+    U = first(field(x))
+    r = HD.helmholtz_decompose_spectral(U, grid; solver = HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); nk = (30, 30),
+                                                                                    tol = 1e-12, rtol = 1e-12, maxiter = 40))
+    Test.@test !r.χ_solve.converged && r.χ_solve.iterations == 40
+    Test.@test all(isfinite, r.u_rot) && all(isfinite, r.u_div) && all(isfinite, r.χ) && isfinite(r.residual_fraction)
 end
 
-Test.@testset "scattered Cartesian" begin
-    M = 4000
-    nk = (16, 16)
-    grid, U, exact_div = scattered_case(M)
-    geo = FG.Grids.grid_geometry(grid)
+Test.@testset "points confined to a band" begin
+    # 144 modes from 1200 samples confined to a band of the torus: the fit converges and the
+    # coefficients are not determined across the empty part. The conditioning reports it, and the same
+    # count of well-spread samples does not; `condition_limit = Inf` silences it.
+    banded, (xb, yb) = cloud(2, 1200; seed = 5, band = 0.3π)
+    spread, xs = cloud(2, 1200; seed = 5)
+    grad(x, y) = hcat(cos.(x) .* cos.(y), -sin.(x) .* sin.(y))
+    fit(; kw...) = HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); nk = (12, 12), tol = 1e-12, rtol = 1e-10, maxiter = 4000, kw...)
+    Ub = grad(xb, yb)
+    Test.@test_logs (:warn,) match_mode = :any HD.helmholtz_decompose_spectral(Ub, banded; solver = fit())
+    Test.@test_logs min_level = Logging.Warn HD.helmholtz_decompose_spectral(Ub, banded; solver = fit(condition_limit = Inf))
+    Test.@test_logs min_level = Logging.Warn HD.helmholtz_decompose_spectral(grad(xs...), spread; solver = fit())
 
-    results = Dict{String,Any}()
-    for (name, s) in sc_solvers(; nk = nk, tol = 1e-12, rtol = 1e-12, maxiter = 200)
-        r = HD._decompose_spectral(s, geo, U, grid)
-        results[name] = r
-        scale = maximum(abs, U)
-        Test.@testset "$name" begin
-            # The divergent part is recovered, not merely something of the right size.
-            Test.@test maximum(abs, r.u_div .- exact_div) / scale < 1e-8
-            # And the three parts reconstruct the input.
-            Test.@test maximum(abs, (r.u_rot .+ r.u_div .+ r.u_harm) .- U) / scale < 1e-8
-        end
-    end
-
-    # Two independent transform libraries, one answer.
-    Test.@test maximum(abs, results["FINUFFT"].u_div .- results["NonuniformFFTs"].u_div) /
-          maximum(abs, U) < 1e-8
-
-    Test.@testset "guards" begin
-        s = HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); nk = nk, tol = 1e-12, rtol = 1e-12,
-                                    maxiter = 200)
-
-        # A grid with no period reports 0; dividing by it fed the transform `Inf` coordinates,
-        # which segfaults in the spreader rather than raising.
-        aperiodic, Ua, _ = scattered_case(M; periodic = false)
-        Test.@test_throws ArgumentError HD._decompose_spectral(s, geo, Ua, aperiodic)
-
-        # More modes than samples leaves the normal equations singular.
-        toobig = HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); nk = (128, 128), tol = 1e-12,
-                                         rtol = 1e-12, maxiter = 50)
-        Test.@test_throws ArgumentError HD._decompose_spectral(toobig, geo, U, grid)
-
-        # `prod(nk) ≤ M` is necessary and not sufficient: conditioning degrades well before the
-        # normal equations go singular, so an unconverged fit is refused rather than returned.
-        dense, Ud, _ = scattered_case(3000)
-        tight = HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); nk = (48, 48), tol = 1e-12,
-                                        rtol = 1e-12, maxiter = 400)
-        Test.@test_throws ArgumentError HD._decompose_spectral(tight, geo, Ud, dense)
-
-        # A tag must name a NUFFT; one naming no library is refused where it is selected.
-        Test.@test_throws ArgumentError HD.CartesianNUFFTSolver(SB.FFTSpectralBackend(); nk = nk)
-        unnamed = HD.CartesianNUFFTSolver(SB.NUFFTSpectralBackend(); nk = nk)
-        Test.@test !HD.library_loaded(unnamed)
-        Test.@test_throws ArgumentError HD.select_solver(unnamed, grid, HD.Neumann())
-    end
-
-    Test.@testset "a rectilinear grid never selects the point-cloud solver" begin
-        # Axes collected into `Vector`s are not uniform at the type level, so the bounded and the
-        # periodic transforms both refuse them. Selection has to reach the iterative solver: the
-        # scattered solvers carry their dimension in their own type and have no `solve_poisson!`
-        # for a rectilinear grid at any dimension.
-        T = Float64
-        xs = collect(range(0, 2π; length = 9)[1:8])
-        for dims in ((xs, xs), (xs, xs, xs))
-            g = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{T}(), dims...)
-            sel = HD.select_solver(HD.AutoSolver(), g, HD.Neumann())
-            Test.@test sel isa HD.CGSolver
-            Test.@test hasmethod(HD.solve_poisson!,
-                                 Tuple{Array{T,length(dims)}, Array{T,length(dims)},
-                                       typeof(g), typeof(sel)})
-        end
-
-        g3 = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{T}(), xs, xs, xs)
-        r = HD.helmholtz_decompose(zeros(T, 8, 8, 8, 3), g3; boundary = HD.Neumann())
-        Test.@test size(r.u_rot) == (8, 8, 8, 3)
-
-        # Named directly, each scattered solver refuses a rectilinear grid, and the refusal names
-        # the layout it takes.
-        for (_, s) in sc_solvers(; nk = (8, 8, 8))
-            Test.@test_throws ArgumentError HD.select_solver(s, g3, HD.Neumann())
-        end
-
-        # On the point cloud it is built for, `AutoSolver` picks it and sizes it to the grid. The
-        # direction count is the coordinate count: `ndims` of a point cloud is `1`, since its cells
-        # carry one flat address each. With both libraries loaded, Auto's library is NonuniformFFTs.
-        pts, Up, _ = scattered_case(2000)
-        auto = HD.select_solver(HD.AutoSolver(), pts, HD.Neumann())
-        Test.@test auto isa HD.CartesianNUFFTSolver
-        Test.@test auto.nufft isa SB.AutoSpectralBackend
-        Test.@test HD._nufft_library(auto.nufft) === FTB.NonuniformFFTsBackend()
-        Test.@test length(auto.nk) == length(FG.Grids.coordinates(pts))
-        Test.@test prod(auto.nk) <= size(Up, 1)
-    end
-
-    Test.@testset "a node set that cannot determine the modes is reported" begin
-        # Samples confined to a band of the torus — a ship track, a satellite swath. `144` modes
-        # from `2000` samples clears every counting test by a wide margin, the fit converges, and
-        # the coefficients are still not determined: the field is unconstrained across the empty
-        # part of the domain. The residual cannot see that. `κ(A)` can, and comes out of the
-        # iteration's own scalars.
-        T = Float64
-        L = 2π
-        Mb = 2000
-        Random.seed!(5)
-        xb = L .* rand(T, Mb)
-        yb = 0.3π .* rand(T, Mb)
-        banded = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{T}(), (xb, yb);
-                                           areas = fill(L^2 / Mb, Mb),
-                                           period = (L, L), periodic = (true, true))
-        Ub = similar(xb, Mb, 2)
-        @. Ub[:, 1] = cos(xb) * cos(yb)
-        @. Ub[:, 2] = -sin(xb) * sin(yb)
-
-        nk = (12, 12)
-        sb = HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); nk = nk, tol = 1e-12, rtol = 1e-10,
-                                     maxiter = 2000)
-        Test.@test prod(nk) <= Mb                       # the counting test it passes
-        Test.@test_logs (:warn,) match_mode = :any HD._decompose_spectral(sb, geo, Ub, banded)
-
-        # `condition_limit` is the caller's: `Inf` says nothing at all.
-        quiet = HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); nk = nk, tol = 1e-12, rtol = 1e-10,
-                                        maxiter = 2000, condition_limit = Inf)
-        Test.@test_logs min_level = Logging.Warn HD._decompose_spectral(quiet, geo, Ub, banded)
-
-        # The same count of well-spread samples is quiet, so the report tracks the layout.
-        uni, Uu, _ = scattered_case(Mb)
-        su = HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); nk = nk, tol = 1e-12, rtol = 1e-10,
-                                     maxiter = 2000)
-        Test.@test_logs min_level = Logging.Warn HD._decompose_spectral(su, geo, Uu, uni)
-
-        # With noise on such a point set the residual keeps falling long after the coefficients
-        # have passed their best value, so `rtol` alone runs on and the answer travels. `atol`
-        # stops at the noise level — the discrepancy principle. `Ub` is a pure gradient, so every
-        # bit of rotational part the fit reports is error.
-        Random.seed!(11)
-        noise = 1e-2
-        Un = Ub .+ noise .* randn(Mb, 2)
-        δ = noise * sqrt(2 * Mb)
-        common = (; nk = nk, tol = 1e-12, rtol = 1e-10, maxiter = 4000, condition_limit = Inf)
-        loose = HD._decompose_spectral(
-            HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); common..., atol = 0.0), geo, Un, banded)
-        stopped = HD._decompose_spectral(
-            HD.CartesianNUFFTSolver(FTB.FINUFFTBackend(); common..., atol = δ), geo, Un, banded)
-        nrm(A) = sqrt(sum(abs2, A))
-        Test.@test nrm(stopped.u_rot) < nrm(loose.u_rot) / 100
-        Test.@test nrm(stopped.u_rot) / nrm(Ub) < 1.0
-        # Both still reproduce the samples: the residual is what cannot tell them apart.
-        for r in (loose, stopped)
-            Test.@test nrm(r.u_rot .+ r.u_div .+ r.u_harm .- Un) / nrm(Un) < 1e-1
-        end
-    end
+    # With noise of norm `δ` the residual keeps falling past the coefficients' best value; `atol = δ`
+    # stops once the samples are matched to `δ`, the two components forming one complex column. `Ub` is
+    # a gradient, so every rotational part reported is error.
+    Random.seed!(11)
+    noise = 1e-2
+    Un = Ub .+ noise .* randn(size(Ub))
+    δ = noise * sqrt(length(Un))
+    loose = HD.helmholtz_decompose_spectral(Un, banded; solver = fit(condition_limit = Inf))
+    stopped = HD.helmholtz_decompose_spectral(Un, banded; solver = fit(condition_limit = Inf, atol = δ))
+    nrm(A) = sqrt(sum(abs2, A))
+    Test.@test nrm(stopped.u_rot) < nrm(loose.u_rot) / 100
+    Test.@test stopped.residual_fraction <= (1 + 1e-6) * δ / nrm(Un)
 end

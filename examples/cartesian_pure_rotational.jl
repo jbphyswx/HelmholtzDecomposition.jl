@@ -1,9 +1,9 @@
 """
 Cartesian pure rotational field (Taylor–Green vortex).
 
-A purely rotational field decomposes with a near-zero divergent component. The residue that
-appears in `u_harm` is the two collocated↔staggered averaging hops, and it converges at second
-order — it is discretisation, not topology.
+A purely rotational field decomposes with a near-zero divergent component. Its mean is zero, so its
+harmonic part is zero; `residual_fraction`, the share of the field the collocated↔staggered round
+trip does not carry, falls at second order.
 """
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
@@ -26,5 +26,6 @@ for N in (32, 64, 128)
     result = HD.helmholtz_decompose(U, grid)
     ratio = maximum(speed(result.u_div)) / maximum(speed(U))
     println("N=$N  |u_div|/|u| = $(round(ratio, sigdigits = 3))   " *
-            "harmonic fraction = $(round(result.harmonic_fraction, sigdigits = 3))")
+            "harmonic fraction = $(round(result.harmonic_fraction, sigdigits = 3))   " *
+            "residual fraction = $(round(result.residual_fraction, sigdigits = 3))")
 end

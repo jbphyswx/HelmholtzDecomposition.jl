@@ -1,8 +1,8 @@
 """
 3-D mixed decomposition (ABC + gradient).
 
-A field with both a solenoidal (ABC) and a divergent (gradient) part. Both come out nonzero and
-`u_rot + u_div + u_harm` reconstructs the field.
+A field with both a solenoidal (ABC) and a divergent (gradient) part. Both come out nonzero, and
+`residual_fraction` is the share of the field the staggered split does not carry.
 """
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
@@ -32,4 +32,4 @@ println("=== 3-D mixed (ABC + gradient) ===")
 println("Max |u_rot|:           $(round(maximum(mag(result.u_rot)), sigdigits = 4))")
 println("Max |u_div|:           $(round(maximum(mag(result.u_div)), sigdigits = 4))")
 println("Harmonic fraction:     $(round(result.harmonic_fraction, sigdigits = 4))")
-println("Reconstruction error:  $(round(maximum(abs.(result.u_rot .+ result.u_div .+ result.u_harm .- U)), sigdigits = 4))")
+println("Residual fraction:     $(round(result.residual_fraction, sigdigits = 4))")

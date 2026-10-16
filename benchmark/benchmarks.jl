@@ -142,12 +142,9 @@ function _masked(n)
                                    range(0.0, 1.0; length = n); mask = m)
 end
 
-# Clenshaw–Curtis node positions, which is the node set the spherical transform is defined on.
-function _clenshaw_curtis(nlat)
-    ax = FG.SphericalSampling.spherical_axes(Float64, FG.SphericalSampling.ClenshawCurtisSampling(),
-                                             nlat)
-    return FG.Grids.StructuredGrid(SPH, ax.λ, ax.φ)
-end
+# The Clenshaw–Curtis grid, the node set the spherical transform is defined on, its longitude periodic.
+_clenshaw_curtis(nlat) =
+    FG.Connectivity.structured_grid(FG.SphericalSampling.ClenshawCurtisSampling(), nlat; geometry = SPH)
 
 # Longitude as a range, so its uniformity is provable from the axis type.
 function _latlon(nlat)
@@ -166,7 +163,7 @@ end
 
 Plan, workspace and steady-state cost of one decomposition, plus the plan's footprint.
 """
-function structured_case(label, grid; boundary = HD.Neumann(), solver = HD.AutoSolver(),
+function structured_case(label, grid; boundary = FG.Operators.Neumann(), solver = HD.AutoSolver(),
                          backend = CB.SerialBackend())
     N = ndims(grid)
     plan = HD.plan_helmholtz(grid; boundary, solver, backend)
@@ -192,7 +189,7 @@ number to read is `call / nfields` against the single-field `call` above.
 """
 function batch_case(label, grid, nfields::Int; backend = CB.SerialBackend())
     N = ndims(grid)
-    plan = HD.plan_helmholtz(grid; boundary = HD.Neumann(), backend = CB.SerialBackend())
+    plan = HD.plan_helmholtz(grid; boundary = FG.Operators.Neumann(), backend = CB.SerialBackend())
     Random.seed!(12)
     fields = [randn(size(grid)..., N) for _ in 1:nfields]
     batch = HD.allocate_batch(plan, nfields)
@@ -265,7 +262,7 @@ function suite(set::Symbol)
     structured_case("bounded $(n2)²", _bounded(n2, 2))
     structured_case("periodic $(n2)²", _periodic(n2, 2))
     structured_case("masked $(n2)²", _masked(n2))
-    structured_case("bounded $(n2)², Dirichlet", _bounded(n2, 2); boundary = HD.Dirichlet())
+    structured_case("bounded $(n2)², Dirichlet", _bounded(n2, 2); boundary = FG.Operators.Dirichlet())
     structured_case("masked $(n2)², jacobi", _masked(n2); solver = HD.CGSolver(; multigrid = false))
     println()
 

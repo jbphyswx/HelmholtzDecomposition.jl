@@ -39,9 +39,8 @@ function _gather!(A, nf::Int, nranks::Int, rank::Int, comm)
     return A
 end
 
-# `N`, `P` and `T` come from the plan, not the batch: parameterising `HelmholtzBatch` here would
-# make this method and the generic refusal mutually ambiguous, since the batch's later parameters
-# are themselves constrained by `T`.
+# `N`, `P` and `T` are read from the plan. `HelmholtzBatch`'s later parameters are constrained by
+# `T`, so a method parameterising the batch is ambiguous with the generic refusal.
 function HD._decompose_batch!(
     b::ComputationalBackends.AbstractMPIBackend, batch::HD.HelmholtzBatch, fields,
     plan::HD.HelmholtzPlan{N,P,T}; kwargs...,
@@ -68,6 +67,7 @@ function HD._decompose_batch!(
         _gather!(A, nf, nranks, rank, comm)
     end
     _gather!(batch.harmonic_fraction, nf, nranks, rank, comm)
+    _gather!(batch.residual_fraction, nf, nranks, rank, comm)
 
     # The convergence diagnostics are structs, so they ride in one scalar buffer: `converged`,
     # `iterations` and `residual` for the primal solve and each of the `P` dual ones.

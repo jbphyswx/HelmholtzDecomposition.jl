@@ -29,7 +29,7 @@ end
 fields = [mkfield(s) for s in (1.0, 2.0, 0.5, 1.5, 0.8)]
 
 # One plan for the whole batch; every rank builds the same one and each takes its own workspace.
-plan = HD.plan_helmholtz(grid; boundary = HD.Dirichlet(), backend = CB.SerialBackend())
+plan = HD.plan_helmholtz(grid; boundary = FG.Operators.Dirichlet(), backend = CB.SerialBackend())
 
 serial = HD.helmholtz_decompose_batch(plan, fields; backend = CB.SerialBackend())
 mpi = HD.helmholtz_decompose_batch(plan, fields; backend = CB.MPIBackend())

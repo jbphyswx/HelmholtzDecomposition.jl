@@ -1,25 +1,8 @@
-"""
-    Solvers.jl — Poisson solvers for `L Φ = f`.
-
-`L` is the operator `Operators.jl` builds: `L = D G` with `D = −G*`, symmetric and negative
-semidefinite under the cell-measure inner product, with the boundary condition and the mask
-already inside it through the face areas. Every solver here inverts *that* `L` — the same one
-the decomposition differentiates with — which is what makes `div(u_div) = div(u)` hold exactly
-rather than to truncation order.
-
-Written as a flux balance, `L`'s row at cell `I` is
-
-    (L Φ)_I = (1/V_I) Σ_f c_f (Φ_nbr(f) − Φ_I),      c_f = A_f / g_f
-
-over the faces of `I`, where a face with `A_f = 0` — masked, or a no-flux domain edge — simply
-does not appear, and a Dirichlet edge appears with `Φ_nbr = 0`. Both the relaxation below and
-the Krylov/multigrid solvers read the same coefficients.
-
-The spectral solvers (`SpectralSolvers.jl`, `Scattered.jl`) run on the transform a library provides:
-FFTW, AbstractFFTs, FastSphericalHarmonics and NUFSHT through this package's extensions, the NUFFT
-libraries through FlowTransformBindings. They are exact on the domains they apply to and refuse the
-ones they do not.
-"""
+# Poisson solvers for `L Φ = f`, `L = D G` the operator FlowGeometries assembles as
+# `Operators.LaplacianCoefficients`: symmetric and negative semidefinite under the cell measure, the
+# boundary condition and the mask inside it through the face areas. The iterative solvers invert that
+# `L`, so `D u_div = D u` holds to the solver tolerance. The spectral solvers (`SpectralSolvers.jl`,
+# `Scattered.jl`) run on a library's transform and refuse the domains it does not diagonalize.
 
 # ---------------------------------------------------------------------------
 # Interface
@@ -37,12 +20,11 @@ abstract type AbstractPoissonSolver end
 """
     solve_poisson!(Φ, RHS, grid, solver; boundary, coefficients, state, backend) -> SolverResult
 
-Solve `L Φ = RHS` in place, with `L` the operator `Operators.jl` builds.
+Solve `L Φ = RHS` in place, `L` the operator `coefficients` holds.
 
 `coefficients` and `state` are the reusable parts — the Hodge factors of every face, and whatever
 the solver prepared for this `(grid, boundary)` pair. A decomposition solves `P + 1` right-hand
-sides and a batch multiplies that by the field count, so both are built once and passed in rather
-than derived here.
+sides and a batch multiplies that by the field count, so both are built once and passed in.
 
 Extensions add methods for their own solver types; the iterative [`CGSolver`](@ref) is the one that
 works on any grid, mask and boundary condition.
@@ -52,8 +34,9 @@ function solve_poisson! end
 """
     SolverResult{T}
 
-Convergence diagnostics from a solve: whether it met its tolerance, how many iterations it took
-(`1` for a direct or spectral solve), and the final residual.
+Convergence diagnostics from a solve or fit: whether it met its tolerance, how many iterations it
+took (`1` for a direct or spectral solve), and the final relative residual. A solve stopped short of
+its tolerance returns what it reached with `converged == false`; the caller decides what to do with it.
 """
 struct SolverResult{T<:AbstractFloat}
     converged::Bool
@@ -61,18 +44,11 @@ struct SolverResult{T<:AbstractFloat}
     residual::T
 end
 
-"""
-    _require_converged(r::SolverResult, what)
-
-Throw unless the solve that produced `r` met its tolerance. A potential solved short of it gives a
-part without the field's divergence or curl, and the difference lands in the harmonic remainder.
-"""
-@inline _require_converged(r::SolverResult, what::Symbol) =
-    r.converged ? nothing : _throw_unconverged(r, what)
-
-@noinline _throw_unconverged(r::SolverResult, what::Symbol) = throw(ArgumentError(
-    "the $what solve did not reach its tolerance: relative residual $(r.residual) after " *
-    "$(r.iterations) iterations. Raise the solver's `max_iter`, or pass a larger `rtol`."))
+# The least converged of several fits: converged only if all are, the most iterations, the largest
+# residual.
+_worst(a::SolverResult{T}, b::SolverResult{T}) where {T} =
+    SolverResult{T}(a.converged & b.converged, max(a.iterations, b.iterations),
+                    max(a.residual, b.residual))
 
 # ---------------------------------------------------------------------------
 # Solver capability
@@ -85,22 +61,21 @@ Whether `solver` solves the problem `boundary` describes. A solver that does not
 selected by [`AutoSolver`](@ref) and errors when named directly — solving a different problem
 from the one asked for is indistinguishable from a correct answer at the call site.
 """
-supports_boundary(::AbstractPoissonSolver, ::AbstractBoundaryCondition) = false
+supports_boundary(::AbstractPoissonSolver, ::FlowGeometries.Operators.AbstractBoundaryCondition) = false
 
 """
     requires_full_domain(solver) -> Bool
 
-Whether `solver` needs every cell active. The spectral solvers transform the whole array, so a
-masked cell would be transformed as though it held data; they set this and are refused a masked
-grid rather than returning a field that is wrong wherever the mask bites.
+Whether `solver` needs every cell active. The spectral solvers transform the whole array, masked
+cells included, so they set this and a masked grid refuses them.
 """
 requires_full_domain(::AbstractPoissonSolver) = false
 
 """
     requires_uniform_axes(solver) -> Bool
 
-Whether `solver` needs constant spacing in every direction. An FFT-based solver does; the
-question is answered from the axis TYPE by `FlowGeometries`, at no runtime cost.
+Whether `solver` needs constant spacing in every direction. An FFT-based solver does; FlowGeometries
+reads the spacing from each axis's type, at no runtime cost.
 """
 requires_uniform_axes(::AbstractPoissonSolver) = false
 
@@ -110,10 +85,8 @@ requires_uniform_axes(::AbstractPoissonSolver) = false
 Whether `solver` needs every direction to wrap. An FFT expands in a periodic basis, so it solves
 the whole-torus problem and nothing else.
 
-This is a question about the **grid's topology**, not about a boundary condition — which is why
-there is no `Periodic` boundary condition to ask instead. A direction that wraps has no boundary
-to impose a condition on, so on a grid this solver accepts, `boundary` is vacuous rather than
-honoured or refused.
+Whether a direction wraps is the grid's topology. A direction that wraps has no boundary to impose a
+condition on, so on a grid this solver accepts `boundary` has no effect.
 """
 requires_periodic_domain(::AbstractPoissonSolver) = false
 
@@ -148,6 +121,42 @@ the mask, axis uniformity and topology.
     throw(ArgumentError(_sampling_message(solver, grid)))
 
 """
+    inverts_discrete_laplacian(solver) -> Bool
+
+Whether `solver` inverts the discrete `L = D G` the staggered decomposition differentiates with.
+Inverting another operator leaves `D u_div ≠ D u` at truncation order, so
+[`select_solver`](@ref) solves with such a solver only through [`CGSolver`](@ref) on `L`, preconditioned
+by it, when it [`preconditions`](@ref) and refuses it otherwise. The spherical transforms divide by
+`−ℓ(ℓ+1)/R²`, the continuous operator's eigenvalue.
+"""
+inverts_discrete_laplacian(::AbstractPoissonSolver) = false
+
+"""
+    preconditions(solver) -> Bool
+
+Whether `solver`'s inverse of the continuous Laplacian can precondition conjugate gradients on the
+discrete `L` of the grids it accepts. Extensions define [`spectral_inverse!`](@ref) for these.
+"""
+preconditions(::AbstractPoissonSolver) = false
+
+"""
+    spectral_inverse!(Φ, RHS, grid, solver, state) -> Φ
+
+`Φ = Δ⁻¹ RHS` by `solver`'s transform, with the constant mode zero, through the state
+[`prepare_solver`](@ref) built. An inexact inner fit is returned as it stands; a caller that needs it
+converged checks.
+"""
+function spectral_inverse! end
+
+"""
+    supports_backend(solver, backend) -> Bool
+
+Whether `solver`'s state can live where `backend` runs. [`AutoSolver`](@ref) passes over a solver that
+cannot.
+"""
+supports_backend(::AbstractPoissonSolver, backend) = true
+
+"""
     library_loaded(solver) -> Bool
 
 Whether the library `solver` transforms with is loaded. [`AutoSolver`](@ref) passes over a solver
@@ -179,7 +188,8 @@ same plan `(P + 1) · B` times: in 3-D that is 17 FFTW plans per field, and for 
 transforms a plan *and* a node upload per conjugate-gradient iteration.
 
 `nothing` is the default and means "nothing to reuse", which is correct for the iterative solvers —
-their reusable part is the `LaplacianCoefficients`, which the plan already holds.
+their reusable part is the `FlowGeometries.Operators.LaplacianCoefficients`, which the plan already
+holds.
 
 `backend` is where the state's buffers are allocated. A solver that builds them with `zeros` hands
 a kernel host memory it cannot reach, and a parity test run on `KernelAbstractions.CPU()` cannot
@@ -189,19 +199,18 @@ prepare_solver(::AbstractPoissonSolver, grid, boundary;
                backend = ComputationalBackends.SerialBackend(), shared = nothing) = nothing
 
 """
-    prepare_shared(solver, grid, boundary) -> shared state
+    prepare_shared(solver, grid, boundary; coefficients) -> shared state
 
-Whatever `solver` can build once for a `(grid, boundary)` pair and **share across tasks**: the part
-that is read during a solve and never written.
+Whatever `solver` can build once for a `(grid, boundary)` pair and share across tasks: the part
+that is read during a solve and never written, built for the operator `coefficients` describes.
 
 `plan_helmholtz` holds this, so a batch builds it once in total. [`prepare_solver`](@ref) receives
 it and allocates only what its task writes through. The multigrid hierarchy is the case that pays:
-its grids and Galerkin coefficients are read-only, while its per-level vectors are not, and
-building the hierarchy dominates what a workspace costs.
+its grids and Galerkin coefficients are read-only, while its per-level vectors are not.
 
-`nothing` by default
+`nothing` by default.
 """
-prepare_shared(::AbstractPoissonSolver, grid, boundary) = nothing
+prepare_shared(::AbstractPoissonSolver, grid, boundary; coefficients = nothing) = nothing
 
 @inline function _require_boundary(solver::AbstractPoissonSolver, boundary)
     supports_boundary(solver, boundary) && return nothing
@@ -256,15 +265,18 @@ end
 """
     AutoSolver()
 
-Sentinel for automatic selection. The only thing permitted to choose a solver on the caller's
-behalf, and it chooses on real capability — geometry, node layout, mask, axis uniformity, the
-requested boundary condition, and which libraries are loaded — taking the first of
-[`_auto_candidates`](@ref) that applies.
+Sentinel for automatic selection. It chooses on capability: geometry, node layout, mask, axis
+uniformity, the boundary condition, the execution backend and which libraries are loaded. For a
+staggered decomposition it takes the first of [`_auto_candidates`](@ref) that applies; failing that,
+[`CGSolver`](@ref) preconditioned by the first of [`_preconditioner_candidates`](@ref) that applies;
+failing that, `CGSolver()`.
 """
 struct AutoSolver <: AbstractPoissonSolver end
 
-function _applicable(solver::AbstractPoissonSolver, grid, boundary)
+function _applicable(solver::AbstractPoissonSolver, grid, boundary,
+                     backend = ComputationalBackends.SerialBackend())
     library_loaded(solver) || return false
+    supports_backend(solver, backend) || return false
     supports_boundary(solver, boundary) || return false
     requires_full_domain(solver) && !all(FlowGeometries.Grids.mask(grid)) && return false
     if requires_uniform_axes(solver)
@@ -277,480 +289,61 @@ function _applicable(solver::AbstractPoissonSolver, grid, boundary)
     return true
 end
 
-function _resolve_auto_solver(grid::FlowGeometries.Grids.AbstractGrid, boundary)
+function _resolve_auto_solver(grid::FlowGeometries.Grids.AbstractGrid, boundary;
+                              backend = ComputationalBackends.SerialBackend())
     for candidate in _auto_candidates(grid)
-        _applicable(candidate, grid, boundary) && return candidate
+        _applicable(candidate, grid, boundary, backend) && return candidate
+    end
+    for candidate in _preconditioner_candidates(grid)
+        _applicable(candidate, grid, boundary, backend) && return CGSolver(; spectral = candidate)
     end
     return CGSolver()
 end
 
 """
-    select_solver(solver, grid, boundary) -> AbstractPoissonSolver
+    select_solver(solver, grid, boundary; backend = SerialBackend()) -> AbstractPoissonSolver
 
-The concrete solver for this problem, resolved and validated **once**. Resolution reads the
-mask, so a caller with several right-hand sides on one grid — which a decomposition always has,
-`P + 1` of them — calls this once and hands the result to each solve.
+The concrete solver for one staggered decomposition's Poisson problems on `grid`, resolved and
+validated once. Resolution reads the mask, so a caller with several right-hand sides on one grid calls
+this once and hands the result to each solve.
+
+A solver that does not [`invert the discrete Laplacian`](@ref inverts_discrete_laplacian) and
+[`preconditions`](@ref) is returned as `CGSolver(; spectral = solver)`, so the solve is of `L`; one
+that does neither is refused.
 """
-function select_solver(solver::AbstractPoissonSolver, grid, boundary)
-    concrete = solver isa AutoSolver ? _resolve_auto_solver(grid, boundary) : solver
+function select_solver(solver::AbstractPoissonSolver, grid, boundary;
+                       backend = ComputationalBackends.SerialBackend())
+    concrete = solver isa AutoSolver ? _resolve_auto_solver(grid, boundary; backend = backend) :
+               solver
     _require_library(concrete)
     _require_boundary(concrete, boundary)
     _require_domain(concrete, grid)
-    return concrete
+    inverts_discrete_laplacian(concrete) && return _require_spectral(concrete, grid, boundary)
+    preconditions(concrete) && return CGSolver(; spectral = concrete)
+    throw(ArgumentError(
+        "$(nameof(typeof(concrete))) has no discrete Laplacian of this grid to invert or " *
+        "precondition. Decompose with it through `helmholtz_decompose_spectral`, or plan with " *
+        "`CGSolver()` or `AutoSolver()`."))
+end
+
+# A conjugate-gradient solver's spectral preconditioner has to apply to the grid it solves on.
+_require_spectral(s::AbstractPoissonSolver, grid, boundary) = s
+
+# The solver a dual grid takes when the primal's was `solver`, the dual's condition `bc`. A transform
+# that does not apply to the dual's nodes or condition gives way to conjugate gradients with the
+# default preconditioner: either way the solve is of the dual `L`.
+function _dual_request(solver::AbstractPoissonSolver, dual, bc, backend)
+    solver isa AutoSolver && return solver
+    s = solver isa CGSolver ? solver.spectral : solver
+    s === nothing && return solver
+    _applicable(s, dual, bc, backend) && return solver
+    return solver isa CGSolver ? CGSolver(solver.max_iter, solver.rtol, solver.multigrid, nothing) :
+           CGSolver()
 end
 
 # ---------------------------------------------------------------------------
 # Iterative solvers on L
 # ---------------------------------------------------------------------------
-
-"""
-    LazyDiagonal{N,T,C,M,G} <: AbstractArray{T,N}
-
-`L`'s diagonal read from the face coefficients: `diag[I] = −Σ_d (c_d[F_lo] + c_d[F_hi]) / V_I`,
-zero where the measure is.
-"""
-struct LazyDiagonal{N,T,C,M,G} <: AbstractArray{T,N}
-    coef::C
-    measure::M
-    grid::G
-end
-
-@inline LazyDiagonal{N,T}(coef::C, measure::M, grid::G) where {N,T,C,M,G} =
-    LazyDiagonal{N,T,C,M,G}(coef, measure, grid)
-
-Base.size(d::LazyDiagonal) = size(d.grid)
-Base.IndexStyle(::Type{<:LazyDiagonal}) = IndexCartesian()
-
-@inline function Base.getindex(d::LazyDiagonal{N,T}, I::Vararg{Int,N}) where {N,T}
-    @boundscheck checkbounds(d, I...)
-    @inbounds begin
-        C = CartesianIndex(I)
-        m = d.measure[C]
-        iszero(m) && return zero(T)
-        acc = zero(T)
-        for e in 1:N
-            cd = d.coef[e]
-            acc += cd[face_below(C, e)] + cd[face_above(d.grid, C, e)]
-        end
-        return -acc / m
-    end
-end
-
-"""
-    LaplacianCoefficients{N,T,C,D,M}
-
-The per-face coefficients `c_f = A_f / g_f` of `L`, and the cell measures, evaluated once for a
-(grid, boundary) pair.
-
-Every iterative solve applies `L` repeatedly, and each application would otherwise re-evaluate
-the geometry: face areas involve the scale factors at the face, which on a curved geometry means
-trigonometry per cell per direction. That is invariant across iterations — and across the `P + 1`
-potentials and the whole batch — so it is reduced once here.
-
-`coef[I, d]` is the coefficient of the face **below** cell `I` along `d`; `diag[I]` is the
-negative sum of a cell's own face coefficients, divided by its measure. `nullspace` holds the
-constants `L` annihilates, one per closed component (see [`ComponentNullspace`](@ref)), and
-`singular` says whether there are any.
-"""
-struct LaplacianCoefficients{N,T,C<:NTuple{N,AbstractArray{T,N}},D<:AbstractArray{T,N},
-                             M<:AbstractArray{T,N},NS}
-    coef::C          # coef[d][F] = A_F / g_F, the Hodge factor of face F
-    diag::D          # −Σ over a cell's own faces, divided by its measure
-    # `measure` and `diag` carry separate types: on an unmasked grid the measure is the grid's own
-    # lazy per-axis factors, while the diagonal is a sum over faces and is held densely.
-    measure::M
-    # `Σ V_I` over the active cells. `project_out_constant!` divides by it on every conjugate-
-    # gradient iteration, and it is a property of the grid.
-    total::T
-    singular::Bool
-    nullspace::NS
-end
-
-"""
-    ComponentNullspace{P,O,V}
-
-The constants in `L`'s null space, one per closed component: a connected component of the graph of
-faces with nonzero coefficient on which `L·1 = 0`. Component `k`'s cells are the linear indices
-`perm[offsets[k]:offsets[k+1]-1]` and `totals[k]` is its measure. `full` marks a single closed
-component holding every active cell, which [`project_out_constant!`](@ref) removes in one linear
-pass without reading `perm`.
-
-`perm` is read by kernels and moves with the plan. `offsets` and `totals` bound the host loop over
-components; they are tuples, so a device plan holds no host array.
-"""
-struct ComponentNullspace{P<:AbstractVector{<:Integer},O<:Tuple{Vararg{Int}},
-                          V<:Tuple{Vararg{AbstractFloat}}}
-    full::Bool
-    perm::P
-    offsets::O
-    totals::V
-end
-
-# Coefficients with their null space, found from the operator they define.
-function _with_nullspace(grid, coef::NTuple{N,Any}, diag, meas, total::T) where {N,T}
-    ns = _nullspace(grid, coef, diag, meas, Val(N), T)
-    return LaplacianCoefficients{N,T,typeof(coef),typeof(diag),typeof(meas),typeof(ns)}(
-        coef, diag, meas, total, !isempty(ns.totals), ns)
-end
-
-"""
-    laplacian_coefficients(grid, bc, fm = face_metrics(grid, bc)) -> LaplacianCoefficients
-
-The Hodge factor `c_F = A_F / g_F` of every face, and the cell measures, reduced once for a
-(grid, boundary) pair.
-
-Every iterative solve applies `L` repeatedly, and each application reading the geometry would
-re-derive the scale factors at each face — trigonometry per cell per direction on a curved grid.
-That is invariant across iterations, across the `P + 1` potentials, and across a whole batch, so it
-is reduced here and only read afterwards.
-
-`fm` carries the areas and gaps. Pass the same [`FaceMetrics`](@ref) the plan holds, and the
-geometry is walked once for both.
-"""
-function laplacian_coefficients(
-    grid::FaceIndexedGrid{T,G,N}, bc::AbstractBoundaryCondition,
-    fm::FaceMetrics{N,T} = face_metrics(grid, bc),
-) where {G,T,N}
-    # A Hodge factor is an area over a gap, and `fm` holds both already. Evaluating the geometry
-    # again here walked every face a second time, and on a curved grid that is trigonometry per
-    # face. A gap is never zero, so a closed face's zero area carries straight through the ratio.
-    #
-    # A quotient of separable arrays is separable, so the coefficients take the storage the metrics
-    # do; a quotient of dense ones is dense.
-    coef = ntuple(d -> fm.area[d] ./ fm.gap[d], Val(N))
-    meas = _measure_array(grid, T)
-    diag = _diagonal(grid, coef, meas, T)
-    # `sum` of a separable measure is the product of its per-axis sums, which `FlowGeometries`
-    # specialises; on a masked grid the inactive entries are already zero.
-    return _with_nullspace(grid, coef, diag, meas, T(sum(meas)))
-end
-
-"""
-    _diagonal(grid, coef, measure, T) -> AbstractArray{T,N}
-
-`L`'s diagonal: a [`LazyDiagonal`](@ref) where the face coefficients are separable, a stored array
-where they are dense.
-
-Dense coefficients are `2N` grid-sized arrays already streamed by every operator application, and
-reading the diagonal back out of them costs `2N` gathers against one from a stored copy. Separable
-coefficients are per-axis factors that stay in cache, and the stored copy is the largest array the
-plan holds.
-"""
-@inline _diagonal(grid, coef::NTuple{N,Array}, meas, ::Type{T}) where {N,T} =
-    _dense_diagonal(grid, coef, meas, T)
-
-@inline _diagonal(grid, coef::NTuple{N,Any}, meas, ::Type{T}) where {N,T} =
-    LazyDiagonal{N,T}(coef, meas, grid)
-
-function _dense_diagonal(grid, coef::NTuple{N,Any}, meas, ::Type{T}) where {N,T}
-    diag = zeros(T, size(grid))
-    @inbounds for I in CartesianIndices(size(grid))
-        m = meas[I]
-        iszero(m) && continue
-        acc = zero(T)
-        for d in 1:N
-            acc += coef[d][face_below(I, d)] + coef[d][face_above(grid, I, d)]
-        end
-        diag[I] = -acc / m
-    end
-    return diag
-end
-
-"""
-    _measure_array(grid, T) -> AbstractArray{T,N}
-
-The cell measure `L` divides by: the grid's own per-axis factors where every cell is active, and a
-copy zeroed on the inactive cells where a mask cuts some out.
-
-`divergence!` already reads the grid's lazy measure while `apply_laplacian!` read a dense copy of
-it. Both now read the same object on an unmasked grid.
-"""
-@inline _measure_array(grid, ::Type{T}) where {T} =
-    _measure_array(grid, FlowGeometries.Grids.mask(grid), T)
-
-@inline _measure_array(grid, ::FlowGeometries.Grids.AllActive, ::Type{T}) where {T} =
-    FlowGeometries.Grids.measure(grid)
-
-function _measure_array(grid, msk, ::Type{T}) where {T}
-    m = zeros(T, size(grid))
-    @inbounds for I in CartesianIndices(size(grid))
-        FlowGeometries.Grids.isactive(grid, Tuple(I)...) && (m[I] = cell_measure(grid, I, T))
-    end
-    return m
-end
-
-"""
-    _nullspace(grid, coef, diag, measure, Val(N), T) -> ComponentNullspace
-
-The constants in `L`'s null space. `(L·1)_I = (1/V_I) Σ_f c_f (1_nbr − 1)` is nonzero only through a
-face whose far side is the zero ghost of a Dirichlet edge, so the null space is spanned by the
-indicators of the components of the coupling graph on which `L·1` vanishes. That is tested per
-component against the scale of the diagonal, so a face whose area is round-off, as at a pole, counts
-as closed. Decided from the operator itself: the dual grid's masked-off boundary ring closes every
-face of its active region, which makes it singular under `Dirichlet`.
-"""
-function _nullspace(grid, coef, diag, meas, v::Val{N}, ::Type{T}) where {N,T}
-    dims = size(grid)
-    labels = zeros(Int32, dims)
-    ncomp = _label_components!(labels, grid, coef, v)
-    ones_ = fill(one(T), dims)
-    Lone = similar(ones_)
-    _apply_laplacian!(Lone, ones_, grid, FlowGeometries.Grids.mask(grid), coef, meas, v, T,
-                      ComputationalBackends.SerialBackend())
-    scale = zero(T)
-    worst = zeros(T, ncomp)
-    counts = zeros(Int, ncomp)
-    @inbounds for I in CartesianIndices(dims)
-        k = labels[I]
-        k == 0 && continue
-        scale = max(scale, abs(diag[I]))
-        worst[k] = max(worst[k], abs(Lone[I]))
-        counts[k] += 1
-    end
-    closed = [iszero(scale) || worst[k] <= sqrt(eps(T)) * scale for k in 1:ncomp]
-    K = count(closed)
-    K == 0 && return ComponentNullspace(false, Int[], (1,), ())
-    ncomp == 1 && return ComponentNullspace(true, Int[], (1,), (T(sum(meas)),))
-    # The closed components' cells, grouped by component with a counting sort over the labels.
-    slot = zeros(Int, ncomp)
-    offsets = ones(Int, K + 1)
-    s = 0
-    for k in 1:ncomp
-        closed[k] || continue
-        s += 1
-        slot[k] = s
-        offsets[s + 1] = offsets[s] + counts[k]
-    end
-    perm = Vector{Int}(undef, offsets[end] - 1)
-    next = offsets[1:K]
-    totals = zeros(T, K)
-    @inbounds for (lin, I) in enumerate(CartesianIndices(dims))
-        k = labels[I]
-        (k == 0 || slot[k] == 0) && continue
-        s = slot[k]
-        perm[next[s]] = lin
-        next[s] += 1
-        totals[s] += T(meas[I])
-    end
-    return ComponentNullspace(false, perm, Tuple(offsets), Tuple(totals))
-end
-
-# Each active cell's component of the coupling graph: two cells share one when a chain of faces of
-# nonzero coefficient joins them. Returns the number of components.
-function _label_components!(labels, grid, coef, v::Val{N}) where {N}
-    dims = size(grid)
-    lin = LinearIndices(dims)
-    cart = CartesianIndices(dims)
-    stack = Int[]
-    ncomp = Int32(0)
-    @inbounds for I0 in cart
-        (labels[I0] == 0 && FlowGeometries.Grids.isactive(grid, Tuple(I0)...)) || continue
-        ncomp += Int32(1)
-        labels[I0] = ncomp
-        push!(stack, lin[I0])
-        while !isempty(stack)
-            _join_neighbours!(labels, stack, lin, grid, coef, cart[pop!(stack)], ncomp, v)
-        end
-    end
-    return Int(ncomp)
-end
-
-# The direction is a type parameter, as in `_flux_sum`, so `coef[d]` is a fixed slot of the tuple.
-@inline _join_neighbours!(labels, stack, lin, grid, coef, I::CartesianIndex, k, ::Val{0}) = nothing
-
-@inline function _join_neighbours!(labels, stack, lin, grid, coef, I::CartesianIndex{N}, k,
-                                   ::Val{d}) where {N,d}
-    @inbounds begin
-        cd = coef[d]
-        Flo = face_below(I, d)
-        iszero(cd[Flo]) || _join!(labels, stack, lin, cell_below(grid, Flo, d), k)
-        Fhi = face_above(grid, I, d)
-        iszero(cd[Fhi]) || _join!(labels, stack, lin, cell_above(grid, Fhi, d), k)
-    end
-    return _join_neighbours!(labels, stack, lin, grid, coef, I, k, Val(d - 1))
-end
-
-@inline _join!(labels, stack, lin, ::Nothing, k) = nothing
-@inline function _join!(labels, stack, lin, J::CartesianIndex, k)
-    @inbounds labels[J] == 0 || return nothing
-    @inbounds labels[J] = k
-    push!(stack, lin[J])
-    return nothing
-end
-
-"""
-    apply_laplacian!(out, Φ, grid, c) -> out
-
-`out = L Φ`, from the prebuilt coefficients. A face at the outer edge of a bounded direction has
-no cell beyond it and contributes `c·(0 − Φ_I)` — the zero ghost a Dirichlet condition places
-there. Under Neumann that face's coefficient is zero and the term vanishes, so one expression
-serves both.
-"""
-function apply_laplacian!(out, Φ, grid, c::LaplacianCoefficients{N,T}; backend = ComputationalBackends.SerialBackend()) where {N,T}
-    _apply_laplacian!(out, Φ, grid, FlowGeometries.Grids.mask(grid), c.coef, c.measure,
-                      Val(N), T, backend)
-    return out
-end
-
-
-"""
-    _laplacian_at(Φ, grid, coef, meas, I, Val(N), T) -> T
-
-`(L Φ)_I`: the flux balance over cell `I`'s faces, divided by its measure.
-
-The one place the stencil is written. Both traversals below call it, so they cannot drift apart.
-"""
-@inline function _laplacian_at(Φ, grid, coef, meas, I::CartesianIndex{N},
-                               v::Val{N}, ::Type{T}) where {N,T}
-    @inbounds return _flux_sum(Φ, grid, coef, I, T(Φ[I]), v, T) / meas[I]
-end
-
-# The direction is a type parameter, so each term is compiled with `d` a literal: the grid's
-# topology in that direction folds to a constant, its two branches with it, and `coef[d]` is a
-# fixed slot of the tuple. Under a runtime `d` none of that is available, and the directions of a
-# tuple of face arrays need not even share a type.
-@inline _flux_sum(Φ, grid, coef, I::CartesianIndex{N}, ΦI, ::Val{0},
-                  ::Type{T}) where {N,T} = zero(T)
-
-@inline function _flux_sum(Φ, grid, coef, I::CartesianIndex{N}, ΦI,
-                           ::Val{d}, ::Type{T}) where {N,d,T}
-    @inbounds begin
-        cd = coef[d]
-        Fhi = face_above(grid, I, d)
-        Φlo = _cell_value(Φ, grid, I, d, false, T)
-        Φhi = _cell_value(Φ, grid, Fhi, d, true, T)
-        here = cd[I] * (Φlo - ΦI) + cd[Fhi] * (Φhi - ΦI)
-    end
-    return here + _flux_sum(Φ, grid, coef, I, ΦI, Val(d - 1), T)
-end
-
-# One index per cell, which is the shape a device launch takes: adjacent threads read adjacent
-# memory. Recovering `I` from a flat index costs an integer division per cell, and on a device that
-# sits under the memory latency.
-function _apply_laplacian!(out, Φ, grid, msk, coef, meas, v::Val{N}, ::Type{T},
-                           backend) where {N,T}
-    cart = CartesianIndices(size(grid))
-    FlowGeometries.Execution.run_indices(length(out), backend) do lin
-        @inbounds begin
-            I = cart[lin]
-            msk[I] && (out[I] = _laplacian_at(Φ, grid, coef, meas, I, v, T))
-        end
-        return nothing
-    end
-    return out
-end
-
-"""
-    _laplacian_interior(Φ, coef, meas, I, Val(N), T) -> T
-
-`(L Φ)_I` for a cell whose every coordinate is strictly inside the grid.
-
-Such a cell has a neighbour on both sides in every direction, so no direction wraps and no face
-carries the zero ghost: the topology and the edge tests drop out and each term is two reads at a
-fixed offset. A mask does not change that — an inactive neighbour reaches this through a zero face
-coefficient, never through the neighbour lookup — so this serves a masked grid as well.
-"""
-@inline function _laplacian_interior(Φ, coef, meas, I::CartesianIndex{N},
-                                     v::Val{N}, ::Type{T}) where {N,T}
-    @inbounds return _flux_interior(Φ, coef, I, T(Φ[I]), v, T) / meas[I]
-end
-
-@inline _flux_interior(Φ, coef, I::CartesianIndex{N}, ΦI, ::Val{0},
-                       ::Type{T}) where {N,T} = zero(T)
-
-@inline function _flux_interior(Φ, coef, I::CartesianIndex{N}, ΦI,
-                                ::Val{d}, ::Type{T}) where {N,d,T}
-    @inbounds begin
-        e = _unit_axis(Val(N), Val(d))
-        cd = coef[d]
-        Ihi = I + e
-        here = cd[I] * (Φ[I - e] - ΦI) + cd[Ihi] * (Φ[Ihi] - ΦI)
-    end
-    return here + _flux_interior(Φ, coef, I, ΦI, Val(d - 1), T)
-end
-
-# The direction is a type parameter, so every component of the offset is decided at compile time and
-# the index is a constant. Handed the direction as a value, the comparison inside the tuple stays in
-# the loop and the offset is rebuilt per cell, which stops the run from vectorising.
-@inline _unit_axis(::Val{N}, ::Val{d}) where {N,d} =
-    CartesianIndex(ntuple(i -> ifelse(i == d, 1, 0), Val(N)))
-
-# Whether any of the coordinates of axes `2 … N` sits on its axis's first or last cell.
-@inline function _rest_on_edge(rest::NTuple{M,Int}, dims::NTuple{N,Int}) where {M,N}
-    @inbounds for e in 1:M
-        (rest[e] == 1 || rest[e] == dims[e + 1]) && return true
-    end
-    return false
-end
-
-# Host arrays on a host backend walk the index space itself, in slabs of the trailing axis. Stepping
-# a `CartesianIndex` carries the coordinates along, so no cell pays the division the flat form does.
-# A KernelAbstractions backend takes the flat form whatever its arrays are, `KA.CPU()`'s `Array`s
-# included: `run_chunks` is a host loop.
-#
-# A row whose other coordinates are all interior meets the boundary only at its two ends, so it
-# splits into those two cells and a run that takes `_laplacian_interior`. That run is the whole grid
-# apart from its surface.
-const _HostBackend = Union{ComputationalBackends.AbstractSerialBackend,
-                           ComputationalBackends.AbstractThreadedBackend}
-
-function _apply_laplacian!(out::Array, Φ, grid, msk, coef, meas, v::Val{N}, ::Type{T},
-                           backend::_HostBackend) where {N,T}
-    dims = size(grid)
-    n1 = dims[1]
-    mid = CartesianIndices(ntuple(e -> dims[e + 1], Val(N - 2)))
-    FlowGeometries.Execution.run_chunks(dims[N], backend) do slab
-        _laplacian_slab!(out, Φ, grid, msk, coef, meas, v, T, slab, dims, mid, n1)
-    end
-    return out
-end
-
-"""
-    _laplacian_slab!(out, Φ, grid, msk, coef, meas, Val(N), T, slab, dims, mid, n1)
-
-`L Φ` over one slab of the trailing axis.
-
-It carries the loop so that `coef` arrives as an argument and the tuple rebuilt below belongs to the
-same function. Where the coefficient arrays are reached through a closure capture, each cell
-re-loads them and the interior run stays scalar.
-"""
-function _laplacian_slab!(out, Φ, grid, msk, coef, meas, v::Val{N}, ::Type{T},
-                          slab, dims, mid, n1::Int) where {N,T}
-    # Rebuilt here so the array pointers become values the loop carries for its whole length.
-    cf = ntuple(d -> @inbounds(coef[d]), v)
-    @inbounds for jN in slab, Im in mid
-        rest = (Tuple(Im)..., jN)
-        if n1 < 3 || _rest_on_edge(rest, dims)
-            for i in 1:n1
-                I = CartesianIndex(i, rest...)
-                msk[I] && (out[I] = _laplacian_at(Φ, grid, cf, meas, I, v, T))
-            end
-        else
-            for i in (1, n1)
-                I = CartesianIndex(i, rest...)
-                msk[I] && (out[I] = _laplacian_at(Φ, grid, cf, meas, I, v, T))
-            end
-            for i in 2:(n1 - 1)
-                I = CartesianIndex(i, rest...)
-                msk[I] && (out[I] = _laplacian_interior(Φ, cf, meas, I, v, T))
-            end
-        end
-    end
-    return nothing
-end
-
-# A one-dimensional grid has no leading axes to nest, so the trailing axis is the whole of it.
-function _apply_laplacian!(out::Array, Φ, grid, msk, coef, meas, v::Val{1}, ::Type{T},
-                           backend::_HostBackend) where {T}
-    FlowGeometries.Execution.run_chunks(size(grid, 1), backend) do slab
-        @inbounds for i in slab
-            I = CartesianIndex(i)
-            msk[I] && (out[I] = _laplacian_at(Φ, grid, coef, meas, I, v, T))
-        end
-        return nothing
-    end
-    return out
-end
 
 """
     lazy_axis_sum(v::NTuple{N,AbstractArray}) -> array or Broadcasted
@@ -766,40 +359,124 @@ array of symbol values is stored or read.
 @inline lazy_axis_sum(v::NTuple{N,Any}) where {N} = Broadcast.broadcasted(+, v...)
 
 """
-    CGSolver(; max_iter = 1000, rtol = nothing, multigrid = true)
+    CGSolver(; max_iter = 1000, rtol = nothing, multigrid = true, spectral = nothing)
 
-Conjugate gradients on `−L`, which is symmetric positive (semi)definite by construction — see
-`Operators.jl` — preconditioned by a multigrid V-cycle, or by Jacobi with `multigrid = false`. On a
+Conjugate gradients on `−L`, which is symmetric positive (semi)definite by construction (see
+`FlowGeometries.Operators.LaplacianCoefficients`). The preconditioner is a multigrid V-cycle, Jacobi with `multigrid = false`, or with
+`spectral` a transform solver that [`preconditions`](@ref), that transform's inverse of the continuous
+Laplacian (see [`SpectralPreconditioner`](@ref)); `spectral` takes precedence over `multigrid`. On a
 singular problem the iterate and residual are kept orthogonal to `L`'s null space.
+
+Under a spectral preconditioner the step is the flexible form `β = −⟨z₊, A p⟩/⟨p, A p⟩` (Notay,
+*SIAM J. Sci. Comput.* 22 (2000) 1444–1460), which converges when the preconditioner is not exactly
+symmetric in the cell-measure inner product or is an inexact inner fit.
 
 The solve stops when the residual falls to `rtol` of the right-hand side, both measured in the
 cell-measure norm; `rtol = nothing` is `100·eps(T)` for the field's element type `T`. Works on any
 grid, mask and boundary condition.
 """
-struct CGSolver{R<:Union{Nothing,AbstractFloat}} <: AbstractPoissonSolver
+struct CGSolver{R<:Union{Nothing,AbstractFloat},S<:Union{Nothing,AbstractPoissonSolver}} <:
+       AbstractPoissonSolver
     max_iter::Int
     rtol::R
     multigrid::Bool
+    spectral::S
 end
 
 CGSolver(; max_iter::Int = 1000, rtol::Union{Nothing,AbstractFloat} = nothing,
-         multigrid::Bool = true) = CGSolver(max_iter, rtol, multigrid)
+         multigrid::Bool = true, spectral::Union{Nothing,AbstractPoissonSolver} = nothing) =
+    CGSolver(max_iter, rtol, multigrid, spectral)
 
 @inline _rtol(s::CGSolver, ::Type{T}) where {T} = s.rtol === nothing ? 100 * eps(T) : T(s.rtol)
 
 # Cell by cell, so every condition on a bounded direction is honoured, and a mask with it.
-supports_boundary(::CGSolver, ::AbstractBoundaryCondition) = true
+supports_boundary(::CGSolver, ::FlowGeometries.Operators.AbstractBoundaryCondition) = true
+inverts_discrete_laplacian(::CGSolver) = true
+supports_backend(s::CGSolver, backend) = s.spectral === nothing || supports_backend(s.spectral, backend)
+
+function _require_spectral(s::CGSolver, grid, boundary)
+    p = s.spectral
+    p === nothing && return s
+    preconditions(p) || throw(ArgumentError(
+        "$(nameof(typeof(p))) cannot precondition CGSolver: it has no inverse of the continuous " *
+        "Laplacian on this grid's nodes."))
+    _require_library(p)
+    _require_boundary(p, boundary)
+    _require_domain(p, grid)
+    return s
+end
+
+"""
+    SpectralPreconditioner{S,ST,A,LV,T}
+
+`z ≈ A⁻¹ r` for `A = −L` by a two-level cycle: `ν` sweeps of damped Jacobi (`ω`) from `z = 0`, the
+spectral correction of the residual `t = r − A z`, then `ν` sweeps more. The correction is a
+transform's inverse of the continuous Laplacian,
+
+    M t = −Δ⁻¹(t − t̄) + t̄/λ₀,    t̄ = ⟨t, 1⟩/⟨1, 1⟩,    λ₀ = ⟨1, A 1⟩/⟨1, 1⟩
+
+in the cell-measure inner product. The transform resolves the smooth modes, where `Δ` and `L`
+agree; the sweeps damp the grid-scale ones, which a fit with fewer coefficients than nodes does not
+carry. The transform zeroes the constant; `t̄/λ₀` restores it where a Dirichlet edge couples it, and
+is absent (`λ₀ = 0`) where `L` is singular.
+"""
+struct SpectralPreconditioner{S<:AbstractPoissonSolver,ST,A<:AbstractArray,LV,T<:AbstractFloat}
+    solver::S
+    state::ST
+    residual::A     # t
+    correction::A   # M t
+    scratch::A      # L z inside the sweeps
+    level::LV       # the coefficients the sweeps relax with
+    λ0::T
+    ω::T
+    ν::Int
+end
+
+# `λ₀ = ⟨1, −L 1⟩/⟨1, 1⟩`, zero where `L` annihilates the constants.
+function _constant_rayleigh(c::FlowGeometries.Operators.LaplacianCoefficients, ::Type{T}) where {T}
+    c.singular && return zero(T)
+    dims = FlowGeometries.Grids.size_tuple(c.grid)
+    L1 = FlowGeometries.Operators.apply_laplacian!(zeros(T, dims), fill(one(T), dims), c)
+    return -T(sum(L1 .* c.measure)) / c.total
+end
+
+function _precondition!(z, r, grid, c::FlowGeometries.Operators.LaplacianCoefficients{N,T},
+                        pre::SpectralPreconditioner, ::Any;
+                        backend = ComputationalBackends.SerialBackend()) where {N,T}
+    t, Mt, s = pre.residual, pre.correction, pre.scratch
+    lb = loop_backend(backend, length(z))
+    fill!(z, zero(T))
+    smooth!(z, r, pre.level, s, pre.ω, pre.ν; backend = backend)
+    FlowGeometries.Operators.apply_laplacian!(s, z, c; backend = lb)
+    @. t = r + s                                        # r − A z with A = −L
+    meas = c.measure
+    tsum = FlowGeometries.Execution.reduce_indices(+, zero(T), length(t), lb) do lin
+        @inbounds t[lin] * meas[lin]
+    end
+    t̄ = tsum / c.total
+    @. t = t - t̄
+    spectral_inverse!(Mt, t, grid, pre.solver, pre.state)
+    shift = iszero(pre.λ0) ? zero(T) : t̄ / pre.λ0
+    @. z += shift - Mt
+    smooth!(z, r, pre.level, s, pre.ω, pre.ν; backend = backend)
+    return z
+end
+
+# `β` of the next search direction: Fletcher–Reeves under a fixed symmetric preconditioner, the
+# flexible form under a spectral one.
+@inline _cg_beta(::Any, z, Ap, pAp, rz_new, rz, grid, c; backend) = rz_new / rz
+@inline _cg_beta(::SpectralPreconditioner, z, Ap, pAp, rz_new, rz, grid, c; backend) =
+    -_dot_measure(z, Ap, grid, c; backend = backend) / pAp
 
 """
     _dot_measure(a, b, grid, c) -> T
 
 `⟨a, b⟩ = Σ a_I b_I V_I` over the active cells.
 
-`L` is self-adjoint under **this** inner product and not under the plain Euclidean one — it is
-`D = −G*` with the adjoint taken against the cell measure. A Krylov method using the wrong inner
-product is no longer minimising what it reports, so the weight is not optional.
+`L = D G` with `D = −G*` taken against the cell measure, so `L` is self-adjoint under this inner
+product, the one conjugate gradients minimizes in.
 """
-function _dot_measure(a, b, grid, c::LaplacianCoefficients{N,T};
+function _dot_measure(a, b, grid, c::FlowGeometries.Operators.LaplacianCoefficients{N,T};
                       backend = ComputationalBackends.SerialBackend()) where {N,T}
     # `measure` is zero on inactive cells, so no mask term is needed; each cell reads only its own
     # entries, so the index is linear.
@@ -827,40 +504,51 @@ end
 Everything `CGSolver` reuses across solves on one `(grid, boundary)`: its vectors and its
 preconditioner.
 
-The vectors belong here and not in a default argument. `helmholtz_decompose!` solves `P + 1`
-right-hand sides and a batch multiplies that by the field count, so defaulting them allocates four
-grid arrays per solve for the lifetime of the program.
+`helmholtz_decompose!` solves `P + 1` right-hand sides per field, and every one of those solves reuses
+the vectors built here.
 """
 struct CGState{W<:CGWorkspace,P,B}
     workspace::W
-    preconditioner::P    # shared: the hierarchy's grids and coefficients
+    preconditioner::P    # the multigrid hierarchy (shared), a SpectralPreconditioner, or nothing
     mgbuffers::B         # per task: the vectors a cycle writes
 end
 
-# The hierarchy is read-only during a solve, so it goes on the plan and every task reads the same
-# one. Building it coarsens a grid and forms a Galerkin operator per level.
-prepare_shared(solver::CGSolver, grid, boundary::AbstractBoundaryCondition) =
-    solver.multigrid ? multigrid(grid, boundary, eltype(grid)) : nothing
+# `L` on `grid` under `boundary`, from its face metrics.
+_laplacian(grid, boundary) =
+    FlowGeometries.Operators.laplacian_coefficients(FlowGeometries.Operators.face_metrics(grid, boundary))
 
-function prepare_solver(solver::CGSolver, grid, boundary::AbstractBoundaryCondition;
+# Read-only during a solve, so it goes on the plan and every task reads the same one: the multigrid
+# hierarchy, or a spectral preconditioner's `λ₀`.
+function prepare_shared(solver::CGSolver, grid, boundary::FlowGeometries.Operators.AbstractBoundaryCondition;
+                        coefficients = _laplacian(grid, boundary))
+    solver.spectral === nothing || return (_constant_rayleigh(coefficients, eltype(grid)), coefficients)
+    return solver.multigrid ? multigrid(coefficients) : nothing
+end
+
+function prepare_solver(solver::CGSolver, grid, boundary::FlowGeometries.Operators.AbstractBoundaryCondition;
                         backend = ComputationalBackends.SerialBackend(), shared = nothing)
     T = eltype(grid)
     dims = size(grid)
     ws = CGWorkspace(_zeros(backend, T, dims), _zeros(backend, T, dims),
                      _zeros(backend, T, dims), _zeros(backend, T, dims))
-    # A plan built before `prepare_shared` existed, or a solver used without one, still works: the
-    # hierarchy is built here instead.
-    pre = shared === nothing && solver.multigrid ?
-          prepare_shared(solver, grid, boundary) : shared
-    bufs = pre === nothing ? nothing : multigrid_buffers(pre, T; backend = backend)
-    return CGState(ws, pre, bufs)
+    sh = shared === nothing ? prepare_shared(solver, grid, boundary) : shared
+    if solver.spectral !== nothing
+        λ0, c = sh
+        st = prepare_solver(solver.spectral, grid, boundary; backend = backend)
+        # The sweep weight and count of the multigrid smoother (see `multigrid`).
+        pre = SpectralPreconditioner(solver.spectral, st, _zeros(backend, T, dims), _zeros(backend, T, dims),
+                                     _zeros(backend, T, dims), c, T(λ0), T(0.8), 2)
+        return CGState(ws, pre, nothing)
+    end
+    bufs = sh === nothing ? nothing : multigrid_buffers(sh; backend = backend)
+    return CGState(ws, sh, bufs)
 end
 
 function solve_poisson!(
     Φ::AbstractArray{T,N}, RHS::AbstractArray{T,N},
-    grid::FaceIndexedGrid{T,G,N}, solver::CGSolver;
-    boundary::AbstractBoundaryCondition,
-    coefficients::LaplacianCoefficients = laplacian_coefficients(grid, boundary),
+    grid::FlowGeometries.Grids.FaceIndexedGrid{T,G,N}, solver::CGSolver;
+    boundary::FlowGeometries.Operators.AbstractBoundaryCondition,
+    coefficients::FlowGeometries.Operators.LaplacianCoefficients = _laplacian(grid, boundary),
     state::CGState = prepare_solver(solver, grid, boundary),
     backend = ComputationalBackends.SerialBackend(),
     kwargs...,
@@ -870,43 +558,46 @@ function solve_poisson!(
     ws = state.workspace
     r, p, Ap, z = ws.r, ws.p, ws.Ap, ws.z
     rtol = _rtol(solver, T)
+    # The fine-grid loops; the preconditioner sizes each of its levels' loops itself.
+    lb = loop_backend(backend, length(Φ))
 
     # Solve A Φ = b with A = −L, which is the positive-definite orientation.
     fill!(Φ, zero(T))
     @. r = -RHS
-    project_out_constant!(r, grid, c; backend = backend)
-    bnorm = sqrt(_dot_measure(r, r, grid, c; backend = backend))
+    FlowGeometries.Operators.project_out_constant!(r, c; backend = lb)
+    bnorm = sqrt(_dot_measure(r, r, grid, c; backend = lb))
     bnorm == 0 && return SolverResult{T}(true, 0, zero(T))
 
     _precondition!(z, r, grid, c, state.preconditioner, state.mgbuffers; backend = backend)
     copyto!(p, z)
-    rz = _dot_measure(r, z, grid, c; backend = backend)
+    rz = _dot_measure(r, z, grid, c; backend = lb)
 
     rnorm = bnorm
     for iter in 1:solver.max_iter
-        apply_laplacian!(Ap, p, grid, c; backend = backend)
+        FlowGeometries.Operators.apply_laplacian!(Ap, p, c; backend = lb)
         @. Ap = -Ap
-        pAp = _dot_measure(p, Ap, grid, c; backend = backend)
+        pAp = _dot_measure(p, Ap, grid, c; backend = lb)
         # A zero curvature means `p` lies in the null space, and no step reduces the residual.
         if iszero(pAp)
-            c.singular && project_out_constant!(Φ, grid, c; backend = backend)
+            FlowGeometries.Operators.project_out_constant!(Φ, c; backend = lb)
             return SolverResult{T}(rnorm <= rtol * bnorm, iter, rnorm / bnorm)
         end
         α = rz / pAp
         @. Φ += α * p
         @. r -= α * Ap
-        c.singular && project_out_constant!(r, grid, c; backend = backend)
-        rnorm = sqrt(_dot_measure(r, r, grid, c; backend = backend))
+        FlowGeometries.Operators.project_out_constant!(r, c; backend = lb)
+        rnorm = sqrt(_dot_measure(r, r, grid, c; backend = lb))
         rnorm <= rtol * bnorm && begin
-            c.singular && project_out_constant!(Φ, grid, c; backend = backend)
+            FlowGeometries.Operators.project_out_constant!(Φ, c; backend = lb)
             return SolverResult{T}(true, iter, rnorm / bnorm)
         end
         _precondition!(z, r, grid, c, state.preconditioner, state.mgbuffers; backend = backend)
-        rz_new = _dot_measure(r, z, grid, c; backend = backend)
-        @. p = z + (rz_new / rz) * p
+        rz_new = _dot_measure(r, z, grid, c; backend = lb)
+        β = _cg_beta(state.preconditioner, z, Ap, pAp, rz_new, rz, grid, c; backend = lb)
+        @. p = z + β * p
         rz = rz_new
     end
-    c.singular && project_out_constant!(Φ, grid, c; backend = backend)
+    FlowGeometries.Operators.project_out_constant!(Φ, c; backend = lb)
     return SolverResult{T}(false, solver.max_iter, rnorm / bnorm)
 end
 
@@ -923,7 +614,7 @@ _precondition!(z, r, grid, c, ::Nothing, ::Any;
                backend = ComputationalBackends.SerialBackend()) =
     _jacobi_precondition!(z, r, grid, c; backend = backend)
 
-function _jacobi_precondition!(z, r, grid, c::LaplacianCoefficients{N,T};
+function _jacobi_precondition!(z, r, grid, c::FlowGeometries.Operators.LaplacianCoefficients{N,T};
                                backend = ComputationalBackends.SerialBackend()) where {N,T}
     d = c.diag
     # Linear, as in `smooth!`: a cell reads only its own diagonal entry.
@@ -937,51 +628,3 @@ function _jacobi_precondition!(z, r, grid, c::LaplacianCoefficients{N,T};
     return z
 end
 
-"""
-    project_out_constant!(Φ, grid, c)
-
-Remove from `Φ`, on each closed component of `L` (see [`ComponentNullspace`](@ref)), its
-measure-weighted mean over that component.
-
-Those constants are `L`'s null space. Krylov iterations must stay orthogonal to it or they drift
-along it, so this is applied to the right-hand side once and to the iterate as it goes.
-"""
-function project_out_constant!(Φ, grid, c::LaplacianCoefficients{N,T};
-                               backend = ComputationalBackends.SerialBackend()) where {N,T}
-    c.singular || return Φ
-    ns = c.nullspace
-    ns.full && return _project_mean!(Φ, c.measure, c.total, backend, T)
-    meas, perm = c.measure, ns.perm
-    for k in eachindex(ns.totals)
-        o = ns.offsets[k] - 1
-        n = ns.offsets[k + 1] - ns.offsets[k]
-        acc = FlowGeometries.Execution.reduce_indices(+, zero(T), n, backend) do i
-            @inbounds begin
-                j = perm[o + i]
-                Φ[j] * meas[j]
-            end
-        end
-        m = acc / ns.totals[k]
-        FlowGeometries.Execution.run_indices(n, backend) do i
-            @inbounds Φ[perm[o + i]] -= m
-            return nothing
-        end
-    end
-    return Φ
-end
-
-# One closed component holding every active cell: both passes are linear, a cell reading its own
-# measure and its own value.
-function _project_mean!(Φ, meas, total, backend, ::Type{T}) where {T}
-    iszero(total) && return Φ
-    acc = FlowGeometries.Execution.reduce_indices(+, zero(T), length(Φ), backend) do lin
-        @inbounds Φ[lin] * meas[lin]
-    end
-    m = acc / total
-    FlowGeometries.Execution.run_indices(length(Φ), backend) do lin
-        # An inactive cell has zero measure and keeps the zero the operator puts there.
-        @inbounds iszero(meas[lin]) || (Φ[lin] -= m)
-        return nothing
-    end
-    return Φ
-end

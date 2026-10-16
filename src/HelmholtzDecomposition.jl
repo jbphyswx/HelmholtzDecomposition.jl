@@ -70,8 +70,7 @@ using SpectralBackends: SpectralBackends
 using LinearAlgebra: LinearAlgebra
 
 include("BoundaryConditions.jl")
-include("Staggering.jl")
-include("Operators.jl")
+include("Execution.jl")
 include("Solvers.jl")
 include("LeastSquares.jl")
 include("Multigrid.jl")

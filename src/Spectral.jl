@@ -38,23 +38,6 @@ function SpectralCartesianResult(u_rot::A, u_div::A, u_harm::A) where {A}
     return SpectralCartesianResult{T,A}(u_rot, u_div, u_harm)
 end
 
-"""
-    SpectralSphericalResult{T,V}
-
-Spherical spectral decomposition result holding the spherical-harmonic coefficients of
-the streamfunction `ψ` and velocity potential `χ`, up to degree `lmax`.
-"""
-struct SpectralSphericalResult{T,V} <: AbstractSpectralHelmholtzResult{T}
-    ψ::V
-    χ::V
-    lmax::Int
-end
-
-function SpectralSphericalResult(ψ::V, χ::V, lmax::Int) where {V}
-    T = real(eltype(V))
-    return SpectralSphericalResult{T,V}(ψ, χ, lmax)
-end
-
 # ---------------------------------------------------------------------------
 # Generic Fourier-space Leray projection
 # ---------------------------------------------------------------------------
@@ -145,9 +128,9 @@ function helmholtz_potentials_spectral(velocity_hat::AbstractArray, ks::NTuple{N
     χ_hat = @. -im * kdotu * inv_k2
 
     kdims = size(velocity_hat)[1:N]
-    P = n_rotation_components(N)
+    P = FlowGeometries.Operators.n_rotation_components(N)
     R_hat = similar(velocity_hat, CT, (kdims..., P))
-    pairs = rotation_pairs(Val(N))
+    pairs = FlowGeometries.Operators.rotation_pairs(Val(N))
     for (p, (a, b)) in enumerate(pairs)
         ûa = comp(velocity_hat, a)
         ûb = comp(velocity_hat, b)
@@ -220,10 +203,11 @@ end
     helmholtz_decompose_spectral(u, v, grid; kwargs...)        # 2D convenience
     helmholtz_decompose_spectral(u, v, w, grid; kwargs...)     # 3D convenience
 
-Decompose a physical velocity field on `grid` using a spectral transform: a physical
-[`HelmholtzResult`](@ref) on a periodic Cartesian grid, the named tuple `(; u_rot, u_div, u_harm)` from
-the scattered and spherical solvers. Requires the appropriate extension (`using FFTW`,
-`using FastSphericalHarmonics`, …). Pass `solver=` to select among loaded spectral backends.
+Decompose a velocity field on `grid` with a spectral transform, into a [`HelmholtzResult`](@ref): the
+FFT on a periodic uniform Cartesian grid, the NUFFT fit on a Cartesian point cloud,
+FastSphericalHarmonics on a Clenshaw–Curtis sphere, NUFSHT on any node set covering the sphere. The
+library is loaded by the caller (`using FFTW`, `using NonuniformFFTs`, …); `solver=` names one.
+A fit that stops short of its tolerance is returned with its convergence in `χ_solve`.
 
 For raw spectral coefficients, use the lower-level [`helmholtz_project_spectral`](@ref).
 """
@@ -242,10 +226,8 @@ end
 """
     _spectral_dispatch(u, grid; solver=AutoSolver(), kwargs...)
 
-Resolve a spectral solver (extensions register them; `AutoSolver` picks the best available)
-and dispatch to the extension's `_decompose_spectral(solver, geometry, u, grid; …)`.
-Dispatching on the solver *type* lets several spectral backends (FFTW + FINUFFT, FSH +
-NUFSHT) coexist for the same geometry without method clashes.
+Resolve a solver with a spectral route ([`_spectral_candidates`](@ref) under `AutoSolver`) and
+dispatch to its extension's `_decompose_spectral(solver, geometry, u, grid; …)`.
 """
 function _spectral_dispatch(u::AbstractArray, grid::FlowGeometries.Grids.AbstractGrid; solver::AbstractPoissonSolver = AutoSolver(), kwargs...)
     s = _resolve_spectral_solver(grid, solver)
@@ -253,20 +235,27 @@ function _spectral_dispatch(u::AbstractArray, grid::FlowGeometries.Grids.Abstrac
 end
 
 function _resolve_spectral_solver(grid::FlowGeometries.Grids.AbstractGrid, solver::AbstractPoissonSolver)
-    # The spectral solvers accept any condition, because a grid they accept has no boundary to
-    # impose one on; the argument is nominal here and only the grid decides.
-    s = solver isa AutoSolver ? _resolve_auto_solver(grid, Neumann()) : solver
-    # Falling through to the iterative solver means no spectral extension applied — which on this
-    # entry point is an error, not a fallback: the caller asked for the spectral path by name.
-    s isa CGSolver && throw(ArgumentError(
+    # A grid a spectral solver accepts has no boundary, so the condition is nominal here.
+    s = solver isa AutoSolver ? _auto_spectral_solver(grid) : solver
+    s === nothing && throw(ArgumentError(
         "helmholtz_decompose_spectral found no spectral solver for this grid. Load one that " *
         "applies (`using FFTW` for a periodic uniform Cartesian grid, `NonuniformFFTs` or `FINUFFT` " *
         "for scattered Cartesian samples, `FastSphericalHarmonics` for a Clenshaw–Curtis sphere, " *
-        "`NUFSHT` for an arbitrary covering sphere), or call `helmholtz_decompose` to solve it " *
-        "iteratively."))
+        "`NUFSHT` for an arbitrary covering sphere), or call `helmholtz_decompose`."))
+    has_spectral_route(s) || throw(ArgumentError(
+        "$(nameof(typeof(s))) has no spectral decomposition route; pass it to `helmholtz_decompose`, " *
+        "or name one of CartesianSpectralSolver, CartesianNUFFTSolver, SphericalSpectralSolver, " *
+        "SphericalNUSHTSolver."))
     _require_library(s)
     _require_domain(s, grid)
     return s
+end
+
+function _auto_spectral_solver(grid::FlowGeometries.Grids.AbstractGrid)
+    for candidate in _spectral_candidates(grid)
+        _applicable(candidate, grid, FlowGeometries.Operators.Neumann()) && return candidate
+    end
+    return nothing
 end
 
 # Hook implemented by spectral extensions: dispatch on the solver type.
@@ -275,34 +264,24 @@ function _decompose_spectral end
 """
     build_cartesian_result(grid, U, velocity_hat, ks, inverse) -> HelmholtzResult
 
-Assemble a physical [`HelmholtzResult`](@ref) from a component-last spectral velocity array.
-`inverse(spectral_scalar)` maps one spectral scalar field (`(kdims...)`) back to a physical one
-(`(dims...)`). Used by the regular-grid spectral extensions (FFTW).
+Assemble a [`HelmholtzResult`](@ref) from a component-last spectral velocity array on a uniform,
+unmasked, periodic Cartesian grid. `inverse(spectral_scalar)` maps one spectral scalar field
+(`(kdims...)`) back to a physical one (`(dims...)`).
 
-`N + P + 2` inverse transforms are taken, not `2N + 2P + 2`:
-
-- `u_rot` is `U − u_div − u_harm` in physical space, so it costs nothing;
-- `u_harm` is the `k = 0` mode, i.e. a constant field, and is the component mean — no transform;
-- the rotation tensor `W = ΔR` is not materialised at all. It was `P` inverse transforms for a
-  quantity recomputable from `R`, and no longer has a field on the result.
-
-On this path `rotation_potential` holds **cell-centred** arrays, where the finite-difference path
-holds corner-staggered ones. The field is type-parameterised for exactly this reason, but the
-staggering does depend on which path produced the result.
+`N + P + 2` inverse transforms: `u_div` (`N`), the rotation potential (`P`), `χ` and the divergence.
+`u_harm` is the `k = 0` mode, each component's mean, and `u_rot = U − u_div − u_harm`. Every cell has
+the same measure here, so the fractions are ratios of plain sums of squares, which run on the
+array's own device. `rotation_potential` holds cell-centred arrays.
 """
-function build_cartesian_result(grid::FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,N}, U, velocity_hat, ks::NTuple{N,Any}, inverse;
-                                backend = ComputationalBackends.SerialBackend()) where {N,T}
+function build_cartesian_result(grid::FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,N}, U, velocity_hat, ks::NTuple{N,Any}, inverse) where {N,T}
     proj = helmholtz_project_spectral(velocity_hat, ks)
     χ_hat, R_hat = helmholtz_potentials_spectral(velocity_hat, ks)
 
     K = _derivative_symbol(velocity_hat, T, ks)
     comp(A, c) = _component(A, c, Val(N))
 
-    # δ_hat = i k·û, accumulated in place rather than by rebinding — the rebinding form
-    # allocated a fresh full-size spectral array per component.
-    # The component views are taken outside the `@.`: it dots every call in the expression, so
-    # `comp(velocity_hat, b)` inside one becomes `comp.(velocity_hat, b)` — the accessor mapped
-    # over each element rather than called once.
+    # δ_hat = i k·û, accumulated in place. The component views are taken outside the `@.`, which
+    # dots every call inside it.
     û1 = comp(velocity_hat, 1)
     δ_hat = similar(û1)
     K1 = K[1]
@@ -314,41 +293,50 @@ function build_cartesian_result(grid::FlowGeometries.Grids.StructuredGrid{T,<:Fl
     end
     @. δ_hat *= im
 
-    P = n_rotation_components(N)
+    P = FlowGeometries.Operators.n_rotation_components(N)
     dims = size(grid)
 
-    # The output array is allocated from the known shape, so nothing here infers as
-    # `Union{Nothing,Array}` and the closure is not captured into a box.
-    # `similar(U, …)` rather than `Array{T,N+1}(undef, …)`: the result then lives wherever
-    # the input does, which is what lets a device array take this path unchanged.
+    # Allocated like `U`, so the result lives where the input does.
     u_div = similar(U, T, (dims..., N))
     for c in 1:N
         copyto!(_component(u_div, c, Val(N)), inverse(comp(proj.u_div, c)))
     end
 
-    # One array per component, matching the finite-difference path's container, so that
-    # `streamfunction` and `vector_potential` index the same way whichever path built the result.
+    # One array per component, as on the staggered path, so `streamfunction` and `vector_potential`
+    # index either the same way.
     Rpot = ntuple(p -> inverse(comp(R_hat, p)), Val(P))
 
     χ = inverse(χ_hat)
     divergence = inverse(δ_hat)
 
-    # The harmonic part is the k = 0 mode: a constant field, equal to each component's mean.
     u_harm = similar(U, T, (dims..., N))
     for c in 1:N
-        fill!(_component(u_harm, c, Val(N)), sum(_component(U, c, Val(N))) / length(_component(U, c, Val(N))))
+        Uc = _component(U, c, Val(N))
+        fill!(_component(u_harm, c, Val(N)), sum(Uc) / length(Uc))
     end
 
     u_rot = similar(U, T, (dims..., N))
     @. u_rot = U - u_div - u_harm
 
-    den = velocity_norm(U, grid; backend = backend)
-    hfrac = iszero(den) ? zero(T) :
-            velocity_norm(u_harm, grid; backend = backend) / den
+    den = sum(abs2, U)
+    hfrac = iszero(den) ? zero(T) : sqrt(sum(abs2, u_harm) / den)
     ok = SolverResult{T}(true, 1, zero(T))
     return HelmholtzResult{N,P,T,typeof(u_div),typeof(χ),typeof(Rpot)}(
-        u_rot, u_div, u_harm, χ, Rpot, divergence, hfrac, ok, ntuple(_ -> ok, Val(P)),
+        u_rot, u_div, u_harm, χ, Rpot, divergence, hfrac, zero(T), ok, ntuple(_ -> ok, Val(P)),
     )
+end
+
+"""
+    _measure_ratio(A, B, grid) -> T
+
+`‖A‖/‖B‖` for component-last arrays over the cells or nodes of `grid`, weighted by its measure; zero
+where `B` is zero. A host reduction for the spectral fits.
+"""
+function _measure_ratio(A::AbstractArray{T}, B::AbstractArray{T}, grid) where {T}
+    w = FlowGeometries.Grids.measure(grid)
+    sq(X) = sum(c -> sum(w .* abs2.(selectdim(X, ndims(X), c))), 1:size(X, ndims(X)))
+    den = sq(B)
+    return iszero(den) ? zero(T) : T(sqrt(sq(A) / den))
 end
 
 """

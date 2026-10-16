@@ -6,8 +6,9 @@
 
 Helmholtz–Hodge decomposition of velocity fields into **rotational** (divergence-free),
 **divergent** (curl-free), and **harmonic** components — in **1D/2D/3D and generically N-D**,
-on Cartesian and spherical grids, on **CPU and GPU**, with serial / threaded / distributed /
-MPI execution backends.
+on Cartesian and spherical grids. One decomposition runs serially, threaded, or as
+KernelAbstractions kernels on a device; a batch of fields runs threaded, on Distributed workers or
+on MPI ranks.
 
 ```
 u  =  u_div (∇χ)  ⊕  u_rot (rot R)  ⊕  u_harm
@@ -42,8 +43,9 @@ Then for coarse-graining: filter ψ̄, χ̄ as scalars → reconstruct velocity 
 
 ### Harmonic circulation on an annulus (multiply-connected domain)
 
-A pure circulation around a masked hole is **harmonic** — `u_rot ≈ 0`, `u_div ≈ 0`, and the
-whole field lands in `u_harm` (`harmonic_fraction ≈ 1`, `count_holes = 1`).
+A pure circulation around a masked hole is **harmonic** and lands in `u_harm` (`count_holes = 1`).
+The part of it that crosses the square box's edge is divergent under the natural boundary condition
+`∂χ/∂n = u·n̂`.
 
 ![Harmonic Annulus Decomposition](docs/src/assets/harmonic_annulus_decomposition.png)
 
@@ -100,7 +102,7 @@ grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs)
 # Physical-space decomposition (mask- and boundary-aware; a transform where one applies)
 result = HD.helmholtz_decompose(u, v, grid)
 
-# Or the fully spectral path (exact derivatives, physical fields back)
+# Or, on a periodic grid (`topology = (true, true)`), the fully spectral path
 result = HD.helmholtz_decompose_spectral(u, v, grid)
 
 # Velocity-like fields use a component-last layout (dims..., N):
@@ -108,23 +110,38 @@ result.u_rot          # rotational (divergence-free) velocity, (Nx, Ny, 2)
 result.u_div          # divergent (curl-free) velocity
 result.u_harm         # harmonic remainder
 result.χ              # scalar velocity potential
-HD.streamfunction(result)   # ψ (2D); HD.vector_potential(result) in 3D
-result.harmonic_fraction    # ‖u_harm‖ / ‖u‖ — how much lives in the harmonic subspace
+HD.streamfunction(result)   # ψ (2D); HD.vector_potential(result) in 3D, u_rot = ∇ × A
+result.harmonic_fraction    # ‖u_harm‖ / ‖u‖ on faces: the share in the harmonic subspace
+result.residual_fraction    # the share of u the staggered representation does not carry
 ```
 
-### N-dimensional, GPU, and batch
+Under `Neumann` (the default) the split is the natural Helmholtz–Hodge decomposition: the
+divergent part carries the normal velocity through every bounded edge (`∂χ/∂n = u·n̂`), and the
+rotational and harmonic parts carry none. Every route returns a `HelmholtzResult`; a solve or fit
+that stops short of its tolerance is returned with `converged == false` in `χ_solve`/`rot_solve`.
+
+### N-dimensional, devices, and batch
 
 ```julia
+using ComputationalBackends: ComputationalBackends as CB
+
 # 3-D: pass a single component-last array (Nx, Ny, Nz, 3)
 res3 = HD.helmholtz_decompose_spectral(U3, grid3)
 A1, A2, A3 = HD.vector_potential(res3)
 
-# GPU: pass a CuArray (requires `using CUDA`); AutoBackend routes to the CUFFT path
-res_gpu = HD.helmholtz_decompose_spectral(CUDA.cu(U), grid)
+# A device: plan with a GPUBackend over a KernelAbstractions backend (`using KernelAbstractions`
+# and the vendor package); the loops run as kernels and the arrays stay on the device.
+plan = HD.plan_helmholtz(grid; backend = CB.GPUBackend(CUDA.CUDABackend()), solver = HD.CGSolver())
 
-# Batch many snapshots in parallel (ThreadedBackend / DistributedBackend / MPIBackend)
-results = HD.helmholtz_decompose_batch(grid, fields; backend = HD.ThreadedBackend())
+# Many snapshots on one grid (`using OhMyThreads`, `Distributed` or `MPI` for the parallel axes)
+plan = HD.plan_helmholtz(grid)
+batch = HD.helmholtz_decompose_batch(plan, fields; backend = CB.ThreadedBackend())
 ```
+
+`AutoBackend()`, the default, threads the loops when Julia runs more than one thread and runs them
+serially otherwise; it does not read the array type, so a device array needs its `GPUBackend`
+named. The device path is checked against the host on `KernelAbstractions.CPU()` and on JLArrays in
+the test suite; `gpu/runtests.jl` runs the same comparison on CUDA hardware.
 
 ### Scattered / unstructured data
 
@@ -140,7 +157,7 @@ using FlowTransformBindings: FlowTransformBindings as FTB
 # One coordinate vector per direction, plus a control volume per node.
 pts = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (x, y), areas;
                                 periodic = (true, true), period = (Lx, Ly))
-res = HD.helmholtz_decompose_spectral(U, pts)   # U is (M, 2) → (; u_rot, u_div, u_harm)
+res = HD.helmholtz_decompose_spectral(U, pts)   # U is (M, 2); parts, χ, ψ and ∇·u at the points
 
 # Or name the library and the mode count:
 solver = HD.CartesianNUFFTSolver(FTB.NonuniformFFTsBackend(); nk = (32, 32))
@@ -165,7 +182,7 @@ res  = HD.helmholtz_decompose_spectral(U, grid)   # U is (nlon, nlat, 2) = (u_ea
 ```
 
 The expansion degree is sized from the grid unless `lmax` is given, and a fit that does not
-converge raises.
+converge is returned flagged.
 
 ### Multiply-connected domains (the harmonic part)
 
@@ -198,9 +215,10 @@ On the sphere (radius R):
 
 ## When is Helmholtz Required?
 
-- **NOT needed:** Non-divergent velocity (e.g., SSH-derived geostrophic flow) — Storer et al. (2022)
-- **REQUIRED:** Full model velocity with both rotational AND divergent components
-- **ALSO needed:** Separating energy flux Π into toroidal/potential contributions — Buzzicotti et al. (2023)
+- **Not needed:** non-divergent velocity, e.g. SSH-derived geostrophic flow — Storer et al. (2022)
+- **Required:** full model velocity with both rotational and divergent components
+- **Also needed:** separating the energy flux Π into toroidal and potential contributions —
+  Buzzicotti et al. (2023)
 
 ## Two backend axes
 
@@ -218,13 +236,21 @@ The package keeps two orthogonal axes separate:
 | `HD.SphericalSpectralSolver()` (FastSphericalHarmonics) | Clenshaw–Curtis lat/lon (`Nlon = 2·Nlat−1`) |
 | `HD.SphericalNUSHTSolver()` (NUFSHT) | any spherical node set covering `S²` |
 
-`AutoSolver` is mask-aware (never picks a periodic spectral solver on a masked domain) and
-prefers the regular FFT/SHT on structured grids.
+The spherical transforms invert the continuous Laplacian. `helmholtz_decompose_spectral` uses them
+directly; on the staggered path (`helmholtz_decompose`, `plan_helmholtz`) they precondition
+`CGSolver` on the grid's own discrete Laplacian, named or chosen by `AutoSolver`, so the divergent
+part carries the field's divergence on the grid to the solver tolerance.
 
-**Execution backend** (where/how arrays compute): `SerialBackend`, `ThreadedBackend`
-(`using OhMyThreads`), `GPUBackend` (`using CUDA`), `DistributedBackend` (`using Distributed`),
-`MPIBackend` (`using MPI`). Passed via `backend=` to `helmholtz_decompose` /
-`helmholtz_decompose_batch`; `AutoBackend()` infers it from the array type.
+`AutoSolver` is mask-aware (never picks a transform on a masked domain) and takes a Cartesian
+transform where one applies, a spherical preconditioner on a sphere whose nodes one accepts, and
+multigrid otherwise.
+
+**Execution backend** (where the loops of one decomposition run): `SerialBackend`,
+`ThreadedBackend`, `GPUBackend(backend)` over a KernelAbstractions backend, passed as `backend=` to
+`plan_helmholtz` / `helmholtz_decompose`. **Batch backend** (how fields are spread):
+`SerialBackend`, `ThreadedBackend` (`using OhMyThreads`), `DistributedBackend`
+(`using Distributed`), `MPIBackend` (`using MPI`), passed as `backend=` to
+`helmholtz_decompose_batch`. `AutoBackend()` is threads when Julia runs more than one, else serial.
 
 ## Relationship to Structure Function "Helmholtz Decomposition"
 

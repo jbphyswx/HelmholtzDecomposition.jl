@@ -1,8 +1,6 @@
 # Internals
 
-Not part of the interface and not subject to its stability. Documented because a reader following
-the operator construction or the solver dispatch will meet them, and because a manual that omits
-half of what a module defines is harder to trust than one that marks the boundary explicitly.
+Names internal to the package, outside its stability guarantee.
 
 ## Spectral result types
 
@@ -12,7 +10,6 @@ these carry the spectral path's own intermediate form.
 ```@docs
 HelmholtzDecomposition.AbstractSpectralHelmholtzResult
 HelmholtzDecomposition.SpectralCartesianResult
-HelmholtzDecomposition.SpectralSphericalResult
 HelmholtzDecomposition.build_cartesian_result
 ```
 
@@ -21,15 +18,43 @@ HelmholtzDecomposition.build_cartesian_result
 ```@docs
 HelmholtzDecomposition.CGWorkspace
 HelmholtzDecomposition.CGState
+HelmholtzDecomposition.SpectralPreconditioner
 HelmholtzDecomposition._precondition!
-HelmholtzDecomposition.ComponentNullspace
-HelmholtzDecomposition._nullspace
-HelmholtzDecomposition._require_converged
 HelmholtzDecomposition._require_domain
 HelmholtzDecomposition._require_sampling
 HelmholtzDecomposition._unavailable_message
 HelmholtzDecomposition._auto_candidates
+HelmholtzDecomposition._preconditioner_candidates
+HelmholtzDecomposition._spectral_candidates
 HelmholtzDecomposition._spectral_dispatch
+```
+
+## Solver kernels
+
+```@docs
+HelmholtzDecomposition._dot_measure
+HelmholtzDecomposition.lazy_axis_sum
+HelmholtzDecomposition._sampling_message
+HelmholtzDecomposition._WORKSPACE_LOCK
+```
+
+## Conditioning of the scattered fit
+
+```@docs
+HelmholtzDecomposition.CGLanczos
+HelmholtzDecomposition.condition_estimate
+HelmholtzDecomposition.condition_limit
+HelmholtzDecomposition.warn_conditioning
+```
+
+## Face-space parts and fractions
+
+```@docs
+HelmholtzDecomposition._divergent_faces!
+HelmholtzDecomposition._add_edge_flux!
+HelmholtzDecomposition._face_norm
+HelmholtzDecomposition._remainder_norm
+HelmholtzDecomposition._measure_ratio
 ```
 
 ## Scattered Cartesian fit
@@ -44,15 +69,6 @@ HelmholtzDecomposition.inverse_nufft!
 HelmholtzDecomposition._coldot
 HelmholtzDecomposition._reflect
 HelmholtzDecomposition._unpack!
-```
-
-## Grid walking
-
-```@docs
-HelmholtzDecomposition.cell_above
-HelmholtzDecomposition.cell_below
-HelmholtzDecomposition.face_below
-HelmholtzDecomposition.geometric_face_area
 ```
 
 ## Batch and backend plumbing

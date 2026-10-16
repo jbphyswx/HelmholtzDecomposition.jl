@@ -1,15 +1,7 @@
-"""
-    HelmholtzDecompositionDistributedExt — multiprocess batch decomposition.
-
-Parallelizes [`helmholtz_decompose_batch`](@ref) across worker processes. The package must be
-loaded on the workers (`@everywhere using HelmholtzDecomposition`). Results are returned in input
-order.
-
-Work is chunked **per worker**, not per field. A `pmap` over individual fields sends one message
-and serializes the plan once per field; over `nworkers()` chunks it does so once per worker, and
-each worker builds a single workspace and reuses it down its chunk — which is the same reason the
-threaded extension takes a workspace per task rather than per field.
-"""
+# Multiprocess batch decomposition: `helmholtz_decompose_batch` across worker processes, results in
+# input order. The package must be loaded on the workers (`@everywhere using HelmholtzDecomposition`).
+# Each worker takes one contiguous chunk of the batch, receives the plan once, and reuses one
+# workspace down its chunk.
 module HelmholtzDecompositionDistributedExt
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
@@ -38,8 +30,8 @@ function HD._decompose_batch!(
     items = collect(fields)
     isempty(items) && return batch
     ranges = _chunks(length(items), max(1, Distributed.nworkers()))
-    # A worker cannot write into the caller's arrays, so each returns its chunk as its own batch
-    # and the slices are copied in here — one message per worker rather than one per field.
+    # A worker cannot write into the caller's arrays, so each returns its chunk as its own batch,
+    # one message per worker, and the slices are copied in here.
     parts = Distributed.pmap(ranges) do rng
         # Serial within a worker, FastTransforms on one OpenMP thread included: each worker process
         # gets one chunk of the batch, and the processes carry the parallelism.

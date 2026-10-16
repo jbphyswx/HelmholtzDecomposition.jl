@@ -19,10 +19,9 @@ loaded and FINUFFT when only it is. `nk` is the mode count per axis and its leng
 the fitted series spans `|k_d| ≤ ⌊nk_d/2⌋`. `rtol`/`maxiter` govern the conjugate gradients of the fit,
 and `tol` is the transforms' relative accuracy, by default the `rtol` the fit is asked for.
 
-The iterations a fit needs grow with the mode-to-point ratio, and any ratio below one is accepted.
-`maxiter` is sized so that conditioning is what an unconvergeable fit runs into: a budget set for a
-well-sampled fit refuses a legitimate one near the top of that range, and the refusal then names
-`nk` when the cap was the only thing missing.
+The iterations a fit needs grow with the mode-to-point ratio, and any ratio below one is accepted. A
+fit that stops at `maxiter` short of `rtol` is returned as it stands, with `converged == false` in the
+result's `χ_solve` and `rot_solve`.
 
 `condition_limit` is the `κ(A)` above which the fit reports that the nodes determine the
 coefficients too poorly for `rtol`. It defaults to `√(rtol/eps(T))`, the level where a
@@ -89,7 +88,7 @@ const _CartesianCloud{T,D} =
     FlowGeometries.Grids.UnstructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,D}
 
 # A NUFFT expands in the same periodic basis an FFT does, over every sample it is handed.
-supports_boundary(::CartesianNUFFTSolver, ::AbstractBoundaryCondition) = true
+supports_boundary(::CartesianNUFFTSolver, ::FlowGeometries.Operators.AbstractBoundaryCondition) = true
 requires_full_domain(::CartesianNUFFTSolver) = true
 
 # The solver expands a point cloud, and its methods take an `UnstructuredGrid` at a matching
@@ -171,6 +170,10 @@ _nfits(::_ComplexPairs, D::Int) = cld(D, 2)
 _library_threads(::ComputationalBackends.AbstractThreadedBackend) = Threads.nthreads()
 _library_threads(::ComputationalBackends.AbstractExecutionBackend) = 1
 
+# Keywords for an `AbstractFFTs` plan over `a` under `backend`. An extension whose library takes a
+# thread count adds the method for the arrays it plans, so each plan runs on the backend's threads.
+_plan_kwargs(a, backend) = (;)
+
 # ---------------------------------------------------------------------------
 # The normal-equations fit
 # ---------------------------------------------------------------------------
@@ -251,12 +254,12 @@ end
 end
 
 """
-    inverse_nufft!(F, vals, plan, cg, weight; rtol, maxiter, atol = 0) -> Bool
+    inverse_nufft!(F, vals, plan, cg, weight; rtol, maxiter, atol = 0) -> SolverResult
 
 Least-squares Fourier coefficients of the bandlimited fields matching `vals` at the plan's nodes:
 conjugate gradients on `(AᴴA) F = Aᴴ vals`, with `A` the type-2 synthesis and `Aᴴ` its adjoint,
-in the mode-space inner product `weight` names (see [`_coldot`](@ref)). Returns whether the fit
-reached its tolerance.
+in the mode-space inner product `weight` names (see [`_coldot`](@ref)). Returns whether every column
+reached its tolerance, the iterations taken, and the largest relative mode-space residual.
 
 Its working set comes from [`CGBuffers`](@ref), so repeated fits over one point set allocate none.
 """
@@ -275,12 +278,16 @@ function inverse_nufft!(F::AbstractArray, vals::AbstractArray,
     rpt = cg.rpt; copyto!(rpt, vals)        # `b − A F` at `F = 0`
     fill!(F, zero(eltype(F)))
     rs = cg.rs; rs_new = cg.rs_new; den = cg.den; bn = cg.bn; rn = cg.rn
+    RT = eltype(rs)
     _coldot(r, r, rs, weight)
     _coldot(b, b, bn, weight)
-    all(iszero, bn) && return true
+    all(iszero, bn) && return SolverResult{RT}(true, 0, zero(RT))
+    copyto!(rs_new, rs)
     check_atol = atol > 0
     converged = false
+    iters = 0
     for iter in 1:maxiter
+        iters = iter
         FlowTransformBindings.nufft_type2!(scratch, plan, d)      # A d
         FlowTransformBindings.nufft_type1!(Ap, plan, scratch)     # Aᴴ A d
         _coldot(d, Ap, den, weight)
@@ -323,7 +330,11 @@ function inverse_nufft!(F::AbstractArray, vals::AbstractArray,
             rs[c] = rs_new[c]
         end
     end
-    return converged
+    resid = zero(RT)
+    for c in 1:nc
+        iszero(bn[c]) || (resid = max(resid, sqrt(rs_new[c] / bn[c])))
+    end
+    return SolverResult{RT}(converged, iters, resid)
 end
 
 """
@@ -367,25 +378,6 @@ end
     prod(nk) <= M || throw(ArgumentError(
         "$(join(nk, "×")) = $(prod(nk)) modes cannot be determined from $M samples; reduce `nk`."))
     return nothing
-end
-
-"""
-    _require_converged(ok, nk, M, solver)
-
-Refuse a fit that did not reach its tolerance.
-
-`prod(nk) ≤ M` is necessary and nowhere near sufficient: the normal equations lose conditioning as
-the mode count approaches the sample count, well before they become singular, and an unconverged
-fit is a smooth field that does not match the samples. The test is therefore whether the fit
-converged, which the iteration already knows.
-"""
-@inline function _require_converged(ok::Bool, nk::NTuple{D,Int}, M::Int, solver) where {D}
-    ok && return nothing
-    throw(ArgumentError(
-        "the non-uniform fit did not reach rtol=$(solver.rtol) in $(solver.maxiter) iterations " *
-        "for $(join(nk, "×")) modes at $M points ($(round(prod(nk) / M; digits = 2)) modes per " *
-        "point). The normal equations lose conditioning as that ratio approaches 1; reduce `nk`, " *
-        "supply more points, or raise `maxiter`."))
 end
 
 # A non-uniform FFT expands in a periodic basis over the grid's period, and an aperiodic grid
@@ -443,7 +435,7 @@ _inner_weights(::_RealComponents, plan, ::Type{T}) where {T} =
     T[k == 0 ? one(T) : T(2) for k in FlowTransformBindings.mode_frequencies(plan, 1)]
 
 function prepare_solver(solver::CartesianNUFFTSolver{L,D}, grid::_CartesianCloud{T,D},
-                        ::AbstractBoundaryCondition;
+                        ::FlowGeometries.Operators.AbstractBoundaryCondition;
                         backend = ComputationalBackends.SerialBackend(),
                         shared = nothing) where {L,D,T}
     lib = _nufft_library(solver.nufft)
@@ -489,17 +481,18 @@ function _decompose_spectral(solver::CartesianNUFFTSolver{L,D},
     # call frees its plan and a repeated one keeps it.
     owned = state === nothing
     st = owned ?
-         prepare_solver(solver, grid, Neumann(); backend = resolve_execution_backend(backend)) :
+         prepare_solver(solver, grid, FlowGeometries.Operators.Neumann();
+                        backend = resolve_execution_backend(backend)) :
          state
     try
-        return _decompose_scattered(solver, U, st)
+        return _decompose_scattered(solver, U, st, grid)
     finally
         owned && close!(st)
     end
 end
 
 function _decompose_scattered(solver::CartesianNUFFTSolver{L,D}, U::AbstractMatrix{T},
-                              st::ScatteredState{D,T}) where {L,D,T}
+                              st::ScatteredState{D,T}, grid) where {L,D,T}
     nk = solver.nk
     M = FlowTransformBindings.npoints(st.plan)
     size(U, 2) == D || throw(DimensionMismatch(
@@ -508,13 +501,14 @@ function _decompose_scattered(solver::CartesianNUFFTSolver{L,D}, U::AbstractMatr
         "velocity has $(size(U, 1)) rows against $M nodes in the plan"))
 
     velocity_hat = st.velocity_hat
+    fit = SolverResult{T}(true, 0, zero(T))
     for q in 1:_nfits(st.packing, D)
         _load_samples!(st.buf, st.packing, U, q, D)
-        ok = inverse_nufft!(st.packed, st.buf, st.plan, st.cg, st.weight; rtol = solver.rtol,
-                            maxiter = solver.maxiter, atol = solver.atol)
-        _require_converged(ok, nk, M, solver)
-        # A converged fit says the samples are reproduced; the conditioning says whether they pick
-        # out one coefficient vector or many.
+        s = inverse_nufft!(st.packed, st.buf, st.plan, st.cg, st.weight; rtol = solver.rtol,
+                           maxiter = solver.maxiter, atol = solver.atol)
+        fit = _worst(fit, s)
+        # Convergence says the samples are reproduced; the conditioning says whether they pick out
+        # one coefficient vector or many.
         warn_conditioning(condition_estimate(st.cg.lanczos, 1), solver.rtol,
                           solver.condition_limit, M, prod(nk))
         _store_fit!(velocity_hat, st.packing, st.packed, q, D)
@@ -529,12 +523,48 @@ function _decompose_scattered(solver::CartesianNUFFTSolver{L,D}, U::AbstractMatr
     u_rot = similar(U, T, M, D)
     u_div = similar(U, T, M, D)
     u_harm = similar(U, T, M, D)
-    for (out, spec) in ((u_rot, rot), (u_div, div), (u_harm, harm)), q in 1:_nfits(st.packing, D)
-        _load_modes!(st.packed, st.packing, spec, q, D)
-        FlowTransformBindings.nufft_type2!(st.buf, st.plan, st.packed)
-        _store_samples!(out, st.packing, st.buf, q, D)
+    _synthesize!(u_rot, rot, st)
+    _synthesize!(u_div, div, st)
+    _synthesize!(u_harm, harm, st)
+
+    # χ, the `P` rotation-potential components and the divergence, as `P + 2` real scalars.
+    P = FlowGeometries.Operators.n_rotation_components(D)
+    χ_hat, R_hat = helmholtz_potentials_spectral(velocity_hat, st.ks)
+    K = _derivative_symbol(velocity_hat, T, st.ks)
+    kdims = size(χ_hat)
+    S = similar(velocity_hat, Complex{T}, (kdims..., P + 2))
+    copyto!(selectdim(S, D + 1, 1), χ_hat)
+    for p in 1:P
+        copyto!(selectdim(S, D + 1, 1 + p), selectdim(R_hat, D + 1, p))
     end
-    return (; u_rot, u_div, u_harm)
+    δ_hat = selectdim(S, D + 1, P + 2)
+    fill!(δ_hat, zero(Complex{T}))
+    for d in 1:D
+        Kd, ûd = K[d], selectdim(velocity_hat, D + 1, d)
+        @. δ_hat += im * Kd * ûd
+    end
+    scalars = similar(U, T, M, P + 2)
+    _synthesize!(scalars, S, st)
+    χ = scalars[:, 1]
+    Rpot = ntuple(p -> scalars[:, 1 + p], Val(P))
+    divergence = scalars[:, P + 2]
+
+    hfrac = _measure_ratio(u_harm, U, grid)
+    rfrac = _measure_ratio(U .- u_rot .- u_div .- u_harm, U, grid)
+    return HelmholtzResult{D,P,T,typeof(u_rot),typeof(χ),typeof(Rpot)}(
+        u_rot, u_div, u_harm, χ, Rpot, divergence, hfrac, rfrac, fit, ntuple(_ -> fit, Val(P)))
+end
+
+# The `n` real fields whose spectra are the last axis of `spec`, at the plan's points, into the
+# columns of `out`: one type 2 per real-transform field, one per pair of fields as `a + ib`.
+function _synthesize!(out::AbstractMatrix, spec::AbstractArray, st::ScatteredState)
+    n = size(out, 2)
+    for q in 1:_nfits(st.packing, n)
+        _load_modes!(st.packed, st.packing, spec, q, n)
+        FlowTransformBindings.nufft_type2!(st.buf, st.plan, st.packed)
+        _store_samples!(out, st.packing, st.buf, q, n)
+    end
+    return out
 end
 
 # Fit `q`'s samples: component `q`, or components `2q − 1` and `2q` as `u + iv`. An odd component

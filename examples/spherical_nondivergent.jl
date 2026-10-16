@@ -5,8 +5,8 @@ A purely rotational flow on a lat–lon sphere: the divergent component should v
 metric is what makes this a real test — the face areas carry the `cos φ` that closes the surface,
 and the operators are built so `curl ∘ grad = 0` holds on it exactly.
 
-`FastSphericalHarmonics` or `NUFSHT` give an `O(N log N)` spectral solve on a covering node set;
-this lat–lon grid is not one of theirs, so it takes the multigrid-preconditioned iterative path.
+The solve is multigrid-preconditioned conjugate gradients on the grid's own Laplacian; loading
+`NUFSHT` makes its transform the preconditioner instead.
 """
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
@@ -31,4 +31,4 @@ println("solver:                $(nameof(typeof(HD.plan_helmholtz(grid).solver))
 println("|u_div| / |u|:         $(round(maximum(speed(result.u_div)) / maximum(speed(U)), sigdigits = 3))")
 println("Harmonic fraction:     $(round(result.harmonic_fraction, sigdigits = 4))")
 println("χ solve:               $(result.χ_solve.iterations) iterations, converged = $(result.χ_solve.converged)")
-println("Reconstruction error:  $(round(maximum(abs.(result.u_rot .+ result.u_div .+ result.u_harm .- U)), sigdigits = 4))")
+println("Residual fraction:     $(round(result.residual_fraction, sigdigits = 4))")

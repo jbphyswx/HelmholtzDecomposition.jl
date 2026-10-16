@@ -1,17 +1,8 @@
-"""
-    HelmholtzDecompositionOhMyThreadsExt — multithreaded batch decomposition.
-
-Parallelizes [`helmholtz_decompose_batch`](@ref) over the batch, which is the axis that is
-race-free by construction: the fields are independent and each writes only its own result.
-
-One [`HelmholtzPlan`](@ref) is shared by every task — its Laplacian coefficients are identical
-for all of them and are the expensive part, so rebuilding per task would defeat the batch. Each
-task takes its own [`HelmholtzWorkspace`](@ref) through `@local`, allocated once per task rather
-than once per field, since those buffers are written through and sharing them would race.
-
-The inner decomposition runs serially, FastTransforms on one OpenMP thread included
-(`FlowTransformBindings.FASTTRANSFORMS_THREADS`): the batch axis claims the threads.
-"""
+# Multithreaded batch decomposition: `helmholtz_decompose_batch` over the batch, whose fields are
+# independent and each write only their own result. Every task shares one `HelmholtzPlan`, read-only
+# during a solve, and takes one `HelmholtzWorkspace` through `@local`, which its fields reuse. The
+# decomposition inside a field runs serially, FastTransforms on one OpenMP thread included
+# (`FlowTransformBindings.FASTTRANSFORMS_THREADS`): the batch axis claims the threads.
 module HelmholtzDecompositionOhMyThreadsExt
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
