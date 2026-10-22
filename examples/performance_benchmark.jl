@@ -27,8 +27,8 @@ function report(N::Int)
     Random.seed!(1)
     u = randn(N, N, 2)
 
-    tplan = best(() -> @elapsed HD.plan_helmholtz(grid; backend = CB.SerialBackend()))
-    plan = HD.plan_helmholtz(grid; backend = CB.SerialBackend())
+    tplan = best(() -> @elapsed HD.plan_helmholtz(grid; execution = CB.SerialBackend()))
+    plan = HD.plan_helmholtz(grid; execution = CB.SerialBackend())
     tws = best(() -> @elapsed HD.allocate_workspace(plan))
     ws, res = HD.allocate_workspace(plan), HD.allocate_result(plan)
 
@@ -53,12 +53,12 @@ println("=== Batch: one plan, one contiguous result ===")
 for (N, B) in ((128, 32), (256, 16))
     axis = range(0.0, 1.0; length = N)
     grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), axis, axis)
-    plan = HD.plan_helmholtz(grid; backend = CB.SerialBackend())
+    plan = HD.plan_helmholtz(grid; execution = CB.SerialBackend())
     Random.seed!(2)
     fields = [randn(N, N, 2) for _ in 1:B]
     batch = HD.allocate_batch(plan, B)
     run = () -> @elapsed HD.helmholtz_decompose_batch!(batch, fields, plan;
-                                                       backend = CB.SerialBackend())
+                                                       execution = CB.SerialBackend())
     t = best(run, 2)
     Printf.@printf("%5d² × %-4d | %8.1f ms total | %6.2f ms/field\n", N, B, 1e3t, 1e3t / B)
 end

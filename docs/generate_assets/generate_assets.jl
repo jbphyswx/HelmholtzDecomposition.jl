@@ -197,8 +197,7 @@ function figure_spherical()
     grid = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(1.0), lons, lats;
                                    topology = (true, false), period = (2π, nothing))
     u, v, = ReferenceFlows.kelvin_ekman_flow(grid)
-    NUExt = Base.get_extension(HD, :HelmholtzDecompositionNUFSHTExt)
-    nusht = NUExt.SphericalNUSHTSolver(; lmax = Nlat - 1, tol = 1e-8)
+    nusht = HD.SphericalNUSHTSolver(; lmax = Nlat - 1, tol = 1e-8)
     res = HD.helmholtz_decompose(cat(u, v; dims = 3), grid; solver = nusht)
 
     fig = CairoMakie.Figure(; size = (1200, 760), fontsize = 14)

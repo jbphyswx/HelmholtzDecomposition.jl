@@ -33,6 +33,7 @@ using AbstractFFTs: AbstractFFTs
 using FFTW: FFTW
 using FINUFFT: FINUFFT
 using FastSphericalHarmonics: FastSphericalHarmonics
+using FlowTransformBindings: FlowTransformBindings as FTB
 using LinearAlgebra: LinearAlgebra
 using NUFSHT: NUFSHT
 using NonuniformFFTs: NonuniformFFTs
@@ -100,9 +101,8 @@ end
 
 const EXTENSIONS = (:HelmholtzDecompositionFFTWExt, :HelmholtzDecompositionAbstractFFTsExt,
                     :HelmholtzDecompositionFSHExt, :HelmholtzDecompositionNUFSHTExt,
-                    :HelmholtzDecompositionFINUFFTExt, :HelmholtzDecompositionNonuniformFFTsExt,
                     :HelmholtzDecompositionOhMyThreadsExt,
-                    :HelmholtzDecompositionKernelAbstractionsExt)
+                    :HelmholtzDecompositionAdaptExt)
 
 function configuration()
     println("HelmholtzDecomposition.jl benchmark")
@@ -142,12 +142,9 @@ function _masked(n)
                                    range(0.0, 1.0; length = n); mask = m)
 end
 
-# Clenshaw–Curtis node positions, which is the node set the spherical transform is defined on.
-function _clenshaw_curtis(nlat)
-    ax = FG.SphericalSampling.spherical_axes(Float64, FG.SphericalSampling.ClenshawCurtisSampling(),
-                                             nlat)
-    return FG.Grids.StructuredGrid(SPH, ax.λ, ax.φ)
-end
+# The Clenshaw–Curtis grid, the node set the spherical transform is defined on, its longitude periodic.
+_clenshaw_curtis(nlat) =
+    FG.Connectivity.structured_grid(FG.SphericalSampling.ClenshawCurtisSampling(), nlat; geometry = SPH)
 
 # Longitude as a range, so its uniformity is provable from the axis type.
 function _latlon(nlat)
@@ -162,15 +159,15 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    structured_case(label, grid; boundary, solver, backend)
+    structured_case(label, grid; boundary, solver, execution)
 
 Plan, workspace and steady-state cost of one decomposition, plus the plan's footprint.
 """
-function structured_case(label, grid; boundary = HD.Neumann(), solver = HD.AutoSolver(),
-                         backend = CB.SerialBackend())
+function structured_case(label, grid; boundary = FG.Operators.Neumann(), solver = HD.AutoSolver(),
+                         execution = CB.SerialBackend())
     N = ndims(grid)
-    plan = HD.plan_helmholtz(grid; boundary, solver, backend)
-    tplan = bench(() -> HD.plan_helmholtz(grid; boundary, solver, backend); samples = 3)
+    plan = HD.plan_helmholtz(grid; boundary, solver, execution)
+    tplan = bench(() -> HD.plan_helmholtz(grid; boundary, solver, execution); samples = 3)
     tws = bench(() -> HD.allocate_workspace(plan); samples = 3)
 
     ws = HD.allocate_workspace(plan)
@@ -185,19 +182,19 @@ function structured_case(label, grid; boundary = HD.Neumann(), solver = HD.AutoS
 end
 
 """
-    batch_case(label, grid, nfields; backend)
+    batch_case(label, grid, nfields; execution)
 
 Per-field cost across a batch. One plan is shared and each task takes its own workspace, so the
 number to read is `call / nfields` against the single-field `call` above.
 """
-function batch_case(label, grid, nfields::Int; backend = CB.SerialBackend())
+function batch_case(label, grid, nfields::Int; execution = CB.SerialBackend())
     N = ndims(grid)
-    plan = HD.plan_helmholtz(grid; boundary = HD.Neumann(), backend = CB.SerialBackend())
+    plan = HD.plan_helmholtz(grid; boundary = FG.Operators.Neumann(), execution = CB.SerialBackend())
     Random.seed!(12)
     fields = [randn(size(grid)..., N) for _ in 1:nfields]
     batch = HD.allocate_batch(plan, nfields)
 
-    t = bench(() -> HD.helmholtz_decompose_batch!(batch, fields, plan; backend); samples = 3)
+    t = bench(() -> HD.helmholtz_decompose_batch!(batch, fields, plan; execution); samples = 3)
     per = (; time = t.time / nfields, bytes = t.bytes ÷ nfields)
     record!(; case = label, solver = string(nameof(typeof(plan.solver))) * " /field",
             plan = NA, workspace = NA, call = per, planbytes = Base.summarysize(plan))
@@ -221,15 +218,15 @@ function spectral_case(label, grid)
 end
 
 """
-    scattered_case(label, npoints, nk)
+    scattered_case(label, npoints, nk, nufft)
 
-Scattered Cartesian samples through the non-uniform transform. Needs `FINUFFT` or `NonuniformFFTs`.
+Scattered Cartesian samples through the non-uniform transform of the library `nufft` names.
 
-`nk` sets the solver's mode count, so the label names what was measured. The default mode count is
-fixed at 64², and the fit is a conjugate-gradient solve on the normal equations whose cost and
-conditioning both track `prod(nk) / npoints`.
+`nk` sets the solver's mode count, so the label names what was measured. The fit is a
+conjugate-gradient solve on the normal equations whose cost and conditioning both track
+`prod(nk) / npoints`.
 """
-function scattered_case(label, npoints::Int, nk::Int)
+function scattered_case(label, npoints::Int, nk::Int, nufft)
     Random.seed!(14)
     Lx = Ly = 2π
     x = Lx .* rand(npoints)
@@ -239,11 +236,11 @@ function scattered_case(label, npoints::Int, nk::Int)
     measure = fill(Lx * Ly / npoints, npoints)
     grid = FG.Grids.UnstructuredGrid(CART, (x, y), measure;
                                      periodic = (true, true), period = (Lx, Ly))
-    ext = Base.get_extension(HD, :HelmholtzDecompositionFINUFFTExt)
-    solver = ext.CartesianNUFFTSolver(; nk = (nk, nk))
+    solver = HD.CartesianNUFFTSolver(nufft; nk = (nk, nk))
     U = randn(npoints, 2)
     t = bench(() -> HD.helmholtz_decompose_spectral(U, grid; solver); samples = 3)
-    record!(; case = label, solver = "NUFFT", plan = NA, workspace = NA, call = t, planbytes = -1)
+    record!(; case = label, solver = "NUFFT " * string(nameof(typeof(nufft))), plan = NA,
+            workspace = NA, call = t, planbytes = -1)
     return nothing
 end
 
@@ -265,7 +262,7 @@ function suite(set::Symbol)
     structured_case("bounded $(n2)²", _bounded(n2, 2))
     structured_case("periodic $(n2)²", _periodic(n2, 2))
     structured_case("masked $(n2)²", _masked(n2))
-    structured_case("bounded $(n2)², Dirichlet", _bounded(n2, 2); boundary = HD.Dirichlet())
+    structured_case("bounded $(n2)², Dirichlet", _bounded(n2, 2); boundary = FG.Operators.Dirichlet())
     structured_case("masked $(n2)², jacobi", _masked(n2); solver = HD.CGSolver(; multigrid = false))
     println()
 
@@ -279,9 +276,8 @@ function suite(set::Symbol)
     header()
     structured_case("clenshaw-curtis $nlat", _clenshaw_curtis(nlat))
     structured_case("lat-lon $nlat", _latlon(nlat))
-    # `_decompose_spectral` has no spherical method, so `helmholtz_decompose_spectral` on a sphere
-    # raises. Add the two rows here once it does.
-    println("  (spherical spectral entry point: no method)")
+    spectral_case("clenshaw-curtis $nlat, spectral", _clenshaw_curtis(nlat))
+    spectral_case("lat-lon $nlat, spectral", _latlon(nlat))
     println()
 
     println("Spectral entry point, Cartesian")
@@ -291,8 +287,8 @@ function suite(set::Symbol)
 
     println("Scattered Cartesian")
     header()
-    for (m, nk) in scatter
-        scattered_case("scattered M=$m, nk=$(nk)²", m, nk)
+    for (m, nk) in scatter, nufft in (FTB.NonuniformFFTsBackend(), FTB.FINUFFTBackend())
+        scattered_case("scattered M=$m, nk=$(nk)²", m, nk, nufft)
     end
     println()
 
@@ -301,15 +297,15 @@ function suite(set::Symbol)
     for b in batches
         batch_case("serial B=$b", _periodic(n2, 2), b)
         Threads.nthreads() > 1 &&
-            batch_case("threaded B=$b", _periodic(n2, 2), b; backend = CB.ThreadedBackend())
+            batch_case("threaded B=$b", _periodic(n2, 2), b; execution = CB.ThreadedBackend())
     end
     println()
 
     println("Intra-field backend, masked $(n2)²")
     header()
-    structured_case("masked serial", _masked(n2); backend = CB.SerialBackend())
+    structured_case("masked serial", _masked(n2); execution = CB.SerialBackend())
     Threads.nthreads() > 1 &&
-        structured_case("masked threaded", _masked(n2); backend = CB.ThreadedBackend())
+        structured_case("masked threaded", _masked(n2); execution = CB.ThreadedBackend())
     println()
     println("BENCHMARK_COMPLETE")
     return ROWS

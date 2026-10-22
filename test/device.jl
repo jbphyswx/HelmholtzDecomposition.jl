@@ -1,14 +1,11 @@
 """
-Device gate: every buffer a plan, workspace or result reaches lives where the backend runs.
+Device execution: a decomposition planned on a device backend holds no host memory, equals the serial
+host result, keeps its batch diagnostics on the host, and the periodic spectral result is assembled
+on the array's own device.
 
-`GPUBackend(KernelAbstractions.CPU())` allocates plain `Array`s. A host buffer and a device buffer
-have the same type there, so a solver that builds its state with `zeros` passes a parity test
-against the serial path while holding host memory a kernel cannot reach. `JLArray` is a distinct
-array type over host memory, so the same walk over the same structures separates the two.
-
-The walk records any `Array` or `BitArray` it reaches. `FlowGeometries`' lazy wrappers are recursed
-into, since a `SeparableMeasure` holding host `Vector`s is host memory wearing an abstract type;
-an array from another module is device storage and is a leaf.
+`GPUBackend(KernelAbstractions.CPU())` runs the kernels through KernelAbstractions over plain `Array`s;
+`JLArray` is a distinct array type over host memory with scalar indexing disallowed, so a buffer built
+with `zeros` where the backend's allocator belongs is found by the walk below.
 """
 
 using Test: Test
@@ -17,126 +14,127 @@ using FlowGeometries: FlowGeometries as FG
 using ComputationalBackends: ComputationalBackends as CB
 using KernelAbstractions: KernelAbstractions as KA
 using JLArrays: JLArrays
+using FFTW: FFTW
+using FlowTransformBindings: FlowTransformBindings as FTB
 using Random: Random
 
-# `JLArrays` implements `get_backend`, `allocate`, `launch_config` and the `Adapt` rules for
-# `JLBackend`, but not `KernelAbstractions.synchronize`. Its kernels are converted to CPU kernels
-# and have completed by the time the launch returns, so the method is a no-op.
+# `JLArrays` defines no `KernelAbstractions.synchronize` for its backend; its kernels have completed by
+# the time a launch returns.
 KA.synchronize(::JLArrays.JLBackend) = nothing
 
 module DeviceWalk
 
-"""
-    host_arrays(x) -> Vector{Tuple{String,Type}}
-
-Every `Array` or `BitArray` reachable from `x`, with the field path that reached it.
-"""
+# Every `Array` or `BitArray` reachable from `x`, with the field path that reached it. FlowGeometries'
+# lazy wrappers are walked into; any other array type is device storage and a leaf; a foreign
+# transform plan owns memory this package does not allocate.
 function host_arrays(x)
     out = Tuple{String,Type}[]
     _walk!(out, Base.IdSet{Any}(), x, "")
     return out
 end
 
-_is_flowgeometries(T) = startswith(string(parentmodule(T)), "FlowGeometries")
-
 function _walk!(out, seen, x, path)
-    x === nothing && return nothing
-    isbits(x) && return nothing
-    x in seen && return nothing
+    (x === nothing || isbits(x) || x in seen) && return nothing
     push!(seen, x)
-
     if x isa AbstractArray
-        if x isa Array || x isa BitArray
-            push!(out, (path, typeof(x)))
-            return nothing
-        end
-        if x isa SubArray || x isa Base.ReshapedArray
-            return _walk!(out, seen, parent(x), path * "→parent")
-        end
-        # A lazy wrapper carries its storage in its fields; anything else is the device's own array.
-        _is_flowgeometries(typeof(x)) || return nothing
+        (x isa Array || x isa BitArray) && return (push!(out, (path, typeof(x))); nothing)
+        (x isa SubArray || x isa Base.ReshapedArray) && return _walk!(out, seen, parent(x), path * "→parent")
+        startswith(string(parentmodule(typeof(x))), "FlowGeometries") || return nothing
     end
-
     if x isa Tuple || x isa NamedTuple
-        for (k, v) in pairs(x)
-            _walk!(out, seen, v, string(path, ".", k))
-        end
+        foreach(((k, v),) -> _walk!(out, seen, v, string(path, ".", k)), pairs(x))
         return nothing
     end
-
     T = typeof(x)
-    isstructtype(T) || return nothing
-    # A foreign transform handle owns memory this package does not allocate.
-    occursin("Plan", string(nameof(T))) && return nothing
+    foreign_plan = occursin("Plan", string(nameof(T))) &&
+                   !startswith(string(parentmodule(T)), "HelmholtzDecomposition")
+    (isstructtype(T) && !foreign_plan) || return nothing
     for f in fieldnames(T)
-        isdefined(x, f) || continue
-        _walk!(out, seen, getfield(x, f), string(path, ".", f))
+        isdefined(x, f) && _walk!(out, seen, getfield(x, f), string(path, ".", f))
     end
     return nothing
 end
 
 end # module DeviceWalk
 
-const _JL = CB.GPUBackend(JLArrays.JLBackend())
 const CART = FG.Geometry.CartesianGeometry{Float64}()
 
-function _report(label, hits)
-    isempty(hits) && return
-    println("\n  ", label, ": ", length(hits), " host arrays reachable")
-    for (path, T) in first(hits, 12)
-        println("    ", path, "  ::  ", T)
-    end
-    length(hits) > 12 && println("    … and ", length(hits) - 12, " more")
-end
-
-Test.@testset "device gate: the walker itself" begin
-    # A host array is found through a tuple, a struct field, and a view.
-    Test.@test !isempty(DeviceWalk.host_arrays((zeros(2),)))
-    Test.@test !isempty(DeviceWalk.host_arrays(view(zeros(4), 1:2)))
-    # A device array is a leaf, and its own host-side storage is not reported.
-    Test.@test isempty(DeviceWalk.host_arrays(JLArrays.JLArray(zeros(2))))
-    # An isbits lazy mask carries no storage.
-    Test.@test isempty(DeviceWalk.host_arrays(FG.Grids.AllActive((2, 2))))
-end
-
-Test.@testset "device: no host memory reachable from a device plan" begin
-    n = 12
-    xr = range(0.0, 1.0; length = n)
-    grid = FG.Grids.StructuredGrid(CART, xr, xr)
-
-    for (label, solver) in (("jacobi", HD.CGSolver(; multigrid = false)),
-                            ("multigrid", HD.CGSolver(; multigrid = true)))
-        plan = HD.plan_helmholtz(grid; boundary = HD.Neumann(), solver = solver, backend = _JL)
-        ws = HD.allocate_workspace(plan)
-        res = HD.allocate_result(plan)
-
-        Test.@testset "$label" begin
-            for (what, obj) in (("plan", plan), ("workspace", ws), ("result", res))
-                hits = DeviceWalk.host_arrays(obj)
-                _report("$label/$what", hits)
-                Test.@test isempty(hits)
+Test.@testset "device parity with the serial host path" begin
+    Random.seed!(21)
+    for dims in ((10, 10), (6, 6, 6)), (sname, solver) in (("jacobi", HD.CGSolver(; multigrid = false)),
+                                                           ("multigrid", HD.CGSolver(; multigrid = true)))
+        N = length(dims)
+        grid = FG.Grids.StructuredGrid(CART, ntuple(d -> range(0.0, 1.0; length = dims[d]), N)...)
+        fields = [randn(dims..., N) for _ in 1:2]
+        hplan = HD.plan_helmholtz(grid; solver, execution = CB.SerialBackend())
+        href = HD.helmholtz_decompose_batch(hplan, fields; execution = CB.SerialBackend())
+        for (bname, execution, move) in (("JLArrays", CB.GPUBackend(JLArrays.JLBackend()), JLArrays.JLArray),
+                                         ("KA.CPU", CB.GPUBackend(KA.CPU()), identity))
+            Test.@testset "$N-D $sname on $bname" begin
+                plan = HD.plan_helmholtz(grid; solver, execution)
+                if bname == "JLArrays"
+                    for obj in (plan, HD.allocate_workspace(plan), HD.allocate_result(plan))
+                        hits = DeviceWalk.host_arrays(obj)
+                        isempty(hits) || println("  host arrays reachable: ", first(hits, 6))
+                        Test.@test isempty(hits)
+                    end
+                end
+                # The batch axis serial, or on the plan's device.
+                for batch_execution in (CB.SerialBackend(), execution)
+                    b = HD.helmholtz_decompose_batch(plan, map(move, fields); execution = batch_execution)
+                    Test.@test b.harmonic_fraction isa Vector{Float64} && b.residual_fraction isa Vector{Float64}
+                    Test.@test Array(b.χ) ≈ href.χ
+                    Test.@test Array(b.u_rot) ≈ href.u_rot
+                    Test.@test Array(b.u_div) ≈ href.u_div
+                    Test.@test b.harmonic_fraction ≈ href.harmonic_fraction atol = 1e-12
+                    Test.@test b.residual_fraction ≈ href.residual_fraction
+                end
             end
         end
     end
 end
 
-Test.@testset "device: a decomposition runs and matches the host" begin
+Test.@testset "AutoSolver on a periodic grid, on each device backend" begin
+    # Whatever solver each backend's arrays take, the decomposition is the serial host one, which the FFT
+    # solves exactly, to conjugate gradients' accuracy: `κ(L) · 100eps`, `κ(L) ≈ 30` on this grid.
     n = 12
-    xr = range(0.0, 1.0; length = n)
-    grid = FG.Grids.StructuredGrid(CART, xr, xr)
-    solver = HD.CGSolver(; multigrid = true)
-    Random.seed!(21)
-    u = randn(n, n, 2)
+    ax = FG.Axes.PeriodicAxis(0.0, 1.0, n)
+    grid = FG.Grids.StructuredGrid(CART, ax, ax)
+    Random.seed!(23)
+    fields = [randn(n, n, 2) for _ in 1:2]
+    href = HD.helmholtz_decompose_batch(HD.plan_helmholtz(grid; execution = CB.SerialBackend()), fields;
+                                        execution = CB.SerialBackend())
+    for (bname, execution, move) in (("JLArrays", CB.GPUBackend(JLArrays.JLBackend()), JLArrays.JLArray),
+                                     ("KA.CPU", CB.GPUBackend(KA.CPU()), identity))
+        Test.@testset "$bname" begin
+            plan = HD.plan_helmholtz(grid; execution)
+            b = HD.helmholtz_decompose_batch(plan, map(move, fields); execution)
+            Test.@test isapprox(Array(b.χ), href.χ; rtol = 1e-10)
+            Test.@test isapprox(Array(b.u_rot), href.u_rot; rtol = 1e-10)
+            Test.@test isapprox(Array(b.u_div), href.u_div; rtol = 1e-10)
+            Test.@test b.harmonic_fraction ≈ href.harmonic_fraction atol = 1e-10
+        end
+    end
+end
 
-    hplan = HD.plan_helmholtz(grid; boundary = HD.Neumann(), solver, backend = CB.SerialBackend())
-    href = HD.helmholtz_decompose!(HD.allocate_result(hplan), u, hplan,
-                                   HD.allocate_workspace(hplan))
-
-    dplan = HD.plan_helmholtz(grid; boundary = HD.Neumann(), solver, backend = _JL)
-    dres = HD.helmholtz_decompose!(HD.allocate_result(dplan), JLArrays.JLArray(u), dplan,
-                                   HD.allocate_workspace(dplan))
-
-    Test.@test Array(dres.χ) ≈ href.χ
+Test.@testset "the periodic spectral result is assembled on the device" begin
+    # Every step after the forward transform runs on JLArrays; the inverse transforms are the host FFT
+    # wrapped, since JLArrays has none.
+    n = 12
+    xr = range(0.0, 1.0 - 1 / n; length = n)
+    grid = FG.Grids.StructuredGrid(CART, xr, xr; topology = (true, true), period = (1.0, 1.0))
+    Random.seed!(25)
+    U = randn(n, n, 2)
+    ks = FTB.wavenumber_axes((1.0, 1.0), (n, n), Val(true))
+    V̂ = cat(FFTW.rfft(U[:, :, 1]), FFTW.rfft(U[:, :, 2]); dims = 3)
+    assemble(U, V̂, invert!) = HD._cartesian_result(grid, U, V̂, HD._derivative_symbol(V̂, Float64, ks),
+                                                    similar(V̂, size(V̂)[1:2]), similar(V̂, size(V̂)[1:2]), invert!)
+    href = assemble(U, V̂, (out, x) -> copyto!(out, FFTW.irfft(x, n)))
+    dres = assemble(JLArrays.JLArray(U), JLArrays.JLArray(V̂),
+                    (out, x) -> copyto!(out, JLArrays.JLArray(FFTW.irfft(Array(x), n))))
+    Test.@test dres.u_rot isa JLArrays.JLArray
     Test.@test Array(dres.u_rot) ≈ href.u_rot
     Test.@test Array(dres.u_div) ≈ href.u_div
+    Test.@test Array(dres.χ) ≈ href.χ
+    Test.@test dres.harmonic_fraction ≈ href.harmonic_fraction
 end

@@ -5,36 +5,37 @@
 ```
 src/
   HelmholtzDecomposition.jl   # module; qualified imports only, no exports
-  BoundaryConditions.jl       # Dirichlet, Neumann
-  Staggering.jl               # face/corner counts and indexing (Arakawa C-grid / MAC)
-  Operators.jl                # G, D = −G*, L = D G, curl, δ; face metrics; execution backend
-  Solvers.jl                  # AbstractPoissonSolver, CGSolver, AutoSolver, solver registry
-  Multigrid.jl                # geometric V-cycle preconditioner (Galerkin coarsening)
+  BoundaryConditions.jl       # CornerDirichlet, the dual grid's condition
+  Execution.jl                # the execution backend of one decomposition
+  Solvers.jl                  # AbstractPoissonSolver, CGSolver, AutoSolver
+  Multigrid.jl                # geometric V-cycle preconditioner over FlowGeometries' Galerkin levels
   DualGrid.jl                 # the corner grid the rotation potential lives on
   Decomposition.jl            # plan/workspace/result/batch and helmholtz_decompose[!]
   Spectral.jl                 # Leray projector in mode space
+  Scattered.jl                # scattered Cartesian: CartesianNUFFTSolver over FlowTransformBindings
+  SpectralSolvers.jl          # the transform solver types and the order AutoSolver tries them in
 reference_flows/
   reference_flows.jl          # analytic fields with known decompositions; NOT part of the library
 ext/
-  HelmholtzDecompositionAbstractFFTsExt.jl        # bounded + channel + periodic, any FFT backend
-  HelmholtzDecompositionFFTWExt.jl                # r2r fast path on the host
-  HelmholtzDecompositionFINUFFTExt.jl             # scattered Cartesian (binary NUFFT)
-  HelmholtzDecompositionNonuniformFFTsExt.jl      # scattered Cartesian (pure Julia, device-capable)
+  HelmholtzDecompositionAbstractFFTsExt.jl        # periodic FFT, bounded and channel transforms, any FFT library
+  HelmholtzDecompositionFFTWExt.jl                # FFTW's r2r transforms and plan thread count, on the host
   HelmholtzDecompositionFSHExt.jl                 # Clenshaw–Curtis sphere
   HelmholtzDecompositionNUFSHTExt.jl              # arbitrary covering sphere
-  HelmholtzDecompositionKernelAbstractionsExt.jl  # device memory for the buffers
+  HelmholtzDecompositionAdaptExt.jl               # how a plan's structs move to a device
   HelmholtzDecompositionOhMyThreadsExt.jl         # threaded batch
   HelmholtzDecompositionDistributedExt.jl         # multiprocess batch
   HelmholtzDecompositionMPIExt.jl                 # MPI batch
   HelmholtzDecompositionCairoMakieExt.jl          # visualization
 ```
 
-Grids, geometries, masks, topology and the execution primitives come from
+Grids, geometries, masks, topology, the execution primitives and the staggered operators with their
+boundary conditions come from
 [FlowGeometries](https://github.com/jbphyswx/FlowGeometries.jl); the backend taxonomy from
 [ComputationalBackends](https://github.com/jbphyswx/ComputationalBackends.jl); the names for
 transform algorithms from
-[SpectralBackends](https://github.com/jbphyswx/SpectralBackends.jl). This package defines none of
-them.
+[SpectralBackends](https://github.com/jbphyswx/SpectralBackends.jl); the NUFFT library plans from
+[FlowTransformBindings](https://github.com/jbphyswx/FlowTransformBindings.jl). This package defines
+none of them.
 
 ## One consistent operator family
 
@@ -46,10 +47,13 @@ D = −G*      (adjoint under the cell-measure inner product)
 L = D G      (so L = −G*G)
 ```
 
-`L` is then symmetric negative-semidefinite by construction, which is what makes conjugate
-gradients and multigrid applicable rather than merely plausible; `div(u_div) = L χ = D u` holds
-exactly; and `u_div ⊥ u_rot` discretely, so `harmonic_fraction` reports topology rather than
-disagreement between separately-chosen stencils.
+`L` is then symmetric negative-semidefinite by construction, so conjugate gradients and multigrid
+apply; `div(u_div) = L χ = D u` holds to the solver tolerance; and `u_div ⊥ u_rot` holds discretely
+on every grid, the face flux of `u_rot` being the metric-free difference of `R ℓ`, `ℓ` the edge
+length at each corner. In two dimensions and on a periodic Cartesian grid the rotation solve is
+`curl ∘ rot`, so `harmonic_fraction` measures the domain's loops. On a bounded or curved
+three-dimensional grid each rotation component is solved with its own dual Laplacian, and the
+harmonic part also carries that solve's departure from `curl ∘ rot`.
 
 A masked face carries zero area. No-flux, the mask treatment and the preservation of adjointness
 are then the same statement, and no stencil reaches across a hole.
@@ -62,49 +66,58 @@ are then the same statement, and no stencil reaches across a hole.
 | `HelmholtzWorkspace` | face/corner buffers **and solver state** | one per task |
 | `HelmholtzResult` / `HelmholtzBatch` | outputs; the batch stores `(dims…, N, B)` contiguously | per field / per batch |
 
-Solver state is in the workspace, not the plan, because it holds buffers a solve writes through —
-the conjugate-gradient vectors, the multigrid level arrays, the transform scratch. On the plan,
-a threaded batch would have every task writing the same ones.
+Solver state holds buffers a solve writes through — the conjugate-gradient vectors, the multigrid
+level arrays, the transform scratch — so it lives in the workspace, one per task. `close!(ws)` releases
+the foreign plans a workspace holds, NUFSHT's under a spherical preconditioner; every entry that builds
+a workspace of its own releases it before returning.
 
 ## Two orthogonal backend axes
 
 - **Which transform** — `AbstractPoissonSolver`. `AutoSolver` chooses on capability: geometry,
-  node layout, mask, axis uniformity, boundary condition, and which extensions are loaded. It
-  throws rather than downgrading, because a solver that silently solves a *different* boundary
-  value problem returns a smooth, plausible, wrong field.
+  node layout, mask, axis uniformity, boundary condition, the execution backend, and which libraries
+  are loaded. A solver named directly that cannot solve the problem on that backend raises: a solver
+  that solves a different boundary value problem returns a smooth, plausible, wrong field.
 - **Where it runs** — `ComputationalBackends.AbstractExecutionBackend`, passed to
-  `plan_helmholtz`. Every hot loop is written once against `FlowGeometries.Execution.run_indices`,
+  `plan_helmholtz` as `execution`. Every hot loop is written once against `FlowGeometries.Execution.run_indices`,
   which resolves to a serial loop, threaded chunks, or a KernelAbstractions launch with no
-  branching here.
+  branching here. On a device backend the solver state lives on the device: `AutoSolver` takes the
+  Cartesian FFT solvers where an FFT library takes the device's arrays and multigrid-preconditioned
+  conjugate gradients otherwise, and NUFSHT's plans are built on the device when it is named or is the
+  spectral route of a covering sphere. FastSphericalHarmonics, FFTW's real-to-real transforms and the
+  scattered fit hold host state.
 
-## Solver registration
+## Solver selection
 
-An extension declares which `SpectralBackends` algorithm it implements, with a priority:
+Every solver type is declared in the package; an extension adds the methods that run it on its
+library, and `library_loaded(solver)` says whether that library is loaded. Every solve of the
+staggered decomposition is of the grid's own discrete `L`. `AutoSolver` takes, in order, the first
+that applies:
 
-```julia
-HelmholtzDecomposition.register_spectral_solver!(SpectralBackends.FFTSpectralBackend,
-                                                 CartesianBoundedSolver; priority = 10)
-```
+- a Cartesian transform that inverts `L`: `CartesianSpectralSolver`, `CartesianBoundedSolver`,
+  `CartesianRealTransformSolver` (`_auto_candidates`);
+- on a sphere, `CGSolver` preconditioned by `SphericalSpectralSolver` or `SphericalNUSHTSolver`
+  (`_preconditioner_candidates`), which invert the continuous Laplacian;
+- `CGSolver` with multigrid.
 
-Two extensions may implement the same algorithm — `FFTW.r2r` and the `AbstractFFTs` even/odd
-extension are both the bounded FFT — so the priority is explicit and load order decides nothing.
+`helmholtz_decompose_spectral` keeps its own list (`_spectral_candidates`): the periodic FFT and
+the scattered NUFFT on a Cartesian grid, FastSphericalHarmonics and NUFSHT on a sphere. Each list is
+written down once, so load order decides nothing.
 
 ## Type hierarchy
 
 ```
 AbstractPoissonSolver
 ├── AutoSolver
-├── CGSolver{T}                       # multigrid-preconditioned by default
-├── CartesianSpectralSolver           (ext: FFTW)          periodic rfft
-├── CartesianBoundedSolver            (ext: FFTW)          r2r, per-direction kind
-├── CartesianRealTransformSolver      (ext: AbstractFFTs)  bounded/channel/periodic, any backend
-├── CartesianNUFFTSolver{T}           (ext: FINUFFT)
-├── CartesianNonuniformFFTSolver{T}   (ext: NonuniformFFTs)
-├── SphericalSpectralSolver           (ext: FastSphericalHarmonics)
-└── SphericalNUSHTSolver{T}           (ext: NUFSHT)
+├── CGSolver{R,S}                     # multigrid or spectral (S) preconditioning; R the tolerance type
+├── CartesianSpectralSolver           (AbstractFFTs)    periodic rfft, any FFT library
+├── CartesianBoundedSolver            (FFTW)            r2r, per-direction kind, host
+├── CartesianRealTransformSolver      (AbstractFFTs)    bounded/channel/periodic, any FFT library
+├── CartesianNUFFTSolver{L,D,T}       (NonuniformFFTs or FINUFFT, through FlowTransformBindings)
+├── SphericalSpectralSolver           (FastSphericalHarmonics)
+└── SphericalNUSHTSolver{T}           (NUFSHT)
 ```
 
 ## Import style
 
 All imports are `using X: X`, called as `X.method()`. No top-level `export`, no
-`const X = Submodule.X` flattening. Enforced by Aqua.
+`const X = Submodule.X` flattening.

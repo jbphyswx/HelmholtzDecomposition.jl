@@ -15,13 +15,14 @@ The base package solves any grid, mask and boundary condition with multigrid-pre
 conjugate gradients. A transform is `O(N log N)` where one applies, and each arrives with its
 package:
 
-| Geometry   | Regular grid                      | Irregular grid                         |
-|------------|-----------------------------------|----------------------------------------|
-| Cartesian  | `using FFTW`, `using AbstractFFTs`| `using FINUFFT`, `using NonuniformFFTs`|
-| Spherical  | `using FastSphericalHarmonics`    | `using NUFSHT`                         |
+| Geometry   | Regular grid                                   | Irregular grid                         |
+|------------|------------------------------------------------|----------------------------------------|
+| Cartesian  | an FFT library for the array (`using FFTW`)    | `using FINUFFT`, `using NonuniformFFTs`|
+| Spherical  | `using FastSphericalHarmonics`                 | `using NUFSHT`                         |
 
 `AutoSolver` picks among the loaded ones on the grid's own properties — mask, axis uniformity,
-topology and node layout — and refuses a solver named directly that cannot solve the problem given.
+topology and node layout — and on the execution backend, and refuses a solver named directly that
+cannot solve the problem given.
 
 # Quick start
 ```julia
@@ -60,20 +61,25 @@ Nothing is exported: every name is reached as `HelmholtzDecomposition.name`.
 """
 module HelmholtzDecomposition
 
+# First, so its `__init__` selects the OpenMP runtime's thread-local mode before FastTransforms loads
+# that runtime; see `FlowTransformBindings.with_fasttransforms_threads`. Its NUFFT plans run the
+# scattered solver.
+using FlowTransformBindings: FlowTransformBindings
 using ComputationalBackends: ComputationalBackends
 using FlowGeometries: FlowGeometries
 using SpectralBackends: SpectralBackends
 using LinearAlgebra: LinearAlgebra
 
 include("BoundaryConditions.jl")
-include("Staggering.jl")
-include("Operators.jl")
+include("Execution.jl")
 include("Solvers.jl")
 include("LeastSquares.jl")
 include("Multigrid.jl")
 include("DualGrid.jl")
 include("Decomposition.jl")
 include("Spectral.jl")
+include("Scattered.jl")
+include("SpectralSolvers.jl")
 
 # Implemented in ext/HelmholtzDecompositionCairoMakieExt.jl.
 function plot_decomposition end

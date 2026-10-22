@@ -1,9 +1,6 @@
-# MPI batch-decomposition smoke test. Launch with:
+# The MPIBackend batch reproduces the serial result on every rank, in input order. Launch with
 #   mpiexec -n 3 julia --project=test test/mpi_batch.jl
-# MPI.jl ships its own launcher, so this is reachable from a test run as
-# `run(`$(MPI.mpiexec()) -n 3 julia --project=test test/mpi_batch.jl`)`.
-#
-# Verifies the MPIBackend batch reproduces the serial result on every rank, in input order.
+# or, from Julia, `run(`$(MPI.mpiexec()) -n 3 julia --project=test test/mpi_batch.jl`)`.
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using FlowGeometries: FlowGeometries as FG
 using ComputationalBackends: ComputationalBackends as CB
@@ -29,10 +26,10 @@ end
 fields = [mkfield(s) for s in (1.0, 2.0, 0.5, 1.5, 0.8)]
 
 # One plan for the whole batch; every rank builds the same one and each takes its own workspace.
-plan = HD.plan_helmholtz(grid; boundary = HD.Dirichlet(), backend = CB.SerialBackend())
+plan = HD.plan_helmholtz(grid; boundary = FG.Operators.Dirichlet(), execution = CB.SerialBackend())
 
-serial = HD.helmholtz_decompose_batch(plan, fields; backend = CB.SerialBackend())
-mpi = HD.helmholtz_decompose_batch(plan, fields; backend = CB.MPIBackend())
+serial = HD.helmholtz_decompose_batch(plan, fields; execution = CB.SerialBackend())
+mpi = HD.helmholtz_decompose_batch(plan, fields; execution = CB.MPIBackend())
 
 ok = length(mpi) == length(fields) &&
      all(mpi[i].u_rot == serial[i].u_rot for i in eachindex(fields)) &&

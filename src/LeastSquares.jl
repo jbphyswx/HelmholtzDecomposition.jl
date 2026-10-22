@@ -1,22 +1,9 @@
-"""
-    LeastSquares.jl — conditioning of the non-uniform fits.
-
-A scattered fit solves `min ‖A F − vals‖` with `A` the synthesis at the sample points. Whether the
-samples determine `F` is a property of where the nodes sit, and the counting test the extensions
-already apply — modes no more than samples — does not see it: a node set clustered into part of the
-domain, or confined to a band of it, is numerically rank deficient at any mode count. The residual
-does not reveal that either. Many coefficient vectors then reproduce the samples, the solver returns
-one of them, and it can be unrelated to the field that was sampled.
-
-What separates the two cases is `κ(A)`, and conjugate gradients already carries it. Its scalars are
-the Lanczos recurrence for `AᴴA`: the tridiagonal built from the `α` and `β` of `k` steps has
-extreme eigenvalues that approximate those of `AᴴA`, so `κ(A) = √(λmax/λmin)` costs two stored
-scalars per iteration and one tridiagonal eigenvalue solve at the end.
-
-The threshold needs no constant. Finite precision limits a normal-equations solve to a relative
-accuracy of order `κ(A)²·u`, so the fit delivers the requested `rtol` while `κ² u ≤ rtol`. Past that
-the answer is looser than its tolerance, and the caller is told so.
-"""
+# Conditioning of the scattered fits. A fit solves `min ‖A F − vals‖`, `A` the synthesis at the sample
+# points; a node set clustered into part of the domain is numerically rank deficient at any mode count,
+# with a residual at round-off. `κ(A)` tells the cases apart, and conjugate gradients carries it: its `α`
+# and `β` are the Lanczos recurrence for `AᴴA`, whose tridiagonal's extreme eigenvalues approximate those
+# of `AᴴA`. A normal-equations solve reaches a relative accuracy of order `κ(A)² eps`, so a fit meets
+# `rtol` while `κ² eps ≤ rtol`.
 
 """
     CGLanczos{V}

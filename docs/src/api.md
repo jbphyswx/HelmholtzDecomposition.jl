@@ -29,6 +29,7 @@ HelmholtzDecomposition.plan_helmholtz
 HelmholtzDecomposition.HelmholtzPlan
 HelmholtzDecomposition.HelmholtzWorkspace
 HelmholtzDecomposition.allocate_workspace
+HelmholtzDecomposition.close!
 HelmholtzDecomposition.AbstractHelmholtzResult
 HelmholtzDecomposition.HelmholtzResult
 HelmholtzDecomposition.allocate_result
@@ -54,19 +55,19 @@ these interpolated back to cell centres.
 HelmholtzDecomposition.face_velocity
 HelmholtzDecomposition.face_divergent
 HelmholtzDecomposition.face_rotational
+HelmholtzDecomposition.face_harmonic
 HelmholtzDecomposition.corner_rotation_potential
 ```
 
 ## Boundary conditions
 
-```@docs
-HelmholtzDecomposition.AbstractBoundaryCondition
-HelmholtzDecomposition.Dirichlet
-HelmholtzDecomposition.Neumann
-```
+A bounded direction takes FlowGeometries' `FG.Operators.Neumann()` (the default) or
+`FG.Operators.Dirichlet()`. Whether a direction wraps is the grid's own topology, so there is no
+periodic condition. The rotation potential's dual grid is solved under:
 
-There is no `Periodic` boundary condition: whether a direction wraps is a property of the grid's
-topology, and a direction that wraps has no boundary for a condition to act on.
+```@docs
+HelmholtzDecomposition.CornerDirichlet
+```
 
 ## Solvers
 
@@ -81,62 +82,57 @@ HelmholtzDecomposition.select_solver
 HelmholtzDecomposition.SolverResult
 ```
 
+### Transform solvers
+
+Each runs once its library is loaded; see [`library_loaded`](@ref HelmholtzDecomposition.library_loaded).
+
+```@docs
+HelmholtzDecomposition.CartesianSpectralSolver
+HelmholtzDecomposition.CartesianBoundedSolver
+HelmholtzDecomposition.CartesianRealTransformSolver
+HelmholtzDecomposition.CartesianNUFFTSolver
+HelmholtzDecomposition.SphericalSpectralSolver
+HelmholtzDecomposition.SphericalNUSHTSolver
+```
+
 ### Capability
 
-`AutoSolver` chooses on these, and a solver named directly is refused rather than allowed to solve
-a different problem.
+`AutoSolver` chooses on these. A named solver whose state cannot live on the execution backend is
+refused, as is one that cannot invert the grid's `L`, except a spherical transform, which becomes the
+preconditioner of [`CGSolver`](@ref HelmholtzDecomposition.CGSolver).
 
 ```@docs
 HelmholtzDecomposition.supports_boundary
 HelmholtzDecomposition.requires_full_domain
 HelmholtzDecomposition.requires_uniform_axes
 HelmholtzDecomposition.requires_periodic_domain
-HelmholtzDecomposition.register_spectral_solver!
+HelmholtzDecomposition.supports_sampling
+HelmholtzDecomposition.supports_backend
+HelmholtzDecomposition.library_loaded
+HelmholtzDecomposition.inverts_discrete_laplacian
+HelmholtzDecomposition.preconditions
+HelmholtzDecomposition.spectral_inverse!
 ```
 
-## Operators
+## Operators and the dual grid
+
+The staggered operators are FlowGeometries': `FG.Operators.FaceMetrics` with `gradient!`,
+`divergence!`, `curl!`, `rotational_velocity!`, `to_faces!` and `to_centres!`, and the assembled
+`FG.Operators.LaplacianCoefficients` with its null space and Galerkin hierarchy. A plan holds the
+primal grid's metrics and coefficients and, per rotation pair, a dual grid with its own operator:
 
 ```@docs
-HelmholtzDecomposition.gradient!
-HelmholtzDecomposition.divergence!
-HelmholtzDecomposition.laplacian!
-HelmholtzDecomposition.apply_laplacian!
-HelmholtzDecomposition.curl!
-HelmholtzDecomposition.rotational_velocity!
-HelmholtzDecomposition.to_faces!
-HelmholtzDecomposition.to_centres!
-HelmholtzDecomposition.LaplacianCoefficients
-HelmholtzDecomposition.laplacian_coefficients
-HelmholtzDecomposition.FaceMetrics
-HelmholtzDecomposition.face_area
-HelmholtzDecomposition.face_gap
-```
-
-## Staggering and the dual grid
-
-```@docs
-HelmholtzDecomposition.nfaces
-HelmholtzDecomposition.ncorners
-HelmholtzDecomposition.corner_offset
-HelmholtzDecomposition.face_dims
-HelmholtzDecomposition.corner_dims
-HelmholtzDecomposition.allocate_faces
-HelmholtzDecomposition.allocate_corners
-HelmholtzDecomposition.rotation_pairs
-HelmholtzDecomposition.rotation_terms
-HelmholtzDecomposition.n_rotation_components
-HelmholtzDecomposition.face_coordinates
-HelmholtzDecomposition.corner_mask
 HelmholtzDecomposition.dual_grid
+HelmholtzDecomposition.dual_boundary
+HelmholtzDecomposition.dual_coefficients
 ```
 
 ## Execution
 
 ```@docs
-HelmholtzDecomposition.execution_backend
 HelmholtzDecomposition.resolve_execution_backend
-HelmholtzDecomposition.allocate_zeros
-HelmholtzDecomposition.to_backend
+HelmholtzDecomposition.LoopSizedThreads
+HelmholtzDecomposition.loop_backend
 ```
 
 ## Multigrid
@@ -144,14 +140,12 @@ HelmholtzDecomposition.to_backend
 ```@docs
 HelmholtzDecomposition.multigrid
 HelmholtzDecomposition.MultigridPreconditioner
-HelmholtzDecomposition.MultigridLevel
 HelmholtzDecomposition.LevelBuffers
+HelmholtzDecomposition.MultigridBuffers
 HelmholtzDecomposition.multigrid_buffers
-HelmholtzDecomposition.coarsen
-HelmholtzDecomposition.galerkin_coefficients
-HelmholtzDecomposition.restrict!
-HelmholtzDecomposition.prolong_add!
+HelmholtzDecomposition.apply_preconditioner!
 HelmholtzDecomposition.smooth!
+HelmholtzDecomposition.smooth_from_zero!
 HelmholtzDecomposition.vcycle!
 ```
 
@@ -163,5 +157,4 @@ HelmholtzDecomposition.helmholtz_project_spectral
 HelmholtzDecomposition.helmholtz_potentials_spectral
 HelmholtzDecomposition.helmholtz_decompose_spectral
 HelmholtzDecomposition.velocity_norm
-HelmholtzDecomposition.project_out_constant!
 ```

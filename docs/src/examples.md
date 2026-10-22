@@ -41,23 +41,22 @@ using FlowGeometries: FlowGeometries as FG
 using FFTW: FFTW
 
 N, L = 64, 1.0
-axis = FG.Axes.UniformAxis(0.0, L / N, N)
-grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), axis, axis;
-                               topology = (true, true), period = (L, L))
+axis = FG.Axes.PeriodicAxis(0.0, L, N)       # N cells around a period L
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), axis, axis)
 
 U = cat(u, v; dims = 3)                 # component-last (dims..., N)
 result = HD.helmholtz_decompose(U, grid)
-
-@assert maximum(abs, result.u_div) < 1e-14      # divergent component ≈ 0
+result.harmonic_fraction                # the mean flow's share: zero for this field
+result.residual_fraction                # the collocated round trip's share, second order in N
 ```
 
-Uniformity is read from the axis TYPE, never by scanning values, so a `collect`ed axis is not
-provably uniform and no direct transform applies to it. `UniformAxis` is also `isbits`, so a grid
-built from one moves to a device for free.
+Uniformity and periodicity are read from the axis type, so a `collect`ed axis is neither provably
+uniform nor periodic and no direct transform applies to it. A `PeriodicAxis` is also `isbits`, so a
+grid built from one moves to a device for free.
 
-The residue in `result.harmonic_fraction` on a smooth field is the two collocated↔staggered
-averaging hops and falls at second order — `9.6e-3` at N = 32, `6.0e-4` at N = 128. It is
-discretisation, not topology.
+The staggered split is exact on faces (`HD.face_velocity`, `HD.face_divergent`, `HD.face_rotational`,
+`HD.face_harmonic` on the workspace); the collocated parts are their averages to cell centres, and
+`residual_fraction` is what that averaging loses.
 
 ## Reusing a plan
 
@@ -65,14 +64,20 @@ discretisation, not topology.
 more than one field on a grid, build them once — the steady-state call then allocates nothing.
 
 ```julia
-plan = HD.plan_helmholtz(grid; boundary = HD.Neumann())
+using ComputationalBackends: ComputationalBackends as CB
+plan = HD.plan_helmholtz(grid; boundary = FG.Operators.Neumann(), execution = CB.SerialBackend())
 ws   = HD.allocate_workspace(plan)
 res  = HD.allocate_result(plan)
 
 for u in fields
-    HD.helmholtz_decompose!(res, u, plan, ws)    # 0 bytes
+    HD.helmholtz_decompose!(res, u, plan, ws)    # allocation-free on a serial backend
 end
+HD.close!(ws)
 ```
+
+`close!` releases the foreign transform plans a workspace holds, NUFSHT's under a spherical
+preconditioner; `helmholtz_decompose`, `helmholtz_decompose!` without a workspace, and the batches
+release the ones they build.
 
 ## Batches
 
@@ -83,7 +88,7 @@ result of views onto slice `b`.
 using OhMyThreads: OhMyThreads            # enables ThreadedBackend
 using ComputationalBackends: ComputationalBackends as CB
 
-batch = HD.helmholtz_decompose_batch(plan, fields; backend = CB.ThreadedBackend())
+batch = HD.helmholtz_decompose_batch(plan, fields; execution = CB.ThreadedBackend())
 size(batch.u_rot)        # (dims..., N, length(fields))
 batch[3].harmonic_fraction
 ```
@@ -103,17 +108,16 @@ A1, A2, A3 = HD.vector_potential(res3)   # the 3-D vector potential
 
 ```julia
 NLON, NLAT = 128, 64
-λ = FG.Axes.UniformAxis(0.0, 2π / NLON, NLON)
+λ = FG.Axes.PeriodicAxis(0.0, 2π, NLON)
 φ = FG.Axes.UniformAxis(-π / 2 + π / (2NLAT), π / NLAT, NLAT)
-grid = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(6.371e6), λ, φ;
-                               topology = (true, false), period = (2π, nothing))
+grid = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(6.371e6), λ, φ)
 
 result = HD.helmholtz_decompose(cat(u, v; dims = 3), grid)
 ```
 
-A lat–lon grid is not a transform's node set, so it takes the multigrid-preconditioned iterative
-path. Load `FastSphericalHarmonics` for a Clenshaw–Curtis grid, or `NUFSHT` for any node set
-covering the sphere. A *regional* patch stays on the iterative solver: spherical-harmonic analysis
+The solve is conjugate gradients on the grid's own Laplacian, preconditioned by multigrid, or by
+the spherical transform when `NUFSHT` (any node set covering the sphere) or `FastSphericalHarmonics`
+(a Clenshaw–Curtis grid) is loaded. A *regional* patch keeps multigrid: spherical-harmonic analysis
 integrates over all of `S²`, so a patch does not determine the solution even on the patch.
 
 ## Coarse-Graining Workflow

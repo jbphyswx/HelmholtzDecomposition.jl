@@ -1,8 +1,8 @@
 """
 Cartesian mixed rotational + divergent field.
 
-A Taylor–Green vortex plus a source/sink on a doubly periodic box, verifying that
-`u_rot + u_div + u_harm == u` and that each part is recovered.
+A Taylor–Green vortex plus a source/sink on a doubly periodic box: each part is recovered, and
+`residual_fraction` is the share of `u` the staggered split does not carry.
 """
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
@@ -28,11 +28,9 @@ U = cat(u, v; dims = 3)
 
 result = HD.helmholtz_decompose(U, grid)
 
-recon_err = maximum(abs.(result.u_rot .+ result.u_div .+ result.u_harm .- U))
-
 println("=== Cartesian mixed field ===")
 println("solver:                $(nameof(typeof(HD.plan_helmholtz(grid).solver)))")
 println("Mean |u_rot|:          $(round(Statistics.mean(speed(result.u_rot)), sigdigits = 4))")
 println("Mean |u_div|:          $(round(Statistics.mean(speed(result.u_div)), sigdigits = 4))")
 println("Harmonic fraction:     $(round(result.harmonic_fraction, sigdigits = 4))")
-println("Reconstruction error:  $(round(recon_err, sigdigits = 4))")
+println("Residual fraction:     $(round(result.residual_fraction, sigdigits = 4))")

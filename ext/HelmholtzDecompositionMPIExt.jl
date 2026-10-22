@@ -39,12 +39,11 @@ function _gather!(A, nf::Int, nranks::Int, rank::Int, comm)
     return A
 end
 
-# `N`, `P` and `T` come from the plan, not the batch: parameterising `HelmholtzBatch` here would
-# make this method and the generic refusal mutually ambiguous, since the batch's later parameters
-# are themselves constrained by `T`.
+# `N`, `P` and `T` are read from the plan. `HelmholtzBatch`'s later parameters are constrained by
+# `T`, so a method parameterising the batch is ambiguous with the generic refusal.
 function HD._decompose_batch!(
     b::ComputationalBackends.AbstractMPIBackend, batch::HD.HelmholtzBatch, fields,
-    plan::HD.HelmholtzPlan{N,P,T}; kwargs...,
+    plan::HD.HelmholtzPlan{N,P,T},
 ) where {N,P,T}
     MPI.Initialized() || throw(ArgumentError(
         "MPI is not initialized — call `MPI.Init()` before `helmholtz_decompose_batch`."))
@@ -56,18 +55,23 @@ function HD._decompose_batch!(
     nf = length(items)
     nf == 0 && return batch
 
-    ws = HD.allocate_workspace(plan)
-    for i in _block(nf, nranks, rank)
-        # The rank's own inner backend, as named on the `MPIBackend`: a rank owns a block of the
-        # batch, so how it works through that block is a separate choice from how ranks divide it.
-        HD._decompose_slice!(batch, i, items[i], plan, ws;
-                             backend = HD.execution_backend(b.inner), kwargs...)
+    # The rank's own inner backend, as named on the `MPIBackend`, on a host plan: a rank owns a block of
+    # the batch, so how it works through that block is a separate choice from how ranks divide it.
+    exec = HD._field_execution(plan, ComputationalBackends.local_backend(b))
+    ws = HD._allocate_workspace(plan, exec)
+    try
+        for i in _block(nf, nranks, rank)
+            HD._decompose_slice!(batch, i, items[i], plan, ws, exec)
+        end
+    finally
+        HD.close!(ws)
     end
 
     for A in _arrays(batch)
         _gather!(A, nf, nranks, rank, comm)
     end
     _gather!(batch.harmonic_fraction, nf, nranks, rank, comm)
+    _gather!(batch.residual_fraction, nf, nranks, rank, comm)
 
     # The convergence diagnostics are structs, so they ride in one scalar buffer: `converged`,
     # `iterations` and `residual` for the primal solve and each of the `P` dual ones.

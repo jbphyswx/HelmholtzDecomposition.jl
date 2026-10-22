@@ -7,9 +7,9 @@ When coarse-graining (filtering) velocity fields on the sphere, the naive approa
 2. Filter each Cartesian component as a scalar
 3. Convert back to spherical
 
-does **NOT** commute with differential operators (Aluie 2019). This means:
-- Filtering a divergence-free field does NOT produce a divergence-free filtered field
-- Physical properties (incompressibility, etc.) are violated
+does not commute with differential operators (Aluie 2019):
+- the filtered field of a divergence-free field is in general divergent;
+- physical properties such as incompressibility are lost.
 
 ## The Correct Approach
 
@@ -73,6 +73,6 @@ result = HelmholtzDecomposition.helmholtz_decompose(cat(u, v; dims = 3), grid)
 Per Storer et al. (2022): if your velocity is **already non-divergent** (e.g., geostrophic velocity derived from SSH), the commutativity issue does not apply. The planetary Cartesian approach is correct in that case.
 
 Only use the full Helmholtz workflow when:
-- Velocity has both rotational AND divergent components
+- Velocity has both rotational and divergent components
 - You need to decompose Π into toroidal/potential contributions
 - You need guaranteed commutativity for general velocity fields

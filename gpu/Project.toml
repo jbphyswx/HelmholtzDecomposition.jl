@@ -1,12 +1,17 @@
 [deps]
-AbstractFFTs = "621f4979-c628-5d54-868e-fcf4e3e8185c"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+ComputationalBackends = "5c6e2104-4040-447f-8fc0-66ec2223b019"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+FlowGeometries = "0ccd6995-f618-4175-b01e-f437d0cb4974"
 HelmholtzDecomposition = "10a91b07-9549-4913-979d-72f12272cfcc"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [compat]
 julia = "1.11"
 
 [sources]
-HelmholtzDecomposition = { path = ".." }
+ComputationalBackends = {url = "https://github.com/jbphyswx/ComputationalBackends.jl.git"}
+FlowGeometries = {url = "https://github.com/jbphyswx/FlowGeometries.jl.git"}
+HelmholtzDecomposition = {path = ".."}
