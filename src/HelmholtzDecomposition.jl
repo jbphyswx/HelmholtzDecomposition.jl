@@ -70,6 +70,11 @@ using FlowGeometries: FlowGeometries
 using SpectralBackends: SpectralBackends
 using LinearAlgebra: LinearAlgebra
 
+public FlowTransformBindings
+public ComputationalBackends
+public FlowGeometries
+public SpectralBackends
+
 include("BoundaryConditions.jl")
 include("Execution.jl")
 include("Solvers.jl")
