@@ -1,7 +1,7 @@
 # Multiprocess batch decomposition: `helmholtz_decompose_batch` across worker processes, results in
 # input order. The package must be loaded on the workers (`@everywhere using HelmholtzDecomposition`).
-# Each worker takes one contiguous chunk of the batch, receives the plan once, and reuses one
-# workspace down its chunk.
+# Each worker receives the plan and its own contiguous chunk of the batch, and works through the chunk
+# with one workspace on the backend's inner backend.
 module HelmholtzDecompositionDistributedExt
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
@@ -25,22 +25,27 @@ end
 
 function HD._decompose_batch!(
     b::ComputationalBackends.AbstractDistributedBackend, batch::HD.HelmholtzBatch, fields,
-    plan::HD.HelmholtzPlan; kwargs...,
+    plan::HD.HelmholtzPlan,
 )
     items = collect(fields)
     isempty(items) && return batch
+    exec = HD._field_execution(plan, ComputationalBackends.local_backend(b))
+    # FastTransforms on one OpenMP thread where each field runs serially, the processes carrying the
+    # parallelism; at its own count under a threaded inner backend.
+    ft = exec isa ComputationalBackends.AbstractSerialBackend ? 1 : nothing
     ranges = _chunks(length(items), max(1, Distributed.nworkers()))
-    # A worker cannot write into the caller's arrays, so each returns its chunk as its own batch,
-    # one message per worker, and the slices are copied in here.
-    parts = Distributed.pmap(ranges) do rng
-        # Serial within a worker, FastTransforms on one OpenMP thread included: each worker process
-        # gets one chunk of the batch, and the processes carry the parallelism.
-        Base.ScopedValues.with(FTB.FASTTRANSFORMS_THREADS => 1) do
-            local_batch = HD.allocate_batch(plan, length(rng))
-            ws = HD.allocate_workspace(plan)
-            for (k, i) in enumerate(rng)
-                HD._decompose_slice!(local_batch, k, items[i], plan, ws;
-                                     backend = ComputationalBackends.SerialBackend(), kwargs...)
+    # A worker cannot write into the caller's arrays, so each returns its chunk as its own batch, one
+    # message per worker, and the slices are copied in here.
+    parts = Distributed.pmap([items[rng] for rng in ranges]) do chunk
+        Base.ScopedValues.with(FTB.FASTTRANSFORMS_THREADS => ft) do
+            local_batch = HD.allocate_batch(plan, length(chunk))
+            ws = HD._allocate_workspace(plan, exec)
+            try
+                for (k, field) in enumerate(chunk)
+                    HD._decompose_slice!(local_batch, k, field, plan, ws, exec)
+                end
+            finally
+                HD.close!(ws)
             end
             local_batch
         end

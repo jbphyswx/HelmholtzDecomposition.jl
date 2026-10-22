@@ -29,6 +29,7 @@ HelmholtzDecomposition.plan_helmholtz
 HelmholtzDecomposition.HelmholtzPlan
 HelmholtzDecomposition.HelmholtzWorkspace
 HelmholtzDecomposition.allocate_workspace
+HelmholtzDecomposition.close!
 HelmholtzDecomposition.AbstractHelmholtzResult
 HelmholtzDecomposition.HelmholtzResult
 HelmholtzDecomposition.allocate_result
@@ -96,8 +97,9 @@ HelmholtzDecomposition.SphericalNUSHTSolver
 
 ### Capability
 
-`AutoSolver` chooses on these. A named solver that cannot invert the grid's `L` is refused, except a
-spherical transform, which becomes the preconditioner of [`CGSolver`](@ref HelmholtzDecomposition.CGSolver).
+`AutoSolver` chooses on these. A named solver whose state cannot live on the execution backend is
+refused, as is one that cannot invert the grid's `L`, except a spherical transform, which becomes the
+preconditioner of [`CGSolver`](@ref HelmholtzDecomposition.CGSolver).
 
 ```@docs
 HelmholtzDecomposition.supports_boundary
@@ -139,8 +141,11 @@ HelmholtzDecomposition.loop_backend
 HelmholtzDecomposition.multigrid
 HelmholtzDecomposition.MultigridPreconditioner
 HelmholtzDecomposition.LevelBuffers
+HelmholtzDecomposition.MultigridBuffers
 HelmholtzDecomposition.multigrid_buffers
+HelmholtzDecomposition.apply_preconditioner!
 HelmholtzDecomposition.smooth!
+HelmholtzDecomposition.smooth_from_zero!
 HelmholtzDecomposition.vcycle!
 ```
 

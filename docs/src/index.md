@@ -20,7 +20,7 @@ Pkg.add(url="https://github.com/jbphyswx/HelmholtzDecomposition.jl")
 
 For spectral solver performance, also install one of:
 ```julia
-Pkg.add("FFTW")                    # Cartesian periodic grids
+Pkg.add("FFTW")                    # uniform Cartesian grids on the host
 Pkg.add("FastSphericalHarmonics")  # Regular spherical grids
 Pkg.add(url="https://github.com/jbphyswx/NUFSHT.jl")  # Irregular spherical
 ```

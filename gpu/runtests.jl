@@ -1,50 +1,51 @@
-"""
-Device parity, on real hardware.
-
-Nothing here is CUDA-specific beyond obtaining the backend. The operators, the solver and the
-reductions all run through `FlowGeometries.Execution`, and the transforms through `AbstractFFTs`,
-so a device array needs no vendor code — which is why this file tests *parity* rather than a
-separate GPU implementation.
-
-The same parity is checked without hardware in the main suite through
-`GPUBackend(KernelAbstractions.CPU())`; this runs it where the arrays are genuinely elsewhere.
-"""
+# Device parity on CUDA hardware: on a periodic grid the staggered decomposition and the periodic
+# spectral route, each run on `GPUBackend(CUDA.CUDABackend())`, equal the serial host result. Every loop
+# runs through `FlowGeometries.Execution` and every transform through `AbstractFFTs`, which CUFFT
+# implements for a `CuArray`. Run with `julia --project=gpu gpu/runtests.jl` on a machine with a device.
 
 using Test: Test
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using FlowGeometries: FlowGeometries as FG
 using ComputationalBackends: ComputationalBackends as CB
-using KernelAbstractions: KernelAbstractions as KA
+using KernelAbstractions: KernelAbstractions
 using CUDA: CUDA
-using AbstractFFTs: AbstractFFTs
+using FFTW: FFTW
 using Random: Random
 
 Test.@testset "GPU parity" begin
-    if !CUDA.functional()
-        @info "no CUDA device; skipping"
-    else
-        N, L = 64, 1.0
-        axis = range(0.0, L - L / N; length = N)
-        grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), axis, axis;
-                                       topology = (true, true), period = (L, L))
-        Random.seed!(7)
-        U = randn(N, N, 2)
+    Test.@test CUDA.functional()
+    N, L = 64, 1.0
+    axis = FG.Axes.PeriodicAxis(0.0, L, N)
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), axis, axis)
+    Random.seed!(7)
+    U = randn(N, N, 2)
+    gpu = CB.GPUBackend(CUDA.CUDABackend())
+    close_to(h, d) = maximum(abs, h .- Array(d)) < 1e-10 * max(maximum(abs, h), 1.0)
 
-        host = HD.plan_helmholtz(grid; backend = CB.SerialBackend())
-        dev = HD.plan_helmholtz(grid; backend = CB.GPUBackend(CUDA.CUDABackend()))
-
-        r_host = HD.helmholtz_decompose!(HD.allocate_result(host), U, host,
-                                         HD.allocate_workspace(host))
-        r_dev = HD.helmholtz_decompose!(HD.allocate_result(dev), CUDA.cu(U), dev,
-                                        HD.allocate_workspace(dev))
-
-        # The result is a `HelmholtzResult` of device arrays — the same type the host path gives,
-        # not a different API.
+    Test.@testset "staggered" begin
+        host = HD.plan_helmholtz(grid; execution = CB.SerialBackend())
+        dev = HD.plan_helmholtz(grid; execution = gpu)
+        r_host = HD.helmholtz_decompose!(HD.allocate_result(host), U, host)
+        r_dev = HD.helmholtz_decompose!(HD.allocate_result(dev), CUDA.CuArray(U), dev)
         Test.@test r_dev.u_rot isa CUDA.CuArray
         for (h, d) in ((r_host.u_rot, r_dev.u_rot), (r_host.u_div, r_dev.u_div),
                        (r_host.u_harm, r_dev.u_harm), (r_host.χ, r_dev.χ))
-            Test.@test maximum(abs, h .- Array(d)) < 1e-10 * max(maximum(abs, h), 1.0)
+            Test.@test close_to(h, d)
         end
         Test.@test isapprox(r_host.harmonic_fraction, r_dev.harmonic_fraction; rtol = 1e-10)
+    end
+
+    Test.@testset "spectral" begin
+        s_host = HD.helmholtz_decompose_spectral(U, grid; execution = CB.SerialBackend())
+        for s_dev in (HD.helmholtz_decompose_spectral(U, grid; execution = gpu),
+                      HD.helmholtz_decompose_spectral(CUDA.CuArray(U), grid; execution = gpu))
+            Test.@test s_dev.u_rot isa CUDA.CuArray
+            for (h, d) in ((s_host.u_rot, s_dev.u_rot), (s_host.u_div, s_dev.u_div),
+                           (s_host.u_harm, s_dev.u_harm), (s_host.χ, s_dev.χ),
+                           (s_host.divergence, s_dev.divergence))
+                Test.@test close_to(h, d)
+            end
+            Test.@test isapprox(s_host.harmonic_fraction, s_dev.harmonic_fraction; rtol = 1e-10)
+        end
     end
 end

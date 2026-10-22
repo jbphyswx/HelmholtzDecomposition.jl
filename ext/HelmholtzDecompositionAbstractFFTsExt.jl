@@ -1,50 +1,58 @@
 """
-    HelmholtzDecompositionAbstractFFTsExt — bounded and channel domains on any FFT backend.
+    HelmholtzDecompositionAbstractFFTsExt — the Cartesian FFT solvers on any FFT library.
 
-A DCT-II/DST-II is an FFT of the even/odd extension, so the cosine and sine transforms that
-diagonalize the bounded Laplacian run on any array whose backend provides an `AbstractFFTs`
-transform:
+The periodic FFT (`CartesianSpectralSolver`) and the bounded and channel transforms
+(`CartesianRealTransformSolver`) call the `AbstractFFTs` interface alone, so they run on whichever
+library implements it for the array: FFTW on the host, CUFFT on a `CuArray`. A DCT-II/DST-II is an FFT
+of the even/odd extension,
 
     even extension y = [x; reverse(x)]      ⇒  DCT-II[k] = real( rfft(y)[k+1] · e^{-iπk/2N} )
     odd  extension y = [x; −reverse(x)]     ⇒  DST-II[k] = −imag( rfft(y)[k+2] · e^{-iπ(k+1)/2N} )
 
-and the inverse by reading the first backwards: rebuild `Z[k+1] = C[k]·e^{+iπk/2N}`, pad one zero
-to the `rfft` layout of a length-`2N` real signal, `brfft(Z, 2N)`, take the first `N` over `2N`.
+and the inverse reads the first backwards: rebuild `Z[k+1] = C[k]·e^{+iπk/2N}`, pad one zero to the
+`rfft` layout of a length-`2N` real signal, `brfft(Z, 2N)`, take the first `N` over `2N`.
 """
 module HelmholtzDecompositionAbstractFFTsExt
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
 using ComputationalBackends: ComputationalBackends as CB
 using FlowGeometries: FlowGeometries as FG
+using FlowTransformBindings: FlowTransformBindings as FTB
 using AbstractFFTs: AbstractFFTs
 using LinearAlgebra: LinearAlgebra
 
+const _FFTSolver = Union{HD.CartesianSpectralSolver,HD.CartesianRealTransformSolver}
+
+# The periodic FFT expands in a periodic basis, so its grid has no boundary and every condition is
+# accepted; the real transforms take a bounded direction under either condition. Both transform every
+# cell and need constant spacing.
+HD.supports_boundary(::HD.CartesianSpectralSolver, ::FG.Operators.AbstractBoundaryCondition) = true
+HD.requires_periodic_domain(::HD.CartesianSpectralSolver) = true
 HD.supports_boundary(::HD.CartesianRealTransformSolver, ::FG.Operators.Dirichlet) = true
 HD.supports_boundary(::HD.CartesianRealTransformSolver, ::FG.Operators.Neumann) = true
-HD.requires_full_domain(::HD.CartesianRealTransformSolver) = true
-HD.requires_uniform_axes(::HD.CartesianRealTransformSolver) = true
+HD.requires_full_domain(::_FFTSolver) = true
+HD.requires_uniform_axes(::_FFTSolver) = true
 
-# Whether `AbstractFFTs` has a `plan_rfft` method for the grid's own storage type.
-@inline _has_backend(::Type{A}) where {A<:AbstractVector} =
-    hasmethod(AbstractFFTs.plan_rfft, Tuple{A,UnitRange{Int}})
+# An FFT library for vectors of type `A` is a `plan_rfft` method other than AbstractFFTs' conversion
+# fallback and, for a device vector, other than the one host vectors reach: a host library's method on
+# `StridedArray` also matches a device array whose memory it cannot address.
+function _has_fft(::Type{A}) where {T,A<:AbstractVector{T}}
+    m = which(AbstractFFTs.plan_rfft, Tuple{A,UnitRange{Int}})
+    m.module === AbstractFFTs && return false
+    return A <: Array || m !== which(AbstractFFTs.plan_rfft, Tuple{Vector{T},UnitRange{Int}})
+end
 
-@inline _storage_vector(grid) = typeof(similar(FG.Grids.measure(grid), eltype(grid), 1))
+HD.supports_backend(::_FFTSolver, backend, grid) =
+    _has_fft(typeof(FG.Execution.allocate(backend, eltype(grid), 0)))
 
-HD.supports_sampling(::HD.CartesianRealTransformSolver, grid) =
-    _has_backend(_storage_vector(grid))
-
-HD._sampling_message(::HD.CartesianRealTransformSolver, grid) =
-    "CartesianRealTransformSolver needs an FFT backend for $(_storage_vector(grid)); " *
-    "`AbstractFFTs` alone is an interface and provides none. Load one (`using FFTW` on the " *
-    "host, or the array's own package on a device)."
+HD._backend_message(s::_FFTSolver, backend) =
+    "$(nameof(typeof(s))) transforms through AbstractFFTs, and no FFT library implements it for the " *
+    "arrays $(nameof(typeof(backend))) allocates. Load one (`using FFTW` on the host, CUDA for a " *
+    "`CuArray`), or solve with `CGSolver()`."
 
 # ---------------------------------------------------------------------------
-# Real path: every direction bounded
+# One bounded direction: the even or odd extension and its two plans
 # ---------------------------------------------------------------------------
-#
-# A cosine or sine transform of real data is real, so with no periodic direction only the
-# length-`2n` half-spectrum in between is complex. The plans and buffers live in the state, so a
-# solve allocates nothing.
 
 """
     DirPlan
@@ -62,8 +70,7 @@ end
 
 function _dir_plan(::Type{T}, dims::Dims{N}, d::Int, off::Int, backend) where {T,N}
     ext = HD._zeros(backend, T, ntuple(e -> e == d ? 2dims[e] : dims[e], Val(N)))
-    spec = HD._zeros(backend, complex(T),
-                             ntuple(e -> e == d ? dims[e] + 1 : dims[e], Val(N)))
+    spec = HD._zeros(backend, complex(T), ntuple(e -> e == d ? dims[e] + 1 : dims[e], Val(N)))
     return DirPlan(ext, spec, AbstractFFTs.plan_rfft(ext, d:d; HD._plan_kwargs(ext, backend)...),
                    AbstractFFTs.plan_brfft(spec, 2dims[d], d:d; HD._plan_kwargs(spec, backend)...),
                    _twiddle(T, dims[d], off, N, d, backend))
@@ -102,6 +109,10 @@ function _axis_symbols(::Type{T}, dims::NTuple{N,Int}, kdims::NTuple{N,Int}, h, 
     end
 end
 
+# ---------------------------------------------------------------------------
+# The solve states
+# ---------------------------------------------------------------------------
+
 """
     RealBoundedState
 
@@ -117,13 +128,13 @@ end
 """
     MixedTopologyState
 
-At least one direction wraps. The bounded directions transform first, in real arithmetic; the
-periodic ones then go through one `rfft`, which halves the first of them.
+At least one direction wraps. The bounded directions `bdims` transform first, in real arithmetic; the
+periodic ones then go through one `rfft`, which halves the first of them. With every direction wrapping
+this is the periodic FFT.
 """
-struct MixedTopologyState{T,N,D,P,IP,L,A,S}
-    dirs::D            # bounded directions only, paired with `bdims`
-    bdims::NTuple{<:Any,Int}
-    pdims::NTuple{<:Any,Int}
+struct MixedTopologyState{T,N,D,BD<:Tuple{Vararg{Int}},P,IP,L,A,S}
+    dirs::D            # one per bounded direction, paired with `bdims`
+    bdims::BD
     pplan::P
     iplan::IP
     λ::L
@@ -141,31 +152,37 @@ Base.show(io::IO, ::MixedTopologyState{T,N}) where {T,N} =
 function HD.prepare_solver(::HD.CartesianRealTransformSolver,
                            grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
                            boundary::FG.Operators.AbstractBoundaryCondition;
-                           backend = CB.SerialBackend(), shared = nothing) where {T,N}
+                           execution = CB.SerialBackend(), shared = nothing) where {T,N}
     dims = size(grid)
     off = boundary isa FG.Operators.Dirichlet ? 1 : 0
     per = ntuple(d -> FG.Grids.isperiodic(grid, d), Val(N))
     h = ntuple(d -> abs(FG.Grids.spacing(grid, d)), Val(N))
-    work = HD._zeros(backend, T, dims)
+    work = HD._zeros(execution, T, dims)
 
     if !any(per)
-        dirs = ntuple(d -> _dir_plan(T, dims, d, off, backend), Val(N))
-        λ = _axis_symbols(T, dims, dims, h, per, off, 0, backend)
+        dirs = ntuple(d -> _dir_plan(T, dims, d, off, execution), Val(N))
+        λ = _axis_symbols(T, dims, dims, h, per, off, 0, execution)
         return RealBoundedState{T,N,typeof(dirs),typeof(λ),typeof(work)}(dirs, λ, work)
     end
 
     bdims = Tuple(d for d in 1:N if !per[d])
     pdims = Tuple(d for d in 1:N if per[d])
-    dirs = map(d -> _dir_plan(T, dims, d, off, backend), bdims)
-    spec = HD._zeros(backend, complex(T),
-                             ntuple(e -> e == pdims[1] ? dims[e] ÷ 2 + 1 : dims[e], Val(N)))
-    pplan = AbstractFFTs.plan_rfft(work, pdims; HD._plan_kwargs(work, backend)...)
-    iplan = AbstractFFTs.plan_brfft(spec, dims[pdims[1]], pdims; HD._plan_kwargs(spec, backend)...)
-    λ = _axis_symbols(T, dims, size(spec), h, per, off, pdims[1], backend)
+    dirs = map(d -> _dir_plan(T, dims, d, off, execution), bdims)
+    spec = HD._zeros(execution, complex(T), ntuple(e -> e == pdims[1] ? dims[e] ÷ 2 + 1 : dims[e], Val(N)))
+    pplan = AbstractFFTs.plan_rfft(work, pdims; HD._plan_kwargs(work, execution)...)
+    iplan = AbstractFFTs.plan_brfft(spec, dims[pdims[1]], pdims; HD._plan_kwargs(spec, execution)...)
+    λ = _axis_symbols(T, dims, size(spec), h, per, off, pdims[1], execution)
     nrm = T(prod(d -> dims[d], pdims))
-    return MixedTopologyState{T,N,typeof(dirs),typeof(pplan),typeof(iplan),typeof(λ),typeof(work),
-                              typeof(spec)}(dirs, bdims, pdims, pplan, iplan, λ, work, spec, nrm)
+    return MixedTopologyState{T,N,typeof(dirs),typeof(bdims),typeof(pplan),typeof(iplan),typeof(λ),
+                              typeof(work),typeof(spec)}(dirs, bdims, pplan, iplan, λ, work, spec, nrm)
 end
+
+# The periodic FFT is the real transforms' path on a grid every direction of which wraps.
+HD.prepare_solver(::HD.CartesianSpectralSolver,
+                  grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
+                  boundary::FG.Operators.AbstractBoundaryCondition;
+                  execution = CB.SerialBackend(), shared = nothing) where {T,N} =
+    HD.prepare_solver(HD.CartesianRealTransformSolver(), grid, boundary; execution = execution)
 
 # x -> [x; ±reverse(x)] along `d`, into the preallocated buffer, reading `X` backwards through a
 # view.
@@ -220,7 +237,8 @@ function _solve!(Φ::AbstractArray{T,N}, RHS, st::RealBoundedState, boundary) wh
 end
 
 # Bounded directions first, in real arithmetic; the periodic ones then take a single `rfft`, which
-# halves the first of them.
+# halves the first of them. `RHS` and `Φ` pass through `work`, the array the plans were built for, since
+# a plan applies to arrays of its own memory alignment and a batch hands views of its slices.
 function _solve!(Φ::AbstractArray{T,N}, RHS, st::MixedTopologyState, boundary) where {T,N}
     odd = boundary isa FG.Operators.Dirichlet
     copyto!(st.work, RHS)
@@ -256,13 +274,52 @@ function HD.solve_poisson!(
     Φ::AbstractArray{T,N},
     RHS::AbstractArray{T,N},
     grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
-    solver::HD.CartesianRealTransformSolver;
+    solver::_FFTSolver;
     boundary::FG.Operators.AbstractBoundaryCondition = FG.Operators.Neumann(),
     state = HD.prepare_solver(solver, grid, boundary),
     kwargs...,
 ) where {T<:AbstractFloat,N}
     HD._require_boundary(solver, boundary)
     return _solve!(Φ, RHS, state, boundary)
+end
+
+# ---------------------------------------------------------------------------
+# The spectral decomposition on a periodic grid
+# ---------------------------------------------------------------------------
+
+function HD._decompose_spectral(
+    ::HD.CartesianSpectralSolver,
+    ::FG.Geometry.AbstractCartesianGeometry,
+    U::AbstractArray{T,M},
+    grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
+    execution, ::Nothing,
+) where {T,M,N}
+    dims = size(grid)
+    kdims = ntuple(d -> d == 1 ? dims[1] ÷ 2 + 1 : dims[d], Val(N))
+    # `U` in `execution`'s memory, and every buffer allocated like it, so the transforms run there. A plan
+    # applies to arrays of the alignment it was built for, which a component view of `U` need not have,
+    # so each component passes through `work`.
+    U = FG.Execution.on_backend(execution, U)
+    work = similar(U, T, dims)
+    spec = similar(U, Complex{T}, kdims)
+    velocity_hat = similar(U, Complex{T}, (kdims..., N))
+    fplan = AbstractFFTs.plan_rfft(work; HD._plan_kwargs(work, execution)...)
+    bplan = AbstractFFTs.plan_brfft(spec, dims[1]; HD._plan_kwargs(spec, execution)...)
+    for c in 1:N
+        copyto!(work, HD._component(U, c, Val(N)))
+        LinearAlgebra.mul!(spec, fplan, work)
+        copyto!(HD._component(velocity_hat, c, Val(N)), spec)
+    end
+    ks = FTB.wavenumber_axes(ntuple(d -> T(FG.Grids.domain_length(grid, d)), Val(N)), dims, Val(true))
+    scale = one(T) / T(prod(dims))
+    # A multi-dimensional complex-to-real plan consumes its input, the scratch refilled for every inverse.
+    invert! = function (out, x)
+        LinearAlgebra.mul!(work, bplan, x)
+        out .= work .* scale
+        return out
+    end
+    return HD._cartesian_result(grid, U, velocity_hat, HD._derivative_symbol(spec, T, ks), similar(spec), spec,
+                                invert!)
 end
 
 end # module

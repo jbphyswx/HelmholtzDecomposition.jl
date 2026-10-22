@@ -78,12 +78,12 @@ library is loaded:
 
 | Geometry | Regular grid | Irregular grid |
 |----------|-------------|----------------|
-| **Cartesian** | `using FFTW` (periodic, bounded, channel) or `using AbstractFFTs` | `using NonuniformFFTs` or `using FINUFFT` |
+| **Cartesian** | an FFT library for the array: `using FFTW` on the host, CUDA's CUFFT for a `CuArray` (periodic, bounded, channel) | `using NonuniformFFTs` or `using FINUFFT` |
 | **Spherical** | `using FastSphericalHarmonics` (Clenshaw–Curtis) | `using NUFSHT` (any covering node set) |
 
 `AutoSolver()` (the default) takes the first of those solvers, in the order of the table below, whose
-library is loaded and whose requirements the grid meets — mask, axis uniformity, topology and node
-layout.
+library is loaded and whose requirements the grid and the execution backend meet — mask, axis
+uniformity, topology, node layout, and whether the solver's state can live where the backend runs.
 
 **Build axes from ranges.** FlowGeometries proves uniformity from the axis *type*, so a
 `collect`ed range is a `Vector`, carries no such proof, and quietly costs every transform fast
@@ -131,17 +131,28 @@ A1, A2, A3 = HD.vector_potential(res3)
 
 # A device: plan with a GPUBackend over a KernelAbstractions backend (`using KernelAbstractions`
 # and the vendor package); the loops run as kernels and the arrays stay on the device.
-plan = HD.plan_helmholtz(grid; backend = CB.GPUBackend(CUDA.CUDABackend()), solver = HD.CGSolver())
+gpu = CB.GPUBackend(CUDA.CUDABackend())
+plan = HD.plan_helmholtz(grid; execution = gpu)
+res = HD.helmholtz_decompose!(HD.allocate_result(plan), CUDA.CuArray(U), plan)
+
+# The periodic spectral route on the device: `U` moves there and the parts come back there.
+res = HD.helmholtz_decompose_spectral(U, periodic_grid; execution = gpu)
 
 # Many snapshots on one grid (`using OhMyThreads`, `Distributed` or `MPI` for the parallel axes)
 plan = HD.plan_helmholtz(grid)
-batch = HD.helmholtz_decompose_batch(plan, fields; backend = CB.ThreadedBackend())
+batch = HD.helmholtz_decompose_batch(plan, fields; execution = CB.ThreadedBackend())
 ```
 
-`AutoBackend()`, the default, threads the loops when Julia runs more than one thread and runs them
-serially otherwise; it does not read the array type, so a device array needs its `GPUBackend`
-named. The device path is checked against the host on `KernelAbstractions.CPU()` and on JLArrays in
-the test suite; `gpu/runtests.jl` runs the same comparison on CUDA hardware.
+`AutoBackend()`, the default, threads a loop when it gives each of Julia's threads at least 16384 of
+its indices and runs it serially otherwise, so the coarse levels of a multigrid cycle stay on one
+thread; it does not read the array type, so a device array needs its `GPUBackend` named. On a device
+`AutoSolver` takes the FFT solvers where an FFT library implements the device's arrays and
+multigrid-preconditioned conjugate gradients otherwise. NUFSHT runs on the device it is given, as
+`helmholtz_decompose_spectral`'s route on any covering sphere and as a named preconditioner, where a
+NUFFT library takes the device's arrays; FastSphericalHarmonics, FFTW's real-to-real transforms and the
+scattered fit hold host state and run on host backends. The device path is checked
+against the host on `KernelAbstractions.CPU()` and on JLArrays in the test suite; `gpu/runtests.jl`
+runs the staggered decomposition and the periodic spectral route on CUDA hardware.
 
 ### Scattered / unstructured data
 
@@ -162,6 +173,11 @@ res = HD.helmholtz_decompose_spectral(U, pts)   # U is (M, 2); parts, χ, ψ and
 # Or name the library and the mode count:
 solver = HD.CartesianNUFFTSolver(FTB.NonuniformFFTsBackend(); nk = (32, 32))
 res = HD.helmholtz_decompose_spectral(U, pts; solver)
+
+# A time series on one point set plans its transforms once; `close!` releases them.
+state = HD.prepare_solver(solver, pts, FG.Operators.Neumann())
+results = [HD.helmholtz_decompose_spectral(U, pts; solver, state) for U in snapshots]
+HD.close!(state)
 ```
 
 On the sphere the same entry point takes **any node set covering `S²`**, through NUFSHT's
@@ -229,9 +245,9 @@ The package keeps two orthogonal axes separate:
 | Solver | When to use |
 |--------|-------------|
 | `HD.CGSolver()` (base, dimension-generic) | any grid: masked domains, any boundary condition, any geometry. Multigrid-preconditioned by default |
-| `HD.CartesianSpectralSolver()` (FFTW) | uniform periodic Cartesian, any dimension |
-| `HD.CartesianBoundedSolver()` (FFTW) | uniform Cartesian with any mix of bounded and periodic directions, including a channel |
-| `HD.CartesianRealTransformSolver()` (AbstractFFTs) | the same, through whichever backend owns the array |
+| `HD.CartesianSpectralSolver()` (AbstractFFTs: FFTW, CUFFT) | uniform periodic Cartesian, any dimension, host or device |
+| `HD.CartesianBoundedSolver()` (FFTW) | uniform Cartesian with any mix of bounded and periodic directions, including a channel, on the host |
+| `HD.CartesianRealTransformSolver()` (AbstractFFTs: FFTW, CUFFT) | the same, through whichever FFT library implements the array, host or device |
 | `HD.CartesianNUFFTSolver(nufft; nk)` (NonuniformFFTs or FINUFFT) | scattered Cartesian, any dimension |
 | `HD.SphericalSpectralSolver()` (FastSphericalHarmonics) | Clenshaw–Curtis lat/lon (`Nlon = 2·Nlat−1`) |
 | `HD.SphericalNUSHTSolver()` (NUFSHT) | any spherical node set covering `S²` |
@@ -241,16 +257,19 @@ directly; on the staggered path (`helmholtz_decompose`, `plan_helmholtz`) they p
 `CGSolver` on the grid's own discrete Laplacian, named or chosen by `AutoSolver`, so the divergent
 part carries the field's divergence on the grid to the solver tolerance.
 
-`AutoSolver` is mask-aware (never picks a transform on a masked domain) and takes a Cartesian
-transform where one applies, a spherical preconditioner on a sphere whose nodes one accepts, and
-multigrid otherwise.
+`AutoSolver` is mask-aware (never picks a transform on a masked domain) and backend-aware (never picks
+a solver whose state lives on the host for a device backend), and takes a Cartesian transform where
+one applies, a spherical preconditioner on a sphere whose nodes one accepts, and multigrid otherwise.
 
 **Execution backend** (where the loops of one decomposition run): `SerialBackend`,
-`ThreadedBackend`, `GPUBackend(backend)` over a KernelAbstractions backend, passed as `backend=` to
-`plan_helmholtz` / `helmholtz_decompose`. **Batch backend** (how fields are spread):
-`SerialBackend`, `ThreadedBackend` (`using OhMyThreads`), `DistributedBackend`
-(`using Distributed`), `MPIBackend` (`using MPI`), passed as `backend=` to
-`helmholtz_decompose_batch`. `AutoBackend()` is threads when Julia runs more than one, else serial.
+`ThreadedBackend`, `GPUBackend(backend)` over a KernelAbstractions backend, passed as `execution=` to
+`plan_helmholtz` / `helmholtz_decompose` / `helmholtz_decompose_spectral`. **Batch backend** (how
+fields are spread): `SerialBackend`, `ThreadedBackend` (`using OhMyThreads`), `DistributedBackend`
+(`using Distributed`), `MPIBackend` (`using MPI`), passed as `execution=` to
+`helmholtz_decompose_batch`. Under a serial batch each field's loops run on the plan's backend; on a
+host plan a threaded batch runs each field serially and a Distributed or MPI batch on its inner
+backend, and on a device plan every field runs on the device. `AutoBackend()` threads a loop only
+when it is long enough to give every thread 16384 indices.
 
 ## Relationship to Structure Function "Helmholtz Decomposition"
 

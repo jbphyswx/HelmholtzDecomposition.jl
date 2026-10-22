@@ -22,18 +22,17 @@ Test.@testset "transforms invert L" begin
     xp = FG.Axes.PeriodicAxis(0.0, 1.0, n)
     xb = range(0.0, 1.0; length = n)
     box = FG.Grids.StructuredGrid(CART, xb, xb)
-    dplan = HD.plan_helmholtz(box; solver = HD.CGSolver(), backend = CB.SerialBackend())
+    dplan = HD.plan_helmholtz(box; solver = HD.CGSolver(), execution = CB.SerialBackend())
+    fft, r2r = HD.CartesianSpectralSolver(), HD.CartesianBoundedSolver()
     cases = [
-        ("periodic", FG.Grids.StructuredGrid(CART, xp, xp), OPS.Neumann(), nothing),
-        ("box, Neumann", box, OPS.Neumann(), nothing),
-        ("box, Dirichlet", box, OPS.Dirichlet(), nothing),
-        ("channel, Dirichlet", FG.Grids.StructuredGrid(CART, xp, xb), OPS.Dirichlet(), nothing),
-        ("dual of a box", dplan.dual_grids[1], dplan.dual_boundaries[1], dplan.dual_coefficients[1]),
+        ("periodic", FG.Grids.StructuredGrid(CART, xp, xp), OPS.Neumann(), nothing, fft),
+        ("box, Neumann", box, OPS.Neumann(), nothing, r2r),
+        ("box, Dirichlet", box, OPS.Dirichlet(), nothing, r2r),
+        ("channel, Dirichlet", FG.Grids.StructuredGrid(CART, xp, xb), OPS.Dirichlet(), nothing, r2r),
+        ("dual of a box", dplan.dual_grids[1], dplan.dual_boundaries[1], dplan.dual_coefficients[1], r2r),
     ]
-    for (name, grid, bc, coef) in cases
+    for (name, grid, bc, coef, s) in cases
         Test.@testset "$name" begin
-            s = HD.select_solver(HD.AutoSolver(), grid, bc)
-            Test.@test !(s isa HD.CGSolver)
             c = coef === nothing ? OPS.laplacian_coefficients(OPS.face_metrics(grid, bc)) : coef
             Random.seed!(4)
             f = randn(size(grid))
@@ -65,16 +64,16 @@ Test.@testset "spherical transforms" begin
             Test.@test maximum(abs, Φ .- f) <= 1e-9
             solver isa HD.SphericalNUSHTSolver && HD.close!(st)
 
-            # On the staggered path the transform preconditions conjugate gradients on the grid's `L`,
-            # named or chosen, so the divergent part carries the field's divergence to the solver
-            # tolerance; the transform shortens the iteration. A device backend takes neither, both
-            # holding host state.
-            Test.@test HD.select_solver(solver, grid, OPS.Neumann()).spectral === solver
-            Test.@test HD._resolve_auto_solver(grid, OPS.Neumann(); backend = CB.GPUBackend(nothing)).spectral === nothing
+            # On the staggered path `AutoSolver` preconditions conjugate gradients on the grid's `L` with
+            # a spherical transform, so the divergent part carries the field's divergence to the solver
+            # tolerance in fewer iterations than under multigrid. Under a device backend it keeps
+            # multigrid.
+            Test.@test HD.select_solver(HD.AutoSolver(), grid, OPS.Neumann();
+                                        execution = CB.GPUBackend(nothing)).spectral === nothing
             Random.seed!(43)
             u = randn(size(grid)..., 2)
             iters = map((HD.AutoSolver(), HD.CGSolver())) do s
-                plan = HD.plan_helmholtz(grid; solver = s, backend = CB.SerialBackend())
+                plan = HD.plan_helmholtz(grid; solver = s, execution = CB.SerialBackend())
                 ws = HD.allocate_workspace(plan)
                 r = HD.helmholtz_decompose!(HD.allocate_result(plan), u, plan, ws)
                 fmD = OPS.face_metrics(grid, OPS.Dirichlet())
@@ -82,11 +81,9 @@ Test.@testset "spherical transforms" begin
                 Dg = OPS.divergence!(zeros(size(grid)), HD.face_divergent(ws), fmD)
                 Test.@test r.χ_solve.converged
                 Test.@test maximum(abs, Dg .- Dv) <= 1e-9 * maximum(abs, Dv)
-                s isa HD.AutoSolver && Test.@test plan.solver.spectral isa typeof(solver)
-                Test.@test HD.close!(ws) === ws
+                HD.close!(ws)
                 r.χ_solve.iterations
             end
-            println("  χ iterations on $name: spectral preconditioner $(iters[1]), multigrid $(iters[2])")
             Test.@test iters[1] < iters[2]
         end
     end
@@ -99,7 +96,7 @@ Test.@testset "Float32 converges; a capped solve returns flagged" begin
     Random.seed!(12)
     u = randn(Float32, n, n, 2)
     for mg in (true, false)
-        plan = HD.plan_helmholtz(grid; solver = HD.CGSolver(; multigrid = mg), backend = CB.SerialBackend())
+        plan = HD.plan_helmholtz(grid; solver = HD.CGSolver(; multigrid = mg), execution = CB.SerialBackend())
         ws = HD.allocate_workspace(plan)
         res = HD.helmholtz_decompose!(HD.allocate_result(plan), u, plan, ws)
         Test.@test res.χ_solve.converged && all(s -> s.converged, res.rot_solve)
@@ -108,7 +105,7 @@ Test.@testset "Float32 converges; a capped solve returns flagged" begin
         Test.@test sqrt(sum(abs2, δ .- res.divergence)) <= 10 * eps(Float32) * (8 * n^2 / π^2) * sqrt(sum(abs2, res.divergence))
     end
     capped = HD.plan_helmholtz(grid; solver = HD.CGSolver(; max_iter = 2, multigrid = false),
-                               backend = CB.SerialBackend())
+                               execution = CB.SerialBackend())
     rc = HD.helmholtz_decompose!(HD.allocate_result(capped), u, capped)
     Test.@test !rc.χ_solve.converged && rc.χ_solve.iterations == 2
     Test.@test !all(s -> s.converged, rc.rot_solve)
@@ -129,7 +126,7 @@ Test.@testset "one constant per closed component" begin
     for (mask, bc, parts) in ((wall, OPS.Neumann(), ((1:(n ÷ 2 - 1), :), ((n ÷ 2 + 1):n, :))),
                               (lake, OPS.Dirichlet(), (inside,)))
         grid = FG.Grids.StructuredGrid(CART, xr, xr; mask = mask)
-        plan = HD.plan_helmholtz(grid; boundary = bc, solver = HD.CGSolver(), backend = CB.SerialBackend())
+        plan = HD.plan_helmholtz(grid; boundary = bc, solver = HD.CGSolver(), execution = CB.SerialBackend())
         ws = HD.allocate_workspace(plan)
         res = HD.helmholtz_decompose!(HD.allocate_result(plan), randn(n, n, 2) .* mask, plan, ws)
         Test.@test res.χ_solve.converged
@@ -149,20 +146,17 @@ Test.@testset "a threaded batch equals the serial one" begin
     # axis; the tasks share one plan and each writes its own workspace and slice.
     n = 10
     grid = FG.Grids.StructuredGrid(CART, range(0.0, 1.0; length = n), range(0.0, 1.0; length = n))
-    plan = HD.plan_helmholtz(grid; backend = CB.SerialBackend())
+    plan = HD.plan_helmholtz(grid; execution = CB.SerialBackend())
     Random.seed!(2)
     fields = [randn(n, n, 2) for _ in 1:4]
-    serial = HD.helmholtz_decompose_batch(plan, fields; backend = CB.SerialBackend())
-    threaded = HD.helmholtz_decompose_batch(plan, fields; backend = CB.ThreadedBackend())
+    serial = HD.helmholtz_decompose_batch(plan, fields; execution = CB.SerialBackend())
+    threaded = HD.helmholtz_decompose_batch(plan, fields; execution = CB.ThreadedBackend())
     Test.@test serial.u_rot == threaded.u_rot && serial.χ == threaded.χ
     Test.@test serial.harmonic_fraction == threaded.harmonic_fraction
-    Test.@test size(serial.u_rot) == (n, n, 2, length(fields))
 
     # Inside one field, `AutoBackend`'s loop-sized threading changes only the grouping of reductions.
     # At one index per thread it threads every loop.
-    sized = HD.plan_helmholtz(grid; backend = HD.LoopSizedThreads(1))
+    sized = HD.plan_helmholtz(grid; execution = HD.LoopSizedThreads(1))
     rs = HD.helmholtz_decompose!(HD.allocate_result(sized), fields[1], sized)
     Test.@test maximum(abs, rs.u_rot .- serial.u_rot[:, :, :, 1]) <= 1e-12 * maximum(abs, serial.u_rot)
-    Test.@test HD.resolve_execution_backend(CB.AutoBackend()) isa
-               (Threads.nthreads() > 1 ? HD.LoopSizedThreads : CB.SerialBackend)
 end

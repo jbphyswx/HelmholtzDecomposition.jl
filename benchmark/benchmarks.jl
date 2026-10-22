@@ -159,15 +159,15 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    structured_case(label, grid; boundary, solver, backend)
+    structured_case(label, grid; boundary, solver, execution)
 
 Plan, workspace and steady-state cost of one decomposition, plus the plan's footprint.
 """
 function structured_case(label, grid; boundary = FG.Operators.Neumann(), solver = HD.AutoSolver(),
-                         backend = CB.SerialBackend())
+                         execution = CB.SerialBackend())
     N = ndims(grid)
-    plan = HD.plan_helmholtz(grid; boundary, solver, backend)
-    tplan = bench(() -> HD.plan_helmholtz(grid; boundary, solver, backend); samples = 3)
+    plan = HD.plan_helmholtz(grid; boundary, solver, execution)
+    tplan = bench(() -> HD.plan_helmholtz(grid; boundary, solver, execution); samples = 3)
     tws = bench(() -> HD.allocate_workspace(plan); samples = 3)
 
     ws = HD.allocate_workspace(plan)
@@ -182,19 +182,19 @@ function structured_case(label, grid; boundary = FG.Operators.Neumann(), solver 
 end
 
 """
-    batch_case(label, grid, nfields; backend)
+    batch_case(label, grid, nfields; execution)
 
 Per-field cost across a batch. One plan is shared and each task takes its own workspace, so the
 number to read is `call / nfields` against the single-field `call` above.
 """
-function batch_case(label, grid, nfields::Int; backend = CB.SerialBackend())
+function batch_case(label, grid, nfields::Int; execution = CB.SerialBackend())
     N = ndims(grid)
-    plan = HD.plan_helmholtz(grid; boundary = FG.Operators.Neumann(), backend = CB.SerialBackend())
+    plan = HD.plan_helmholtz(grid; boundary = FG.Operators.Neumann(), execution = CB.SerialBackend())
     Random.seed!(12)
     fields = [randn(size(grid)..., N) for _ in 1:nfields]
     batch = HD.allocate_batch(plan, nfields)
 
-    t = bench(() -> HD.helmholtz_decompose_batch!(batch, fields, plan; backend); samples = 3)
+    t = bench(() -> HD.helmholtz_decompose_batch!(batch, fields, plan; execution); samples = 3)
     per = (; time = t.time / nfields, bytes = t.bytes ÷ nfields)
     record!(; case = label, solver = string(nameof(typeof(plan.solver))) * " /field",
             plan = NA, workspace = NA, call = per, planbytes = Base.summarysize(plan))
@@ -297,15 +297,15 @@ function suite(set::Symbol)
     for b in batches
         batch_case("serial B=$b", _periodic(n2, 2), b)
         Threads.nthreads() > 1 &&
-            batch_case("threaded B=$b", _periodic(n2, 2), b; backend = CB.ThreadedBackend())
+            batch_case("threaded B=$b", _periodic(n2, 2), b; execution = CB.ThreadedBackend())
     end
     println()
 
     println("Intra-field backend, masked $(n2)²")
     header()
-    structured_case("masked serial", _masked(n2); backend = CB.SerialBackend())
+    structured_case("masked serial", _masked(n2); execution = CB.SerialBackend())
     Threads.nthreads() > 1 &&
-        structured_case("masked threaded", _masked(n2); backend = CB.ThreadedBackend())
+        structured_case("masked threaded", _masked(n2); execution = CB.ThreadedBackend())
     println()
     println("BENCHMARK_COMPLETE")
     return ROWS

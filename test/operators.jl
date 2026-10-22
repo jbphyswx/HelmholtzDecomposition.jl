@@ -62,7 +62,7 @@ Test.@testset "the rotation potential's operator is curl ∘ rot" begin
         ndims(grid) == 2 || continue
         Test.@testset "$name" begin
             Random.seed!(11)
-            plan = HD.plan_helmholtz(grid; boundary = bc, solver = HD.CGSolver(), backend = CB.SerialBackend())
+            plan = HD.plan_helmholtz(grid; boundary = bc, solver = HD.CGSolver(), execution = CB.SerialBackend())
             dg = plan.dual_grids[1]
             dact = FG.Grids.mask(dg)
             R = (randn(size(dg)) .* dact,)
@@ -88,7 +88,7 @@ Test.@testset "the staggered decomposition" begin
             act = FG.Grids.mask(grid)
             Random.seed!(31)
             u = randn(size(grid)..., N) .* act
-            plan = HD.plan_helmholtz(grid; boundary = bc, solver = HD.CGSolver(), backend = CB.SerialBackend())
+            plan = HD.plan_helmholtz(grid; boundary = bc, solver = HD.CGSolver(), execution = CB.SerialBackend())
             ws = HD.allocate_workspace(plan)
             r = HD.helmholtz_decompose!(HD.allocate_result(plan), u, plan, ws)
             Test.@test r.χ_solve.converged && all(s -> s.converged, r.rot_solve)
@@ -123,7 +123,7 @@ Test.@testset "closed forms" begin
     n = 10
     xs = range(0.0, 1.0; length = n)
     run(u, grid; bc = OPS.Neumann()) =
-        HD.helmholtz_decompose(u, grid; boundary = bc, solver = HD.CGSolver(), backend = CB.SerialBackend())
+        HD.helmholtz_decompose(u, grid; boundary = bc, solver = HD.CGSolver(), execution = CB.SerialBackend())
 
     # A uniform flow through a box is the gradient of `x`: wholly divergent, divergence zero in the
     # edge cells as everywhere (`∂χ/∂n = u·n̂`, Bhatia et al. 2013).

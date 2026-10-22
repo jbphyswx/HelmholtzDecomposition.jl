@@ -10,6 +10,7 @@ using NUFSHT: NUFSHT
 using FINUFFT: FINUFFT
 using NonuniformFFTs: NonuniformFFTs
 using FlowTransformBindings: FlowTransformBindings as FTB
+using KernelAbstractions: KernelAbstractions as KA
 using OhMyThreads: OhMyThreads
 using Random: Random
 
@@ -61,7 +62,6 @@ Test.@testset "split and potentials against closed forms" begin
     for (label, grid, solver) in routes
         Test.@testset "$label" begin
             resolved = HD._resolve_spectral_solver(grid, solver)
-            solver isa HD.AutoSolver && Test.@test resolved isa HD.SphericalNUSHTSolver
             # The accuracy the route asks for: the NUFFT and least-squares tolerances of a NUFSHT fit;
             # FastSphericalHarmonics' quadrature is exact to round-off.
             ε = resolved isa HD.SphericalNUSHTSolver ? max(resolved.tol, resolved.rtol) : 1e-12
@@ -88,9 +88,31 @@ Test.@testset "split and potentials against closed forms" begin
     end
 end
 
+Test.@testset "the NUFSHT route on GPUBackend(KernelAbstractions.CPU()) equals the serial one" begin
+    # The plans built under the device backend and every buffer in their memory: a field with both parts
+    # decomposes as on the host, to the fits' tolerance.
+    nlat = 16
+    grid = latlon(nlat)
+    λ, φ = FG.Grids.coordinates(grid, 1), FG.Grids.coordinates(grid, 2)
+    _, G, _ = harmonic_fields(λ, φ, 2, 2, 1)
+    _, _, Rr = harmonic_fields(λ, φ, 4, 4, 0)
+    U = G .+ Rr
+    solver = HD.SphericalNUSHTSolver(; lmax = nlat - 1, tol = 1e-12, rtol = 1e-12)
+    ε = max(solver.tol, solver.rtol)
+    s = HD.helmholtz_decompose_spectral(U, grid; solver, execution = CB.SerialBackend())
+    d = HD.helmholtz_decompose_spectral(U, grid; solver, execution = CB.GPUBackend(KA.CPU()))
+    Test.@test s.χ_solve.converged && d.χ_solve.converged
+    Test.@test nrm(d.u_rot .- s.u_rot) / nrm(U) < 100ε
+    Test.@test nrm(d.u_div .- s.u_div) / nrm(U) < 100ε
+    Test.@test maximum(abs, d.χ .- s.χ) <= 1000ε * maximum(abs, s.χ)
+    Test.@test maximum(abs, HD.streamfunction(d) .- HD.streamfunction(s)) <= 1000ε * maximum(abs, HD.streamfunction(s))
+    Test.@test maximum(abs, d.divergence .- s.divergence) <= 1e4 * ε * maximum(abs, s.divergence)
+    Test.@test abs(d.residual_fraction - s.residual_fraction) < 100ε
+end
+
 Test.@testset "coverage of the sphere" begin
-    # A grid covers the sphere when its outermost latitudes lie within one and a half spacings of the
-    # poles: a dual grid's `Δ`, nudged either way by a rounding, does; a ±74.5° band does not.
+    # A grid covers the sphere when each pole lies within one and a half spacings of its two outermost
+    # latitudes: a dual grid's `Δ`, nudged either way by a rounding, does; a ±74.5° band does not.
     nlat = 16
     λ = FG.Axes.PeriodicAxis(0.0, 2π, 2nlat)
     Δ = π / nlat
@@ -103,6 +125,19 @@ Test.@testset "coverage of the sphere" begin
         Test.@test HD.supports_sampling(nu, HD.dual_grid(g, 1, 2, FG.Operators.face_metrics(g, FG.Operators.Neumann())))
     end
     Test.@test !HD.supports_sampling(nu, FG.Grids.StructuredGrid(SPH, λ, range(-1.3, 1.3; length = nlat)))
+
+    # On a stretched axis: cell centres 0.071 from each pole with outermost spacing 0.12, and their dual
+    # 0.131 from it with spacing 0.15, cover the sphere in either latitude order; rows 0.02 apart that
+    # stop 0.171 short of each pole, 8.5 of their spacings, do not.
+    λs = FG.Axes.PeriodicAxis(0.0, 2π, 22)
+    φc = [-1.50, -1.38, -1.20, -0.9, -0.5, 0.0, 0.5, 0.9, 1.20, 1.38, 1.50]
+    for φs in (φc, reverse(φc))
+        g = FG.Grids.StructuredGrid(SPH, λs, φs)
+        Test.@test HD.supports_sampling(nu, g)
+        Test.@test HD.supports_sampling(nu, HD.dual_grid(g, 1, 2, FG.Operators.face_metrics(g, FG.Operators.Neumann())))
+    end
+    φh = [-1.40, -1.38, -1.36, -1.0, -0.6, -0.2, 0.2, 0.6, 1.0, 1.36, 1.38, 1.40]
+    Test.@test !HD.supports_sampling(nu, FG.Grids.StructuredGrid(SPH, λs, φh))
 end
 
 Test.@testset "a threaded batch on a Clenshaw–Curtis sphere equals the serial one" begin
@@ -110,12 +145,12 @@ Test.@testset "a threaded batch on a Clenshaw–Curtis sphere equals the serial 
     # reaches from worker tasks; pinned to one thread there it returns what the root task returns.
     nlat = 12
     cc = sampled(FG.SphericalSampling.ClenshawCurtisSampling(), nlat)
-    plan = HD.plan_helmholtz(cc; backend = CB.SerialBackend())
+    plan = HD.plan_helmholtz(cc; execution = CB.SerialBackend())
     Test.@test plan.solver.spectral isa HD.SphericalSpectralSolver
     Random.seed!(31)
     fields = [randn(size(cc)..., 2) for _ in 1:4]
-    bser = HD.helmholtz_decompose_batch(plan, fields; backend = CB.SerialBackend())
-    bthr = HD.helmholtz_decompose_batch(plan, fields; backend = CB.ThreadedBackend())
+    bser = HD.helmholtz_decompose_batch(plan, fields; execution = CB.SerialBackend())
+    bthr = HD.helmholtz_decompose_batch(plan, fields; execution = CB.ThreadedBackend())
     Test.@test bser.χ == bthr.χ
     # The dual solves are preconditioned by NUFSHT, whose NUFFT is reproducible to round-off only.
     Test.@test maximum(abs, bser.u_rot .- bthr.u_rot) <= 1e-12 * maximum(abs, bser.u_rot)

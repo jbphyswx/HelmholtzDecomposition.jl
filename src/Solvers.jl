@@ -18,7 +18,7 @@ Supertype for Poisson solvers. Concrete subtypes implement
 abstract type AbstractPoissonSolver end
 
 """
-    solve_poisson!(Φ, RHS, grid, solver; boundary, coefficients, state, backend) -> SolverResult
+    solve_poisson!(Φ, RHS, grid, solver; boundary, coefficients, state, execution) -> SolverResult
 
 Solve `L Φ = RHS` in place, `L` the operator `coefficients` holds.
 
@@ -149,12 +149,27 @@ converged checks.
 function spectral_inverse! end
 
 """
-    supports_backend(solver, backend) -> Bool
+    supports_backend(solver, backend, grid) -> Bool
 
-Whether `solver`'s state can live where `backend` runs. [`AutoSolver`](@ref) passes over a solver that
-cannot.
+Whether `solver`'s state for a field on `grid` can live in the memory `backend` allocates, and its
+transforms run there. [`AutoSolver`](@ref) passes over a solver that cannot, and one named directly
+raises with [`_backend_message`](@ref).
 """
-supports_backend(::AbstractPoissonSolver, backend) = true
+supports_backend(::AbstractPoissonSolver, backend, grid) = true
+
+"""
+    _backend_message(solver, backend) -> String
+
+Why `solver` cannot run under `backend`. Solvers whose reason is not host-held state override it.
+"""
+_backend_message(solver::AbstractPoissonSolver, backend) =
+    "$(nameof(typeof(solver))) holds its state in host memory and cannot run under " *
+    "$(nameof(typeof(backend))). Plan it with a host `execution`, or solve with `CGSolver()`, whose " *
+    "loops run on any backend."
+
+@inline _require_backend(solver::AbstractPoissonSolver, backend, grid) =
+    supports_backend(solver, backend, grid) ? nothing :
+    throw(ArgumentError(_backend_message(solver, backend)))
 
 """
     library_loaded(solver) -> Bool
@@ -176,27 +191,16 @@ _unavailable_message(solver::AbstractPoissonSolver) =
     library_loaded(solver) ? nothing : throw(ArgumentError(_unavailable_message(solver)))
 
 """
-    prepare_solver(solver, grid, boundary) -> state
+    prepare_solver(solver, grid, boundary; execution = SerialBackend(), shared) -> state
 
-Whatever `solver` can compute once for a `(grid, boundary)` pair and reuse on every solve —
-returned opaquely and handed back to [`solve_poisson!`](@ref) as its `state` keyword.
-
-This exists because the transform plans are the dominant per-call cost and depend on nothing that
-changes between calls. A decomposition solves `P + 1` right-hand sides on one grid and a batch
-multiplies that by the number of fields, so a solver planning inside `solve_poisson!` rebuilds the
-same plan `(P + 1) · B` times: in 3-D that is 17 FFTW plans per field, and for the non-uniform
-transforms a plan *and* a node upload per conjugate-gradient iteration.
-
-`nothing` is the default and means "nothing to reuse", which is correct for the iterative solvers —
-their reusable part is the `FlowGeometries.Operators.LaplacianCoefficients`, which the plan already
-holds.
-
-`backend` is where the state's buffers are allocated. A solver that builds them with `zeros` hands
-a kernel host memory it cannot reach, and a parity test run on `KernelAbstractions.CPU()` cannot
-see the difference, since that backend's arrays are host arrays.
+What `solver` builds once for a `(grid, boundary)` pair and reuses on every solve, handed back to
+[`solve_poisson!`](@ref) as its `state`: transform plans and the buffers a solve writes, in the memory
+`execution` allocates and at its thread count, with the read-only part `shared` from
+[`prepare_shared`](@ref). `nothing` for a solver with nothing to reuse. A state holding a foreign plan
+is released with [`close!`](@ref).
 """
 prepare_solver(::AbstractPoissonSolver, grid, boundary;
-               backend = ComputationalBackends.SerialBackend(), shared = nothing) = nothing
+               execution = ComputationalBackends.SerialBackend(), shared = nothing) = nothing
 
 """
     prepare_shared(solver, grid, boundary; coefficients) -> shared state
@@ -245,14 +249,11 @@ function _require_domain(solver::AbstractPoissonSolver, grid)
     if requires_periodic_domain(solver)
         for d in 1:ndims(grid)
             FlowGeometries.Grids.isperiodic(grid, d) || throw(ArgumentError(
-                "$(nameof(typeof(solver))) inverts the Laplacian by dividing by its symbol in a " *
-                "complex-exponential basis, and that basis diagonalizes the *periodic* Laplacian. " *
-                "Direction $d of this grid is bounded, so the result would solve the periodic " *
-                "problem instead — smoothly, plausibly, and to machine precision, which is what " *
-                "makes it worth refusing. Nothing is wrong with transforming this data; only with " *
-                "the divide. Bounded domains are solved here by the iterative solver, and by a " *
-                "cosine (Neumann) or sine (Dirichlet) transform once those are in — those " *
-                "diagonalize the bounded Laplacian and are equally O(N log N)."))
+                "$(nameof(typeof(solver))) divides by the Laplacian's symbol in a complex-exponential " *
+                "basis, which diagonalizes the periodic Laplacian alone, and direction $d of this " *
+                "grid is bounded. `CartesianBoundedSolver()` (FFTW) and " *
+                "`CartesianRealTransformSolver()` (any FFT library) solve a bounded or channel grid " *
+                "by cosine and sine transforms, and `CGSolver()` any grid."))
         end
     end
     return nothing
@@ -276,7 +277,7 @@ struct AutoSolver <: AbstractPoissonSolver end
 function _applicable(solver::AbstractPoissonSolver, grid, boundary,
                      backend = ComputationalBackends.SerialBackend())
     library_loaded(solver) || return false
-    supports_backend(solver, backend) || return false
+    supports_backend(solver, backend, grid) || return false
     supports_boundary(solver, boundary) || return false
     requires_full_domain(solver) && !all(FlowGeometries.Grids.mask(grid)) && return false
     if requires_uniform_axes(solver)
@@ -290,34 +291,38 @@ function _applicable(solver::AbstractPoissonSolver, grid, boundary,
 end
 
 function _resolve_auto_solver(grid::FlowGeometries.Grids.AbstractGrid, boundary;
-                              backend = ComputationalBackends.SerialBackend())
+                              execution = ComputationalBackends.SerialBackend())
     for candidate in _auto_candidates(grid)
-        _applicable(candidate, grid, boundary, backend) && return candidate
+        _applicable(candidate, grid, boundary, execution) && return candidate
     end
+    # A device has a NUFFT library for its arrays or not, which shows when a plan is built, while
+    # multigrid runs on every device.
+    execution isa _HostBackend || return CGSolver()
     for candidate in _preconditioner_candidates(grid)
-        _applicable(candidate, grid, boundary, backend) && return CGSolver(; spectral = candidate)
+        _applicable(candidate, grid, boundary, execution) && return CGSolver(; spectral = candidate)
     end
     return CGSolver()
 end
 
 """
-    select_solver(solver, grid, boundary; backend = SerialBackend()) -> AbstractPoissonSolver
+    select_solver(solver, grid, boundary; execution = SerialBackend()) -> AbstractPoissonSolver
 
-The concrete solver for one staggered decomposition's Poisson problems on `grid`, resolved and
-validated once. Resolution reads the mask, so a caller with several right-hand sides on one grid calls
-this once and hands the result to each solve.
+The concrete solver for one staggered decomposition's Poisson problems on `grid` under `execution`,
+resolved and validated once. Resolution reads the mask, so a caller with several right-hand sides on one
+grid calls this once and hands the result to each solve.
 
 A solver that does not [`invert the discrete Laplacian`](@ref inverts_discrete_laplacian) and
 [`preconditions`](@ref) is returned as `CGSolver(; spectral = solver)`, so the solve is of `L`; one
-that does neither is refused.
+that does neither is refused, as is one whose state cannot live where `execution` runs.
 """
 function select_solver(solver::AbstractPoissonSolver, grid, boundary;
-                       backend = ComputationalBackends.SerialBackend())
-    concrete = solver isa AutoSolver ? _resolve_auto_solver(grid, boundary; backend = backend) :
+                       execution = ComputationalBackends.SerialBackend())
+    concrete = solver isa AutoSolver ? _resolve_auto_solver(grid, boundary; execution = execution) :
                solver
     _require_library(concrete)
     _require_boundary(concrete, boundary)
     _require_domain(concrete, grid)
+    _require_backend(concrete, execution, grid)
     inverts_discrete_laplacian(concrete) && return _require_spectral(concrete, grid, boundary)
     preconditions(concrete) && return CGSolver(; spectral = concrete)
     throw(ArgumentError(
@@ -392,7 +397,9 @@ CGSolver(; max_iter::Int = 1000, rtol::Union{Nothing,AbstractFloat} = nothing,
 # Cell by cell, so every condition on a bounded direction is honoured, and a mask with it.
 supports_boundary(::CGSolver, ::FlowGeometries.Operators.AbstractBoundaryCondition) = true
 inverts_discrete_laplacian(::CGSolver) = true
-supports_backend(s::CGSolver, backend) = s.spectral === nothing || supports_backend(s.spectral, backend)
+supports_backend(s::CGSolver, backend, grid) =
+    s.spectral === nothing || supports_backend(s.spectral, backend, grid)
+_backend_message(s::CGSolver, backend) = _backend_message(s.spectral, backend)
 
 function _require_spectral(s::CGSolver, grid, boundary)
     p = s.spectral
@@ -442,12 +449,11 @@ end
 
 function _precondition!(z, r, grid, c::FlowGeometries.Operators.LaplacianCoefficients{N,T},
                         pre::SpectralPreconditioner, ::Any;
-                        backend = ComputationalBackends.SerialBackend()) where {N,T}
+                        execution = ComputationalBackends.SerialBackend()) where {N,T}
     t, Mt, s = pre.residual, pre.correction, pre.scratch
-    lb = loop_backend(backend, length(z))
-    fill!(z, zero(T))
-    smooth!(z, r, pre.level, s, pre.ω, pre.ν; backend = backend)
-    FlowGeometries.Operators.apply_laplacian!(s, z, c; backend = lb)
+    lb = loop_backend(execution, length(z))
+    smooth_from_zero!(z, r, pre.level, s, pre.ω, pre.ν; execution = execution)
+    FlowGeometries.Operators.apply_laplacian!(s, z, c; execution = lb)
     @. t = r + s                                        # r − A z with A = −L
     meas = c.measure
     tsum = FlowGeometries.Execution.reduce_indices(+, zero(T), length(t), lb) do lin
@@ -458,15 +464,16 @@ function _precondition!(z, r, grid, c::FlowGeometries.Operators.LaplacianCoeffic
     spectral_inverse!(Mt, t, grid, pre.solver, pre.state)
     shift = iszero(pre.λ0) ? zero(T) : t̄ / pre.λ0
     @. z += shift - Mt
-    smooth!(z, r, pre.level, s, pre.ω, pre.ν; backend = backend)
+    smooth!(z, r, pre.level, s, pre.ω, pre.ν; execution = execution)
     return z
 end
 
-# `β` of the next search direction: Fletcher–Reeves under a fixed symmetric preconditioner, the
-# flexible form under a spectral one.
-@inline _cg_beta(::Any, z, Ap, pAp, rz_new, rz, grid, c; backend) = rz_new / rz
-@inline _cg_beta(::SpectralPreconditioner, z, Ap, pAp, rz_new, rz, grid, c; backend) =
-    -_dot_measure(z, Ap, grid, c; backend = backend) / pAp
+# `β` of the next search direction from `⟨r, z⟩` and `⟨z, A p⟩`: Fletcher–Reeves under a fixed symmetric
+# preconditioner, the flexible form under a spectral one, which alone needs `⟨z, A p⟩`.
+@inline _cg_beta(::Any, zAp, pAp, rz_new, rz) = rz_new / rz
+@inline _cg_beta(::SpectralPreconditioner, zAp, pAp, rz_new, rz) = -zAp / pAp
+@inline _flexible(::Any) = Val(false)
+@inline _flexible(::SpectralPreconditioner) = Val(true)
 
 """
     _dot_measure(a, b, grid, c) -> T
@@ -477,11 +484,11 @@ end
 product, the one conjugate gradients minimizes in.
 """
 function _dot_measure(a, b, grid, c::FlowGeometries.Operators.LaplacianCoefficients{N,T};
-                      backend = ComputationalBackends.SerialBackend()) where {N,T}
+                      execution = ComputationalBackends.SerialBackend()) where {N,T}
     # `measure` is zero on inactive cells, so no mask term is needed; each cell reads only its own
     # entries, so the index is linear.
     meas = c.measure
-    return FlowGeometries.Execution.reduce_indices(+, zero(T), length(a), backend) do lin
+    return FlowGeometries.Execution.reduce_indices(+, zero(T), length(a), execution) do lin
         @inbounds a[lin] * b[lin] * meas[lin]
     end
 end
@@ -526,22 +533,23 @@ function prepare_shared(solver::CGSolver, grid, boundary::FlowGeometries.Operato
 end
 
 function prepare_solver(solver::CGSolver, grid, boundary::FlowGeometries.Operators.AbstractBoundaryCondition;
-                        backend = ComputationalBackends.SerialBackend(), shared = nothing)
+                        execution = ComputationalBackends.SerialBackend(),
+                        shared = prepare_shared(solver, grid, boundary))
     T = eltype(grid)
     dims = size(grid)
-    ws = CGWorkspace(_zeros(backend, T, dims), _zeros(backend, T, dims),
-                     _zeros(backend, T, dims), _zeros(backend, T, dims))
-    sh = shared === nothing ? prepare_shared(solver, grid, boundary) : shared
+    ws = CGWorkspace(_zeros(execution, T, dims), _zeros(execution, T, dims),
+                     _zeros(execution, T, dims), _zeros(execution, T, dims))
     if solver.spectral !== nothing
-        λ0, c = sh
-        st = prepare_solver(solver.spectral, grid, boundary; backend = backend)
+        λ0, c = shared
+        st = prepare_solver(solver.spectral, grid, boundary; execution = execution)
         # The sweep weight and count of the multigrid smoother (see `multigrid`).
-        pre = SpectralPreconditioner(solver.spectral, st, _zeros(backend, T, dims), _zeros(backend, T, dims),
-                                     _zeros(backend, T, dims), c, T(λ0), T(0.8), 2)
+        pre = SpectralPreconditioner(solver.spectral, st, _zeros(execution, T, dims),
+                                     _zeros(execution, T, dims), _zeros(execution, T, dims), c, T(λ0),
+                                     T(0.8), 2)
         return CGState(ws, pre, nothing)
     end
-    bufs = sh === nothing ? nothing : multigrid_buffers(sh; backend = backend)
-    return CGState(ws, sh, bufs)
+    bufs = shared === nothing ? nothing : multigrid_buffers(shared; execution = execution)
+    return CGState(ws, shared, bufs)
 end
 
 function solve_poisson!(
@@ -550,7 +558,7 @@ function solve_poisson!(
     boundary::FlowGeometries.Operators.AbstractBoundaryCondition,
     coefficients::FlowGeometries.Operators.LaplacianCoefficients = _laplacian(grid, boundary),
     state::CGState = prepare_solver(solver, grid, boundary),
-    backend = ComputationalBackends.SerialBackend(),
+    execution = ComputationalBackends.SerialBackend(),
     kwargs...,
 ) where {G,T,N}
     _require_boundary(solver, boundary)
@@ -559,46 +567,134 @@ function solve_poisson!(
     r, p, Ap, z = ws.r, ws.p, ws.Ap, ws.z
     rtol = _rtol(solver, T)
     # The fine-grid loops; the preconditioner sizes each of its levels' loops itself.
-    lb = loop_backend(backend, length(Φ))
+    lb = loop_backend(execution, length(Φ))
+
+    pre = state.preconditioner
+    flex = _flexible(pre)
 
     # Solve A Φ = b with A = −L, which is the positive-definite orientation.
     fill!(Φ, zero(T))
     @. r = -RHS
-    FlowGeometries.Operators.project_out_constant!(r, c; backend = lb)
-    bnorm = sqrt(_dot_measure(r, r, grid, c; backend = lb))
+    FlowGeometries.Operators.project_out_constant!(r, c; execution = lb)
+    bnorm = sqrt(_dot_measure(r, r, grid, c; execution = lb))
     bnorm == 0 && return SolverResult{T}(true, 0, zero(T))
 
-    _precondition!(z, r, grid, c, state.preconditioner, state.mgbuffers; backend = backend)
-    copyto!(p, z)
-    rz = _dot_measure(r, z, grid, c; backend = lb)
+    _precondition!(z, r, grid, c, pre, state.mgbuffers; execution = execution)
+    rz, z̄, _ = _cg_dots!(r, z, Ap, zero(T), c, lb, Val(false))
+    _cg_direction!(p, z, z̄, zero(T), c, lb)
 
     rnorm = bnorm
     for iter in 1:solver.max_iter
-        FlowGeometries.Operators.apply_laplacian!(Ap, p, c; backend = lb)
-        @. Ap = -Ap
-        pAp = _dot_measure(p, Ap, grid, c; backend = lb)
+        FlowGeometries.Operators.apply_laplacian!(_negate, Ap, p, c; execution = lb)   # A p, A = −L
+        pAp = _dot_measure(p, Ap, grid, c; execution = lb)
         # A zero curvature means `p` lies in the null space, and no step reduces the residual.
         if iszero(pAp)
-            FlowGeometries.Operators.project_out_constant!(Φ, c; backend = lb)
+            FlowGeometries.Operators.project_out_constant!(Φ, c; execution = lb)
             return SolverResult{T}(rnorm <= rtol * bnorm, iter, rnorm / bnorm)
         end
         α = rz / pAp
-        @. Φ += α * p
-        @. r -= α * Ap
-        FlowGeometries.Operators.project_out_constant!(r, c; backend = lb)
-        rnorm = sqrt(_dot_measure(r, r, grid, c; backend = lb))
+        rr, r̄ = _cg_step!(Φ, r, p, Ap, α, c, lb)
+        rnorm = sqrt(rr)
         rnorm <= rtol * bnorm && begin
-            FlowGeometries.Operators.project_out_constant!(Φ, c; backend = lb)
+            FlowGeometries.Operators.project_out_constant!(Φ, c; execution = lb)
             return SolverResult{T}(true, iter, rnorm / bnorm)
         end
-        _precondition!(z, r, grid, c, state.preconditioner, state.mgbuffers; backend = backend)
-        rz_new = _dot_measure(r, z, grid, c; backend = lb)
-        β = _cg_beta(state.preconditioner, z, Ap, pAp, rz_new, rz, grid, c; backend = lb)
-        @. p = z + β * p
+        _precondition!(z, r, grid, c, pre, state.mgbuffers; execution = execution)
+        rz_new, z̄, zAp = _cg_dots!(r, z, Ap, r̄, c, lb, flex)
+        _cg_direction!(p, z, z̄, _cg_beta(pre, zAp, pAp, rz_new, rz), c, lb)
         rz = rz_new
     end
-    FlowGeometries.Operators.project_out_constant!(Φ, c; backend = lb)
+    FlowGeometries.Operators.project_out_constant!(Φ, c; execution = lb)
     return SolverResult{T}(false, solver.max_iter, rnorm / bnorm)
+end
+
+@inline _negate(_I, L) = -L
+@inline _tadd(a::Tuple, b::Tuple) = map(+, a, b)
+
+# Whether `L`'s null space is one closed component holding every active cell. Its projection is then a
+# mean, which the passes below fold into the updates; several components are projected on their own.
+@inline _one_component(c) = c.singular && c.nullspace.full
+
+# `Φ += α p` and `r −= α A p` in one pass, returning `‖r − r̄‖²` and `r̄`, the mean of `r` on the closed
+# component. Under one component `r` keeps `r̄`, which `_cg_dots!` subtracts on its next pass, and
+# `‖r − r̄‖² = ⟨r, r⟩ − r̄ ⟨r, 1⟩`; under several `r` is projected here.
+function _cg_step!(Φ, r, p, Ap, α::T, c::FlowGeometries.Operators.LaplacianCoefficients, lb) where {T}
+    meas = c.measure
+    if _one_component(c)
+        rr, rs = FlowGeometries.Execution.reduce_indices(_tadd, (zero(T), zero(T)), length(r), lb) do i
+            @inbounds begin
+                Φ[i] += α * p[i]
+                ri = r[i] - α * Ap[i]
+                r[i] = ri
+                rm = ri * meas[i]
+                return (ri * rm, rm)
+            end
+        end
+        r̄ = rs / c.total
+        return max(rr - r̄ * rs, zero(T)), r̄
+    end
+    rr = FlowGeometries.Execution.reduce_indices(+, zero(T), length(r), lb) do i
+        @inbounds begin
+            Φ[i] += α * p[i]
+            ri = r[i] - α * Ap[i]
+            r[i] = ri
+            return ri * ri * meas[i]
+        end
+    end
+    c.singular || return rr, zero(T)
+    FlowGeometries.Operators.project_out_constant!(r, c; execution = lb)
+    return _dot_measure(r, r, nothing, c; execution = lb), zero(T)
+end
+
+# `⟨r, z − z̄⟩`, `z̄` and, for the flexible step, `⟨z − z̄, A p⟩`, with `z̄` the mean of the preconditioned
+# residual on a single closed component (`_cg_direction!` subtracts it). The same pass subtracts `r̄`
+# from `r`. Under several components `z` is projected here.
+function _cg_dots!(r, z, Ap, r̄::T, c::FlowGeometries.Operators.LaplacianCoefficients, lb,
+                   ::Val{F}) where {T,F}
+    meas = c.measure
+    if _one_component(c)
+        rz, zs, rs, zA, As = FlowGeometries.Execution.reduce_indices(_tadd, ntuple(_ -> zero(T), Val(5)),
+                                                                     length(r), lb) do i
+            @inbounds begin
+                m = meas[i]
+                ri = iszero(m) ? r[i] : r[i] - r̄
+                r[i] = ri
+                zm = z[i] * m
+                a = F ? Ap[i] : zero(T)
+                return (ri * zm, zm, ri * m, zm * a, a * m)
+            end
+        end
+        z̄ = zs / c.total
+        return rz - z̄ * rs, z̄, zA - z̄ * As
+    end
+    c.singular && FlowGeometries.Operators.project_out_constant!(z, c; execution = lb)
+    rz, zA = FlowGeometries.Execution.reduce_indices(_tadd, (zero(T), zero(T)), length(r), lb) do i
+        @inbounds begin
+            zm = z[i] * meas[i]
+            return (r[i] * zm, F ? zm * Ap[i] : zero(T))
+        end
+    end
+    return rz, zero(T), zA
+end
+
+# `p = (z − z̄) + β p` on the active cells; `β = 0` starts a direction and does not read `p`.
+function _cg_direction!(p, z, z̄::T, β::T, c::FlowGeometries.Operators.LaplacianCoefficients, lb) where {T}
+    meas = c.measure
+    if iszero(z̄)
+        FlowGeometries.Execution.run_indices(length(p), lb) do i
+            @inbounds p[i] = iszero(β) ? z[i] : z[i] + β * p[i]
+            return nothing
+        end
+    else
+        FlowGeometries.Execution.run_indices(length(p), lb) do i
+            @inbounds begin
+                zi = iszero(meas[i]) ? z[i] : z[i] - z̄
+                p[i] = iszero(β) ? zi : zi + β * p[i]
+            end
+            return nothing
+        end
+    end
+    return p
 end
 
 """
@@ -611,14 +707,14 @@ there is (`Multigrid.jl` adds that method, alongside the type).
 [`prepare_shared`](@ref).
 """
 _precondition!(z, r, grid, c, ::Nothing, ::Any;
-               backend = ComputationalBackends.SerialBackend()) =
-    _jacobi_precondition!(z, r, grid, c; backend = backend)
+               execution = ComputationalBackends.SerialBackend()) =
+    _jacobi_precondition!(z, r, grid, c; execution = execution)
 
 function _jacobi_precondition!(z, r, grid, c::FlowGeometries.Operators.LaplacianCoefficients{N,T};
-                               backend = ComputationalBackends.SerialBackend()) where {N,T}
+                               execution = ComputationalBackends.SerialBackend()) where {N,T}
     d = c.diag
     # Linear, as in `smooth!`: a cell reads only its own diagonal entry.
-    FlowGeometries.Execution.run_indices(length(z), backend) do lin
+    FlowGeometries.Execution.run_indices(length(z), execution) do lin
         @inbounds begin
             dI = d[lin]
             z[lin] = iszero(dI) ? zero(T) : r[lin] / -dI

@@ -1,16 +1,13 @@
-"""
-    SpectralSolvers.jl — the transform solvers and the order `AutoSolver` tries them in.
-
-Each solver type is declared here and implemented by the extension of the library it transforms
-with, which adds its `prepare_solver`, `solve_poisson!`, `_decompose_spectral` and capability
-methods. A solver whose library is not loaded reports so through [`library_loaded`](@ref).
-"""
+# The transform solvers and the order `AutoSolver` tries them in. Each solver type is declared here and
+# implemented by the extension of the library it transforms with, which adds its `prepare_solver`,
+# `solve_poisson!`, `_decompose_spectral` and capability methods.
 
 """
     CartesianSpectralSolver()
 
-Spectral Poisson solver for uniform periodic Cartesian grids in any dimension, through the real
-FFT (`using FFTW`): forward `rfft`, divide by the discrete Laplacian's symbol, inverse `irfft`.
+Spectral Poisson solver for uniform periodic Cartesian grids in any dimension, through the real FFT of
+the `AbstractFFTs` interface (`using FFTW` on the host, CUDA's CUFFT for a `CuArray`): forward `rfft`,
+divide by the discrete Laplacian's symbol, inverse `irfft`.
 """
 struct CartesianSpectralSolver <: AbstractPoissonSolver end
 
@@ -57,9 +54,11 @@ struct SphericalSpectralSolver <: AbstractPoissonSolver end
                          nufft = SpectralBackends.AutoSpectralBackend())
 
 Spectral Poisson solver for an arbitrary spherical node set covering `S²` (`using NUFSHT`).
-`rtol`/`maxiter` govern the least squares inside the exact inverse transform, `tol` is the NUFFT
-accuracy, and `nufft` the NUFFT library NUFSHT runs: a FlowTransformBindings tag, or
-`AutoSpectralBackend()` for NUFSHT's own choice.
+`rtol`/`maxiter` govern the least squares inside the exact inverse transform, which weights each node
+by its cell's measure; `tol` is the NUFFT accuracy, and `nufft` the NUFFT library NUFSHT runs: a
+FlowTransformBindings tag, or `AutoSpectralBackend()` for NUFSHT's own choice. NUFSHT's plans are built
+under the execution backend of the call, a `GPUBackend`'s device included, given a NUFFT library for
+that device's arrays.
 
 `lmax = nothing` sizes the expansion from the grid. The fit recovers `(lmax+1)²` coefficients from
 `M` nodes, so a degree chosen without reference to `M` truncates a fine grid and outruns a coarse
@@ -87,18 +86,17 @@ SphericalNUSHTSolver(; lmax::Union{Nothing,Int} = nothing, tol::AbstractFloat = 
                      nufft::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend()) =
     SphericalNUSHTSolver(lmax, promote(tol, rtol)..., maxiter, nufft)
 
-library_loaded(::Union{CartesianSpectralSolver,CartesianBoundedSolver}) =
-    _extension_loaded(:HelmholtzDecompositionFFTWExt)
-library_loaded(::CartesianRealTransformSolver) =
+library_loaded(::CartesianBoundedSolver) = _extension_loaded(:HelmholtzDecompositionFFTWExt)
+library_loaded(::Union{CartesianSpectralSolver,CartesianRealTransformSolver}) =
     _extension_loaded(:HelmholtzDecompositionAbstractFFTsExt)
 library_loaded(::SphericalSpectralSolver) = _extension_loaded(:HelmholtzDecompositionFSHExt)
 library_loaded(::SphericalNUSHTSolver) = _extension_loaded(:HelmholtzDecompositionNUFSHTExt)
 
-_unavailable_message(s::Union{CartesianSpectralSolver,CartesianBoundedSolver}) =
-    "$(nameof(typeof(s))) transforms with FFTW; run `using FFTW`."
-_unavailable_message(::CartesianRealTransformSolver) =
-    "CartesianRealTransformSolver transforms through AbstractFFTs; run `using AbstractFFTs` and " *
-    "load an FFT backend for the array (`using FFTW` on the host)."
+_unavailable_message(::CartesianBoundedSolver) =
+    "CartesianBoundedSolver transforms with FFTW; run `using FFTW`."
+_unavailable_message(s::Union{CartesianSpectralSolver,CartesianRealTransformSolver}) =
+    "$(nameof(typeof(s))) transforms through AbstractFFTs; load an FFT library for the array " *
+    "(`using FFTW` on the host, CUDA for a `CuArray`)."
 _unavailable_message(::SphericalSpectralSolver) =
     "SphericalSpectralSolver transforms with FastSphericalHarmonics; run " *
     "`using FastSphericalHarmonics`."
@@ -122,15 +120,16 @@ has_spectral_route(::Union{CartesianSpectralSolver,CartesianNUFFTSolver,Spherica
 
 const _SphericalTransform = Union{SphericalSpectralSolver,SphericalNUSHTSolver}
 preconditions(::_SphericalTransform) = true
-# Both hold their transform state in host memory.
-supports_backend(::_SphericalTransform, backend) = backend isa _HostBackend
-supports_backend(::CartesianBoundedSolver, backend) = backend isa _HostBackend
+# FastSphericalHarmonics and FFTW's real-to-real transforms hold their state in host memory.
+supports_backend(::Union{SphericalSpectralSolver,CartesianBoundedSolver}, backend, grid) =
+    backend isa _HostBackend
 
 """
     _preconditioner_candidates(grid) -> Tuple
 
 The transforms [`AutoSolver`](@ref) tries as the preconditioner of [`CGSolver`](@ref) when no solver of
-[`_auto_candidates`](@ref) applies: on a spherical grid FastSphericalHarmonics, then NUFSHT.
+[`_auto_candidates`](@ref) applies: on a spherical grid FastSphericalHarmonics, then NUFSHT. It tries
+them on a host backend; on a device one a transform preconditions when named.
 """
 _preconditioner_candidates(::_SphericalGrid) = (SphericalSpectralSolver(), SphericalNUSHTSolver())
 _preconditioner_candidates(::FlowGeometries.Grids.AbstractGrid) = ()
@@ -141,7 +140,8 @@ _preconditioner_candidates(::FlowGeometries.Grids.AbstractGrid) = ()
 The transform solvers [`AutoSolver`](@ref) tries for the staggered decomposition on `grid`, in
 order: on a Cartesian grid the periodic FFT, FFTW's bounded transform, then the bounded transform
 through any `AbstractFFTs` backend. Each inverts the discrete `L`. The first whose library is loaded
-and whose requirements the grid meets is taken, and the iterative [`CGSolver`](@ref) otherwise.
+and whose requirements the grid and the execution backend meet is taken, and the iterative
+[`CGSolver`](@ref) otherwise.
 """
 _auto_candidates(::_CartesianGrid) =
     (CartesianSpectralSolver(), CartesianBoundedSolver(), CartesianRealTransformSolver())

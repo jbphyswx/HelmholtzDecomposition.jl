@@ -61,13 +61,13 @@ function resolve_execution_backend(b::ComputationalBackends.AbstractGPUBackend)
         throw(ArgumentError(
             "$(typeof(b)) needs FlowGeometries' KernelAbstractions extension, which is not " *
             "loaded. Run `using KernelAbstractions` first (plus the vendor package owning the " *
-            "device), or pass `backend = ComputationalBackends.SerialBackend()`."))
+            "device), or pass `execution = ComputationalBackends.SerialBackend()`."))
     return b
 end
 
 resolve_execution_backend(b::ComputationalBackends.AbstractExecutionBackend) = throw(ArgumentError(
     "$(typeof(b)) parallelises over fields, not over the index space within one field. Pass it " *
-    "to `helmholtz_decompose_batch` instead; `plan_helmholtz`'s `backend` selects how the loops " *
+    "to `helmholtz_decompose_batch` instead; `plan_helmholtz`'s `execution` selects how the loops " *
     "inside a single decomposition run."))
 
 # The backends whose loops run on the host, over host memory.

@@ -17,8 +17,8 @@ src/
 reference_flows/
   reference_flows.jl          # analytic fields with known decompositions; NOT part of the library
 ext/
-  HelmholtzDecompositionAbstractFFTsExt.jl        # bounded + channel + periodic, any FFT backend
-  HelmholtzDecompositionFFTWExt.jl                # r2r fast path on the host
+  HelmholtzDecompositionAbstractFFTsExt.jl        # periodic FFT, bounded and channel transforms, any FFT library
+  HelmholtzDecompositionFFTWExt.jl                # FFTW's r2r transforms and plan thread count, on the host
   HelmholtzDecompositionFSHExt.jl                 # Clenshaw–Curtis sphere
   HelmholtzDecompositionNUFSHTExt.jl              # arbitrary covering sphere
   HelmholtzDecompositionAdaptExt.jl               # how a plan's structs move to a device
@@ -67,18 +67,24 @@ are then the same statement, and no stencil reaches across a hole.
 | `HelmholtzResult` / `HelmholtzBatch` | outputs; the batch stores `(dims…, N, B)` contiguously | per field / per batch |
 
 Solver state holds buffers a solve writes through — the conjugate-gradient vectors, the multigrid
-level arrays, the transform scratch — so it lives in the workspace, one per task.
+level arrays, the transform scratch — so it lives in the workspace, one per task. `close!(ws)` releases
+the foreign plans a workspace holds, NUFSHT's under a spherical preconditioner; every entry that builds
+a workspace of its own releases it before returning.
 
 ## Two orthogonal backend axes
 
 - **Which transform** — `AbstractPoissonSolver`. `AutoSolver` chooses on capability: geometry,
-  node layout, mask, axis uniformity, boundary condition, and which libraries are loaded. A solver
-  named directly that cannot solve the problem raises, because a solver that silently solves a
-  *different* boundary value problem returns a smooth, plausible, wrong field.
+  node layout, mask, axis uniformity, boundary condition, the execution backend, and which libraries
+  are loaded. A solver named directly that cannot solve the problem on that backend raises: a solver
+  that solves a different boundary value problem returns a smooth, plausible, wrong field.
 - **Where it runs** — `ComputationalBackends.AbstractExecutionBackend`, passed to
-  `plan_helmholtz`. Every hot loop is written once against `FlowGeometries.Execution.run_indices`,
+  `plan_helmholtz` as `execution`. Every hot loop is written once against `FlowGeometries.Execution.run_indices`,
   which resolves to a serial loop, threaded chunks, or a KernelAbstractions launch with no
-  branching here.
+  branching here. On a device backend the solver state lives on the device: `AutoSolver` takes the
+  Cartesian FFT solvers where an FFT library takes the device's arrays and multigrid-preconditioned
+  conjugate gradients otherwise, and NUFSHT's plans are built on the device when it is named or is the
+  spectral route of a covering sphere. FastSphericalHarmonics, FFTW's real-to-real transforms and the
+  scattered fit hold host state.
 
 ## Solver selection
 
@@ -103,9 +109,9 @@ written down once, so load order decides nothing.
 AbstractPoissonSolver
 ├── AutoSolver
 ├── CGSolver{R,S}                     # multigrid or spectral (S) preconditioning; R the tolerance type
-├── CartesianSpectralSolver           (FFTW)            periodic rfft
-├── CartesianBoundedSolver            (FFTW)            r2r, per-direction kind
-├── CartesianRealTransformSolver      (AbstractFFTs)    bounded/channel/periodic, any backend
+├── CartesianSpectralSolver           (AbstractFFTs)    periodic rfft, any FFT library
+├── CartesianBoundedSolver            (FFTW)            r2r, per-direction kind, host
+├── CartesianRealTransformSolver      (AbstractFFTs)    bounded/channel/periodic, any FFT library
 ├── CartesianNUFFTSolver{L,D,T}       (NonuniformFFTs or FINUFFT, through FlowTransformBindings)
 ├── SphericalSpectralSolver           (FastSphericalHarmonics)
 └── SphericalNUSHTSolver{T}           (NUFSHT)

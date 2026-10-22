@@ -66,12 +66,12 @@ Test.@testset "device parity with the serial host path" begin
         N = length(dims)
         grid = FG.Grids.StructuredGrid(CART, ntuple(d -> range(0.0, 1.0; length = dims[d]), N)...)
         fields = [randn(dims..., N) for _ in 1:2]
-        hplan = HD.plan_helmholtz(grid; solver, backend = CB.SerialBackend())
-        href = HD.helmholtz_decompose_batch(hplan, fields; backend = CB.SerialBackend())
-        for (bname, backend, move) in (("JLArrays", CB.GPUBackend(JLArrays.JLBackend()), JLArrays.JLArray),
-                                       ("KA.CPU", CB.GPUBackend(KA.CPU()), identity))
+        hplan = HD.plan_helmholtz(grid; solver, execution = CB.SerialBackend())
+        href = HD.helmholtz_decompose_batch(hplan, fields; execution = CB.SerialBackend())
+        for (bname, execution, move) in (("JLArrays", CB.GPUBackend(JLArrays.JLBackend()), JLArrays.JLArray),
+                                         ("KA.CPU", CB.GPUBackend(KA.CPU()), identity))
             Test.@testset "$N-D $sname on $bname" begin
-                plan = HD.plan_helmholtz(grid; solver, backend)
+                plan = HD.plan_helmholtz(grid; solver, execution)
                 if bname == "JLArrays"
                     for obj in (plan, HD.allocate_workspace(plan), HD.allocate_result(plan))
                         hits = DeviceWalk.host_arrays(obj)
@@ -79,21 +79,47 @@ Test.@testset "device parity with the serial host path" begin
                         Test.@test isempty(hits)
                     end
                 end
-                b = HD.helmholtz_decompose_batch(plan, map(move, fields); backend = CB.SerialBackend())
-                Test.@test b.harmonic_fraction isa Vector{Float64} && b.residual_fraction isa Vector{Float64}
-                Test.@test Array(b.χ) ≈ href.χ
-                Test.@test Array(b.u_rot) ≈ href.u_rot
-                Test.@test Array(b.u_div) ≈ href.u_div
-                Test.@test b.harmonic_fraction ≈ href.harmonic_fraction atol = 1e-12
-                Test.@test b.residual_fraction ≈ href.residual_fraction
+                # The batch axis serial, or on the plan's device.
+                for batch_execution in (CB.SerialBackend(), execution)
+                    b = HD.helmholtz_decompose_batch(plan, map(move, fields); execution = batch_execution)
+                    Test.@test b.harmonic_fraction isa Vector{Float64} && b.residual_fraction isa Vector{Float64}
+                    Test.@test Array(b.χ) ≈ href.χ
+                    Test.@test Array(b.u_rot) ≈ href.u_rot
+                    Test.@test Array(b.u_div) ≈ href.u_div
+                    Test.@test b.harmonic_fraction ≈ href.harmonic_fraction atol = 1e-12
+                    Test.@test b.residual_fraction ≈ href.residual_fraction
+                end
             end
         end
     end
 end
 
+Test.@testset "AutoSolver on a periodic grid, on each device backend" begin
+    # Whatever solver each backend's arrays take, the decomposition is the serial host one, which the FFT
+    # solves exactly, to conjugate gradients' accuracy: `κ(L) · 100eps`, `κ(L) ≈ 30` on this grid.
+    n = 12
+    ax = FG.Axes.PeriodicAxis(0.0, 1.0, n)
+    grid = FG.Grids.StructuredGrid(CART, ax, ax)
+    Random.seed!(23)
+    fields = [randn(n, n, 2) for _ in 1:2]
+    href = HD.helmholtz_decompose_batch(HD.plan_helmholtz(grid; execution = CB.SerialBackend()), fields;
+                                        execution = CB.SerialBackend())
+    for (bname, execution, move) in (("JLArrays", CB.GPUBackend(JLArrays.JLBackend()), JLArrays.JLArray),
+                                     ("KA.CPU", CB.GPUBackend(KA.CPU()), identity))
+        Test.@testset "$bname" begin
+            plan = HD.plan_helmholtz(grid; execution)
+            b = HD.helmholtz_decompose_batch(plan, map(move, fields); execution)
+            Test.@test isapprox(Array(b.χ), href.χ; rtol = 1e-10)
+            Test.@test isapprox(Array(b.u_rot), href.u_rot; rtol = 1e-10)
+            Test.@test isapprox(Array(b.u_div), href.u_div; rtol = 1e-10)
+            Test.@test b.harmonic_fraction ≈ href.harmonic_fraction atol = 1e-10
+        end
+    end
+end
+
 Test.@testset "the periodic spectral result is assembled on the device" begin
-    # Every step after the forward transform runs on JLArrays; the transforms are the host FFT wrapped,
-    # since JLArrays has none.
+    # Every step after the forward transform runs on JLArrays; the inverse transforms are the host FFT
+    # wrapped, since JLArrays has none.
     n = 12
     xr = range(0.0, 1.0 - 1 / n; length = n)
     grid = FG.Grids.StructuredGrid(CART, xr, xr; topology = (true, true), period = (1.0, 1.0))
@@ -101,9 +127,11 @@ Test.@testset "the periodic spectral result is assembled on the device" begin
     U = randn(n, n, 2)
     ks = FTB.wavenumber_axes((1.0, 1.0), (n, n), Val(true))
     V̂ = cat(FFTW.rfft(U[:, :, 1]), FFTW.rfft(U[:, :, 2]); dims = 3)
-    href = HD.build_cartesian_result(grid, U, V̂, ks, x -> FFTW.irfft(x, n))
-    dres = HD.build_cartesian_result(grid, JLArrays.JLArray(U), JLArrays.JLArray(V̂), ks,
-                                     x -> JLArrays.JLArray(FFTW.irfft(Array(x), n)))
+    assemble(U, V̂, invert!) = HD._cartesian_result(grid, U, V̂, HD._derivative_symbol(V̂, Float64, ks),
+                                                    similar(V̂, size(V̂)[1:2]), similar(V̂, size(V̂)[1:2]), invert!)
+    href = assemble(U, V̂, (out, x) -> copyto!(out, FFTW.irfft(x, n)))
+    dres = assemble(JLArrays.JLArray(U), JLArrays.JLArray(V̂),
+                    (out, x) -> copyto!(out, JLArrays.JLArray(FFTW.irfft(Array(x), n))))
     Test.@test dres.u_rot isa JLArrays.JLArray
     Test.@test Array(dres.u_rot) ≈ href.u_rot
     Test.@test Array(dres.u_div) ≈ href.u_div

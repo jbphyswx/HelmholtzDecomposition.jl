@@ -10,7 +10,6 @@ these carry the spectral path's own intermediate form.
 ```@docs
 HelmholtzDecomposition.AbstractSpectralHelmholtzResult
 HelmholtzDecomposition.SpectralCartesianResult
-HelmholtzDecomposition.build_cartesian_result
 ```
 
 ## Solver plumbing
@@ -23,6 +22,7 @@ HelmholtzDecomposition._precondition!
 HelmholtzDecomposition._require_domain
 HelmholtzDecomposition._require_sampling
 HelmholtzDecomposition._unavailable_message
+HelmholtzDecomposition._backend_message
 HelmholtzDecomposition._auto_candidates
 HelmholtzDecomposition._preconditioner_candidates
 HelmholtzDecomposition._spectral_candidates
@@ -35,7 +35,6 @@ HelmholtzDecomposition._spectral_dispatch
 HelmholtzDecomposition._dot_measure
 HelmholtzDecomposition.lazy_axis_sum
 HelmholtzDecomposition._sampling_message
-HelmholtzDecomposition._WORKSPACE_LOCK
 ```
 
 ## Conditioning of the scattered fit
@@ -63,7 +62,6 @@ HelmholtzDecomposition._measure_ratio
 HelmholtzDecomposition._nufft_library
 HelmholtzDecomposition._auto_nufft_solver
 HelmholtzDecomposition.ScatteredState
-HelmholtzDecomposition.close!
 HelmholtzDecomposition.CGBuffers
 HelmholtzDecomposition.inverse_nufft!
 HelmholtzDecomposition._coldot

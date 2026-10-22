@@ -65,14 +65,19 @@ more than one field on a grid, build them once — the steady-state call then al
 
 ```julia
 using ComputationalBackends: ComputationalBackends as CB
-plan = HD.plan_helmholtz(grid; boundary = FG.Operators.Neumann(), backend = CB.SerialBackend())
+plan = HD.plan_helmholtz(grid; boundary = FG.Operators.Neumann(), execution = CB.SerialBackend())
 ws   = HD.allocate_workspace(plan)
 res  = HD.allocate_result(plan)
 
 for u in fields
     HD.helmholtz_decompose!(res, u, plan, ws)    # allocation-free on a serial backend
 end
+HD.close!(ws)
 ```
+
+`close!` releases the foreign transform plans a workspace holds, NUFSHT's under a spherical
+preconditioner; `helmholtz_decompose`, `helmholtz_decompose!` without a workspace, and the batches
+release the ones they build.
 
 ## Batches
 
@@ -83,7 +88,7 @@ result of views onto slice `b`.
 using OhMyThreads: OhMyThreads            # enables ThreadedBackend
 using ComputationalBackends: ComputationalBackends as CB
 
-batch = HD.helmholtz_decompose_batch(plan, fields; backend = CB.ThreadedBackend())
+batch = HD.helmholtz_decompose_batch(plan, fields; execution = CB.ThreadedBackend())
 size(batch.u_rot)        # (dims..., N, length(fields))
 batch[3].harmonic_fraction
 ```

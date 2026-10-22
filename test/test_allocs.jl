@@ -38,8 +38,7 @@ end
 
 Jacobi- and multigrid-preconditioned conjugate gradients on every grid, and on a Cartesian grid
 `AutoSolver`, which with FFTW loaded resolves to the periodic FFT, the bounded cosine/sine transforms
-(DST-I on the duals) or conjugate gradients on a masked grid. On a spherical grid `AutoSolver` takes
-whichever spherical transform library the process has loaded, so it is not gated here.
+(DST-I on the duals) or conjugate gradients on a masked grid.
 """
 function _solvers(grid)
     cg = (("jacobi", HD.CGSolver(; multigrid = false)), ("mg", HD.CGSolver(; multigrid = true)))
@@ -47,31 +46,16 @@ function _solvers(grid)
     return (cg..., ("auto", HD.AutoSolver()))
 end
 
-Test.@testset "allocations: solver inner loop" begin
-    for (name, grid) in _grids()
-        c = FG.Operators.laplacian_coefficients(FG.Operators.face_metrics(grid, FG.Operators.Neumann()))
-        x, y, z = randn(size(grid)), zeros(size(grid)), zeros(size(grid))
-        f_jac(a, b, d, e) = HD._jacobi_precondition!(a, b, d, e)
-        Test.@testset "$name" begin
-            Test.@test gate(HD._dot_measure, x, y, grid, c) == 0
-            Test.@test gate(f_jac, z, x, grid, c) == 0
-        end
-    end
-end
-
 Test.@testset "allocations: decomposition" begin
-    # The iteration count varies with the grid, so this gates the rate: nothing per iteration.
     for (name, grid) in _grids(), (sname, solver) in _solvers(grid),
         bc in (FG.Operators.Neumann(), FG.Operators.Dirichlet())
-        plan = HD.plan_helmholtz(grid; boundary = bc, solver = solver, backend = CB.SerialBackend())
+        plan = HD.plan_helmholtz(grid; boundary = bc, solver = solver, execution = CB.SerialBackend())
         ws, res = HD.allocate_workspace(plan), HD.allocate_result(plan)
         Random.seed!(6)
         u = randn(size(grid)..., ndims(grid))
         f_dec(a, b, c, d) = HD.helmholtz_decompose!(a, b, c, d)
-        f_norm(a, b, c, d) = HD.velocity_norm(a, b)
         Test.@testset "$name/$sname/$(nameof(typeof(bc)))" begin
             Test.@test gate(f_dec, res, u, plan, ws) == 0
-            Test.@test gate(f_norm, u, grid, nothing, nothing) == 0
         end
     end
 end

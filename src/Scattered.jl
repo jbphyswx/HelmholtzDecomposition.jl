@@ -87,9 +87,11 @@ end
 const _CartesianCloud{T,D} =
     FlowGeometries.Grids.UnstructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,D}
 
-# A NUFFT expands in the same periodic basis an FFT does, over every sample it is handed.
+# A NUFFT expands in the same periodic basis an FFT does, over every sample it is handed. The fit's
+# working set is host memory.
 supports_boundary(::CartesianNUFFTSolver, ::FlowGeometries.Operators.AbstractBoundaryCondition) = true
 requires_full_domain(::CartesianNUFFTSolver) = true
+supports_backend(::CartesianNUFFTSolver, backend, grid) = backend isa _HostBackend
 
 # The solver expands a point cloud, and its methods take an `UnstructuredGrid` at a matching
 # dimension. A rectilinear grid reaches it only through selection, which then has no
@@ -402,7 +404,8 @@ and point-space buffers of one fit, the conjugate-gradient working set, the wave
 inner-product weights of the mode space.
 
 None of it depends on the field, so a caller decomposing a time series over one point set builds
-it once. It owns the library plan, which [`close!`](@ref) releases.
+it once with [`prepare_solver`](@ref), passes it as `helmholtz_decompose_spectral`'s `state`, and
+releases its library plan with [`close!`](@ref).
 
 **One per task.** Every buffer here is written through during a solve, so concurrent
 decompositions need one each.
@@ -436,11 +439,11 @@ _inner_weights(::_RealComponents, plan, ::Type{T}) where {T} =
 
 function prepare_solver(solver::CartesianNUFFTSolver{L,D}, grid::_CartesianCloud{T,D},
                         ::FlowGeometries.Operators.AbstractBoundaryCondition;
-                        backend = ComputationalBackends.SerialBackend(),
+                        execution = ComputationalBackends.SerialBackend(),
                         shared = nothing) where {L,D,T}
     lib = _nufft_library(solver.nufft)
     lib === nothing && throw(ArgumentError(_unavailable_message(solver)))
-    return _scattered_state(_packing(lib), lib, solver, grid, T, Val(D), backend)
+    return _scattered_state(_packing(lib), lib, solver, grid, T, Val(D), execution)
 end
 
 function _scattered_state(packing, lib, solver::CartesianNUFFTSolver, grid, ::Type{T}, ::Val{D},
@@ -473,16 +476,11 @@ end
 
 function _decompose_spectral(solver::CartesianNUFFTSolver{L,D},
                              ::FlowGeometries.Geometry.AbstractCartesianGeometry,
-                             U::AbstractMatrix{T}, grid::_CartesianCloud{T,D};
-                             state::Union{Nothing,ScatteredState} = nothing,
-                             backend = ComputationalBackends.AutoBackend(),
-                             kwargs...) where {L,D,T}
-    # A state the caller supplies is reused; one built here is closed on the way out, so a one-shot
-    # call frees its plan and a repeated one keeps it.
+                             U::AbstractMatrix{T}, grid::_CartesianCloud{T,D}, execution,
+                             state::Union{Nothing,ScatteredState}) where {L,D,T}
+    # A state the caller supplies is reused and stays open; one built here is released on return.
     owned = state === nothing
-    st = owned ?
-         prepare_solver(solver, grid, FlowGeometries.Operators.Neumann();
-                        backend = resolve_execution_backend(backend)) :
+    st = owned ? prepare_solver(solver, grid, FlowGeometries.Operators.Neumann(); execution = execution) :
          state
     try
         return _decompose_scattered(solver, U, st, grid)

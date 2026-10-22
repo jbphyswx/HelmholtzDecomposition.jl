@@ -81,17 +81,16 @@ end
 # backend the plan runs on. Execution needs no lock when each task owns its plans; two tasks executing
 # one plan corrupt each other through its scratch, so the cache lives on the per-task state.
 
-function HD.prepare_solver(::HD.SphericalSpectralSolver,
+HD._backend_message(::HD.SphericalSpectralSolver, backend) =
+    "SphericalSpectralSolver runs on the host: FastSphericalHarmonics wraps FastTransforms, which has " *
+    "no device implementation, and cannot run under $(nameof(typeof(backend))). Plan this grid with a " *
+    "host `execution`, or on the device with `CGSolver()`."
+
+function HD.prepare_solver(solver::HD.SphericalSpectralSolver,
                            grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2},
                            ::FG.Operators.AbstractBoundaryCondition;
-                           backend = CB.SerialBackend(), shared = nothing) where {T}
-    # FastSphericalHarmonics wraps FastTransforms, which is a host library, so this solver's state
-    # is host memory. A backend that allocates elsewhere is refused here, where the message can
-    # name an alternative, ahead of a `MethodError` raised from inside the transform.
-    FG.Execution.allocate(backend, T, 1) isa Array || throw(ArgumentError(
-        "SphericalSpectralSolver runs on the host: FastSphericalHarmonics has no device " *
-        "implementation. Use `SphericalNUSHTSolver`, whose non-uniform backend follows the array, " *
-        "or plan this grid with a host backend."))
+                           execution = CB.SerialBackend(), shared = nothing) where {T}
+    HD._require_backend(solver, execution, grid)
     nlon, nlat = size(grid)
     R = FG.Geometry.radius(FG.Grids.grid_geometry(grid))
     coeffs = zeros(T, nlat, nlon)
@@ -104,7 +103,7 @@ function HD.prepare_solver(::HD.SphericalSpectralSolver,
     # Both plans are built here, on this task, so a solve executes and plans nothing. The warm-up
     # runs one transform and one evaluation over `coeffs`, which is left zeroed for the first solve.
     cache = FSH.SphPlanCache{T}()
-    FFTW.set_num_threads(HD._library_threads(backend)) do
+    FFTW.set_num_threads(HD._library_threads(execution)) do
         FTB.with_fasttransforms_threads() do
             FSH.sph_transform!(coeffs; cache = cache)
             FSH.sph_evaluate!(coeffs; cache = cache)
@@ -236,19 +235,19 @@ function _potential_coefficients(S::AbstractMatrix{ComplexF64})
 end
 
 """
-    _decompose_spectral(solver, geometry, U, grid) -> HelmholtzResult
+    _decompose_spectral(solver, geometry, U, grid, execution, state) -> HelmholtzResult
 
 Helmholtz decomposition of a tangent velocity field on the Clenshaw–Curtis grid, by spin-weighted
-quadrature. `U` is component-last carrying `(u_east, u_north)`. `S²` is simply connected, so
-`u_harm` is zero; `χ`, the streamfunction `ψ` (`u_rot = k̂ × ∇ψ`) and `∇·u` come from the same
-coefficients.
+quadrature, at the thread count `execution` gives. `U` is component-last carrying `(u_east, u_north)`.
+`S²` is simply connected, so `u_harm` is zero; `χ`, the streamfunction `ψ` (`u_rot = k̂ × ∇ψ`) and
+`∇·u` come from the same coefficients.
 """
 function HD._decompose_spectral(
     ::HD.SphericalSpectralSolver,
     ::FG.Geometry.AbstractSphericalGeometry,
     U::AbstractArray{Float64,3},
-    grid::FG.Grids.StructuredGrid{Float64,<:FG.Geometry.AbstractSphericalGeometry,2};
-    backend = CB.SerialBackend(), kwargs...,
+    grid::FG.Grids.StructuredGrid{Float64,<:FG.Geometry.AbstractSphericalGeometry,2},
+    execution, ::Nothing,
 )
     nlon, nlat = size(grid)
     R = Float64(FG.Geometry.radius(FG.Grids.grid_geometry(grid)))
@@ -269,7 +268,7 @@ function HD._decompose_spectral(
     # per-task state, so the whole section runs under FFTW.jl's planner lock — see the note above
     # `prepare_solver`.
     cache = FSH.SpinSphPlanCache{ComplexF64}()
-    D, Φ, Δ = FFTW.set_num_threads(HD._library_threads(backend)) do
+    D, Φ, Δ = FFTW.set_num_threads(HD._library_threads(execution)) do
         FTB.with_fasttransforms_threads() do
             C = FSH.spinsph_transform!(V, 1; cache = cache)   # spin-1 coefficients, in place over `V`
             S = FSH.spinsph_ethbar(C, 1)                      # spin-0 coefficients of ð̄V
@@ -308,7 +307,7 @@ end
 # with the alternative named, ahead of an assertion from inside the transform.
 HD._decompose_spectral(
     ::HD.SphericalSpectralSolver, ::FG.Geometry.AbstractSphericalGeometry, U::AbstractArray{T},
-    grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2}; kwargs...,
+    grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2}, execution, ::Nothing,
 ) where {T} = throw(ArgumentError(
     "FastSphericalHarmonics works in Float64; this grid carries $T. Load `NUFSHT`, whose spin " *
     "transforms follow the element type, or build the grid in Float64."))

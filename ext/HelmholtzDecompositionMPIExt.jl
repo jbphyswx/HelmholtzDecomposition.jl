@@ -43,7 +43,7 @@ end
 # `T`, so a method parameterising the batch is ambiguous with the generic refusal.
 function HD._decompose_batch!(
     b::ComputationalBackends.AbstractMPIBackend, batch::HD.HelmholtzBatch, fields,
-    plan::HD.HelmholtzPlan{N,P,T}; kwargs...,
+    plan::HD.HelmholtzPlan{N,P,T},
 ) where {N,P,T}
     MPI.Initialized() || throw(ArgumentError(
         "MPI is not initialized — call `MPI.Init()` before `helmholtz_decompose_batch`."))
@@ -55,12 +55,16 @@ function HD._decompose_batch!(
     nf = length(items)
     nf == 0 && return batch
 
-    ws = HD.allocate_workspace(plan)
-    for i in _block(nf, nranks, rank)
-        # The rank's own inner backend, as named on the `MPIBackend`: a rank owns a block of the
-        # batch, so how it works through that block is a separate choice from how ranks divide it.
-        HD._decompose_slice!(batch, i, items[i], plan, ws;
-                             backend = HD.resolve_execution_backend(b.inner), kwargs...)
+    # The rank's own inner backend, as named on the `MPIBackend`, on a host plan: a rank owns a block of
+    # the batch, so how it works through that block is a separate choice from how ranks divide it.
+    exec = HD._field_execution(plan, ComputationalBackends.local_backend(b))
+    ws = HD._allocate_workspace(plan, exec)
+    try
+        for i in _block(nf, nranks, rank)
+            HD._decompose_slice!(batch, i, items[i], plan, ws, exec)
+        end
+    finally
+        HD.close!(ws)
     end
 
     for A in _arrays(batch)

@@ -15,13 +15,14 @@ The base package solves any grid, mask and boundary condition with multigrid-pre
 conjugate gradients. A transform is `O(N log N)` where one applies, and each arrives with its
 package:
 
-| Geometry   | Regular grid                      | Irregular grid                         |
-|------------|-----------------------------------|----------------------------------------|
-| Cartesian  | `using FFTW`, `using AbstractFFTs`| `using FINUFFT`, `using NonuniformFFTs`|
-| Spherical  | `using FastSphericalHarmonics`    | `using NUFSHT`                         |
+| Geometry   | Regular grid                                   | Irregular grid                         |
+|------------|------------------------------------------------|----------------------------------------|
+| Cartesian  | an FFT library for the array (`using FFTW`)    | `using FINUFFT`, `using NonuniformFFTs`|
+| Spherical  | `using FastSphericalHarmonics`                 | `using NUFSHT`                         |
 
 `AutoSolver` picks among the loaded ones on the grid's own properties — mask, axis uniformity,
-topology and node layout — and refuses a solver named directly that cannot solve the problem given.
+topology and node layout — and on the execution backend, and refuses a solver named directly that
+cannot solve the problem given.
 
 # Quick start
 ```julia
