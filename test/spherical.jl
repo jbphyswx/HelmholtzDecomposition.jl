@@ -141,19 +141,20 @@ Test.@testset "coverage of the sphere" begin
 end
 
 Test.@testset "a threaded batch on a Clenshaw–Curtis sphere equals the serial one" begin
-    # The staggered solve here is conjugate gradients preconditioned by FastTransforms, which a batch
-    # reaches from worker tasks; pinned to one thread there it returns what the root task returns.
+    # Conjugate gradients preconditioned by FastTransforms, which a batch reaches from worker tasks;
+    # pinned to one thread there it returns what the root task returns. The dual's nodes are not
+    # FastSphericalHarmonics' grid, so its solves take multigrid.
     nlat = 12
     cc = sampled(FG.SphericalSampling.ClenshawCurtisSampling(), nlat)
-    plan = HD.plan_helmholtz(cc; execution = CB.SerialBackend())
+    plan = HD.plan_helmholtz(cc; solver = HD.CGSolver(; spectral = HD.SphericalSpectralSolver()),
+                             execution = CB.SerialBackend())
     Test.@test plan.solver.spectral isa HD.SphericalSpectralSolver
     Random.seed!(31)
     fields = [randn(size(cc)..., 2) for _ in 1:4]
     bser = HD.helmholtz_decompose_batch(plan, fields; execution = CB.SerialBackend())
     bthr = HD.helmholtz_decompose_batch(plan, fields; execution = CB.ThreadedBackend())
     Test.@test bser.χ == bthr.χ
-    # The dual solves are preconditioned by NUFSHT, whose NUFFT is reproducible to round-off only.
-    Test.@test maximum(abs, bser.u_rot .- bthr.u_rot) <= 1e-12 * maximum(abs, bser.u_rot)
+    Test.@test bser.u_rot == bthr.u_rot
 end
 
 Test.@testset "fits past their tolerance or their nodes" begin

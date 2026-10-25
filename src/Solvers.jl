@@ -210,7 +210,7 @@ that is read during a solve and never written, built for the operator `coefficie
 
 `plan_helmholtz` holds this, so a batch builds it once in total. [`prepare_solver`](@ref) receives
 it and allocates only what its task writes through. The multigrid hierarchy is the case that pays:
-its grids and Galerkin coefficients are read-only, while its per-level vectors are not.
+its grids and coefficients are read-only, while its per-level vectors are not.
 
 `nothing` by default.
 """
@@ -268,9 +268,9 @@ end
 
 Sentinel for automatic selection. It chooses on capability: geometry, node layout, mask, axis
 uniformity, the boundary condition, the execution backend and which libraries are loaded. For a
-staggered decomposition it takes the first of [`_auto_candidates`](@ref) that applies; failing that,
-[`CGSolver`](@ref) preconditioned by the first of [`_preconditioner_candidates`](@ref) that applies;
-failing that, `CGSolver()`.
+staggered decomposition it takes the first of [`_auto_candidates`](@ref) that applies, and otherwise
+[`CGSolver`](@ref)`()`, preconditioned by multigrid. A spherical transform preconditions conjugate
+gradients when named, `CGSolver(; spectral = SphericalSpectralSolver())`.
 """
 struct AutoSolver <: AbstractPoissonSolver end
 
@@ -294,12 +294,6 @@ function _resolve_auto_solver(grid::FlowGeometries.Grids.AbstractGrid, boundary;
                               execution = ComputationalBackends.SerialBackend())
     for candidate in _auto_candidates(grid)
         _applicable(candidate, grid, boundary, execution) && return candidate
-    end
-    # A device has a NUFFT library for its arrays or not, which shows when a plan is built, while
-    # multigrid runs on every device.
-    execution isa _HostBackend || return CGSolver()
-    for candidate in _preconditioner_candidates(grid)
-        _applicable(candidate, grid, boundary, execution) && return CGSolver(; spectral = candidate)
     end
     return CGSolver()
 end
@@ -529,7 +523,7 @@ _laplacian(grid, boundary) =
 function prepare_shared(solver::CGSolver, grid, boundary::FlowGeometries.Operators.AbstractBoundaryCondition;
                         coefficients = _laplacian(grid, boundary))
     solver.spectral === nothing || return (_constant_rayleigh(coefficients, eltype(grid)), coefficients)
-    return solver.multigrid ? multigrid(coefficients) : nothing
+    return solver.multigrid ? multigrid(coefficients, boundary) : nothing
 end
 
 function prepare_solver(solver::CGSolver, grid, boundary::FlowGeometries.Operators.AbstractBoundaryCondition;

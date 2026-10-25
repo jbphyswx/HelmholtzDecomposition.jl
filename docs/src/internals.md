@@ -24,7 +24,6 @@ HelmholtzDecomposition._require_sampling
 HelmholtzDecomposition._unavailable_message
 HelmholtzDecomposition._backend_message
 HelmholtzDecomposition._auto_candidates
-HelmholtzDecomposition._preconditioner_candidates
 HelmholtzDecomposition._spectral_candidates
 HelmholtzDecomposition._spectral_dispatch
 ```

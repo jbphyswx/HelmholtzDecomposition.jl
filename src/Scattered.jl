@@ -16,8 +16,10 @@ Spectral Poisson/Helmholtz solver for scattered Cartesian samples in any dimensi
 library `nufft` names: `FlowTransformBindings.NonuniformFFTsBackend()`,
 `FlowTransformBindings.FINUFFTBackend()`, or `AutoSpectralBackend()` for NonuniformFFTs when it is
 loaded and FINUFFT when only it is. `nk` is the mode count per axis and its length fixes the dimension;
-the fitted series spans `|k_d| ≤ ⌊nk_d/2⌋`. `rtol`/`maxiter` govern the conjugate gradients of the fit,
-and `tol` is the transforms' relative accuracy, by default the `rtol` the fit is asked for.
+the fitted series spans `|k_d| ≤ ⌊nk_d/2⌋`. The fit minimizes the squared misfit at the nodes weighted
+by each node's measure, the grid's quadrature of the misfit's integral. `rtol`/`maxiter` govern the
+conjugate gradients of the fit, and `tol` is the transforms' relative accuracy, by default the `rtol`
+the fit is asked for.
 
 The iterations a fit needs grow with the mode-to-point ratio, and any ratio below one is accepted. A
 fit that stops at `maxiter` short of `rtol` is returned as it stands, with `converged == false` in the
@@ -124,15 +126,16 @@ count per direction, over the library `AutoSpectralBackend` resolves; on any oth
 default, which refuses it.
 
 The dimension rides in the solver's own type and the mode count has to be resolvable from the
-samples, so neither can come from a constructor default. The count leaves a factor of two between
-`prod(nk)` and the node count, which is the margin `_require_resolvable` asks for.
+samples, so neither can come from a constructor default. The count leaves four nodes per mode: for `M`
+random nodes and `n` modes the fit's matrix has condition number near `(1 + √(n/M)) / (1 − √(n/M))`
+(Marchenko–Pastur), 3 at a quarter, and unbounded as `n` approaches `M`.
 
 The direction count is the grid's own type parameter. `ndims` of a point cloud is `1`: its cells
 carry one flat address each, and that is unrelated to how many directions they sit in.
 """
 function _auto_nufft_solver(grid::_CartesianCloud{T,D}) where {T,D}
     M = length(FlowGeometries.Grids.mask(grid))
-    n = max(2, 2 * fld(floor(Int, (M / 2)^(1 / D)), 2))
+    n = max(2, 2 * fld(floor(Int, (M / 4)^(1 / D)), 2))
     return CartesianNUFFTSolver(; nk = ntuple(_ -> n, Val(D)))
 end
 _auto_nufft_solver(grid::FlowGeometries.Grids.AbstractGrid) = CartesianNUFFTSolver()
@@ -199,6 +202,8 @@ struct CGBuffers{A,S,V,L}
     # each iteration, so this follows by one axpy and costs no transform. It is what the
     # discrepancy principle tests, and the mode-space residual cannot answer that.
     rpt::S
+    # A point-space vector times the node weights, which the adjoint is applied to.
+    wpt::S
     rs::V
     rs_new::V
     den::V
@@ -214,7 +219,7 @@ function CGBuffers(::Type{T}, modes::AbstractArray, values::AbstractArray,
     nc = size(modes)[end]
     v() = zeros(T, nc)
     return CGBuffers(similar(modes), similar(modes), similar(modes), similar(modes),
-                     similar(values), similar(values), v(), v(), v(), v(), v(),
+                     similar(values), similar(values), similar(values), v(), v(), v(), v(), v(),
                      CGLanczos(Float64, maxiter, nc))
 end
 
@@ -256,23 +261,26 @@ end
 end
 
 """
-    inverse_nufft!(F, vals, plan, cg, weight; rtol, maxiter, atol = 0) -> SolverResult
+    inverse_nufft!(F, vals, plan, cg, weight, w; rtol, maxiter, atol = 0) -> SolverResult
 
-Least-squares Fourier coefficients of the bandlimited fields matching `vals` at the plan's nodes:
-conjugate gradients on `(AᴴA) F = Aᴴ vals`, with `A` the type-2 synthesis and `Aᴴ` its adjoint,
-in the mode-space inner product `weight` names (see [`_coldot`](@ref)). Returns whether every column
-reached its tolerance, the iterations taken, and the largest relative mode-space residual.
+Least-squares Fourier coefficients of the bandlimited fields matching `vals` at the plan's nodes,
+each node's residual weighted by `w`: conjugate gradients on `(AᴴWA) F = AᴴW vals`, with `A` the
+type-2 synthesis, `Aᴴ` its adjoint and `W = Diagonal(w)`, in the mode-space inner product `weight`
+names (see [`_coldot`](@ref)). Returns whether every column reached its tolerance, the iterations
+taken, and the largest relative mode-space residual.
 
 Its working set comes from [`CGBuffers`](@ref), so repeated fits over one point set allocate none.
 """
 function inverse_nufft!(F::AbstractArray, vals::AbstractArray,
-                        plan::FlowTransformBindings.AbstractNUFFTPlan, cg::CGBuffers, weight;
-                        rtol::Real, maxiter::Int, atol::Real = 0)
+                        plan::FlowTransformBindings.AbstractNUFFTPlan, cg::CGBuffers, weight,
+                        w::AbstractVector; rtol::Real, maxiter::Int, atol::Real = 0)
     nc = size(F)[end]
     npt = size(vals, 1)
     modes = CartesianIndices(Base.front(size(F)))
     b = cg.b
-    FlowTransformBindings.nufft_type1!(b, plan, vals)
+    wpt = cg.wpt
+    wpt .= w .* vals
+    FlowTransformBindings.nufft_type1!(b, plan, wpt)
     r = cg.r; copyto!(r, b)
     d = cg.d; copyto!(d, b)
     Ap = cg.Ap
@@ -291,7 +299,8 @@ function inverse_nufft!(F::AbstractArray, vals::AbstractArray,
     for iter in 1:maxiter
         iters = iter
         FlowTransformBindings.nufft_type2!(scratch, plan, d)      # A d
-        FlowTransformBindings.nufft_type1!(Ap, plan, scratch)     # Aᴴ A d
+        wpt .= w .* scratch
+        FlowTransformBindings.nufft_type1!(Ap, plan, wpt)         # Aᴴ W A d
         _coldot(d, Ap, den, weight)
         @inbounds for c in 1:nc
             iszero(den[c]) && continue
@@ -400,8 +409,8 @@ end
     ScatteredState
 
 Everything a scattered decomposition reuses: the library plan with its node set, the mode-space
-and point-space buffers of one fit, the conjugate-gradient working set, the wavenumbers, and the
-inner-product weights of the mode space.
+and point-space buffers of one fit, the conjugate-gradient working set, the wavenumbers, the
+inner-product weights of the mode space, and each node's measure, which weights its residual.
 
 None of it depends on the field, so a caller decomposing a time series over one point set builds
 it once with [`prepare_solver`](@ref), passes it as `helmholtz_decompose_spectral`'s `state`, and
@@ -410,7 +419,7 @@ releases its library plan with [`close!`](@ref).
 **One per task.** Every buffer here is written through during a solve, so concurrent
 decompositions need one each.
 """
-struct ScatteredState{D,T,S,P,A,B,C,G,K,W}
+struct ScatteredState{D,T,S,P,A,B,C,G,K,W,V<:AbstractVector{T}}
     packing::S
     plan::P
     packed::A          # one fit's coefficients: (mode_size…, 1)
@@ -419,6 +428,7 @@ struct ScatteredState{D,T,S,P,A,B,C,G,K,W}
     cg::G
     ks::K
     weight::W          # axis-1 inner-product weights of a half spectrum; `nothing` otherwise
+    measure::V         # each node's measure
 end
 
 Base.show(io::IO, s::ScatteredState{D,T}) where {D,T} =
@@ -469,9 +479,10 @@ function _scattered_state(packing, lib, solver::CartesianNUFFTSolver, grid, ::Ty
         T[T(2π) * k / periods[d] for k in FlowTransformBindings.mode_frequencies(plan, d)]
     end
     weight = _inner_weights(packing, plan, T)
+    measure = copyto!(similar(proto, T, M), FlowGeometries.Grids.measure(grid))
     return ScatteredState{D,T,typeof(packing),typeof(plan),typeof(packed),typeof(buf),
-                          typeof(velocity_hat),typeof(cg),typeof(ks),typeof(weight)}(
-        packing, plan, packed, buf, velocity_hat, cg, ks, weight)
+                          typeof(velocity_hat),typeof(cg),typeof(ks),typeof(weight),typeof(measure)}(
+        packing, plan, packed, buf, velocity_hat, cg, ks, weight, measure)
 end
 
 function _decompose_spectral(solver::CartesianNUFFTSolver{L,D},
@@ -502,7 +513,7 @@ function _decompose_scattered(solver::CartesianNUFFTSolver{L,D}, U::AbstractMatr
     fit = SolverResult{T}(true, 0, zero(T))
     for q in 1:_nfits(st.packing, D)
         _load_samples!(st.buf, st.packing, U, q, D)
-        s = inverse_nufft!(st.packed, st.buf, st.plan, st.cg, st.weight; rtol = solver.rtol,
+        s = inverse_nufft!(st.packed, st.buf, st.plan, st.cg, st.weight, st.measure; rtol = solver.rtol,
                            maxiter = solver.maxiter, atol = solver.atol)
         fit = _worst(fit, s)
         # Convergence says the samples are reproduced; the conditioning says whether they pick out

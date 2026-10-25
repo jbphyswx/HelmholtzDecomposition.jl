@@ -158,9 +158,11 @@ runs the staggered decomposition and the periodic spectral route on CUDA hardwar
 
 For data sampled at arbitrary point locations (observation networks, floats, tracks), build an
 `UnstructuredGrid`. It routes through the non-uniform transforms: a least-squares fit of the Fourier
-coefficients (conjugate gradients on the normal equations) → exact Leray projection → synthesis
-back to the points. The NUFFTs are [FlowTransformBindings](https://github.com/jbphyswx/FlowTransformBindings.jl)
-plans over NonuniformFFTs or FINUFFT.
+coefficients, each node's misfit weighted by its measure (conjugate gradients on the normal equations)
+→ exact Leray projection → synthesis back to the points. The default mode count, and on the sphere the
+default degree, leave four nodes per coefficient, where a fit at random nodes is well conditioned. The
+NUFFTs are [FlowTransformBindings](https://github.com/jbphyswx/FlowTransformBindings.jl) plans over
+NonuniformFFTs or FINUFFT.
 
 ```julia
 using NonuniformFFTs: NonuniformFFTs
@@ -253,13 +255,15 @@ The package keeps two orthogonal axes separate:
 | `HD.SphericalNUSHTSolver()` (NUFSHT) | any spherical node set covering `S²` |
 
 The spherical transforms invert the continuous Laplacian. `helmholtz_decompose_spectral` uses them
-directly; on the staggered path (`helmholtz_decompose`, `plan_helmholtz`) they precondition
-`CGSolver` on the grid's own discrete Laplacian, named or chosen by `AutoSolver`, so the divergent
-part carries the field's divergence on the grid to the solver tolerance.
+directly; on the staggered path (`helmholtz_decompose`, `plan_helmholtz`) a named one preconditions
+`CGSolver` on the grid's own discrete Laplacian, `CGSolver(; spectral = SphericalSpectralSolver())`, so
+the divergent part carries the field's divergence on the grid to the solver tolerance.
 
 `AutoSolver` is mask-aware (never picks a transform on a masked domain) and backend-aware (never picks
 a solver whose state lives on the host for a device backend), and takes a Cartesian transform where
-one applies, a spherical preconditioner on a sphere whose nodes one accepts, and multigrid otherwise.
+one applies and multigrid otherwise: on a sphere with line smoothing along longitude, elsewhere with
+lines along each direction in turn where the coupling of some cell is more than twice as strong along
+one direction as along another (a stretched or curvilinear mesh), and point smoothing otherwise.
 
 **Execution backend** (where the loops of one decomposition run): `SerialBackend`,
 `ThreadedBackend`, `GPUBackend(backend)` over a KernelAbstractions backend, passed as `execution=` to
