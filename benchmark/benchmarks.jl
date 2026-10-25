@@ -1,11 +1,17 @@
 """
-    benchmark/benchmarks.jl — the baseline every performance claim is measured against.
+    benchmark/benchmarks.jl — plan, workspace and call costs of every decomposition path.
 
     julia --project=benchmark benchmark/benchmarks.jl [quick|full|huge]
 
 Three costs are reported separately because they are paid at different rates: building a plan is
 once per grid, building a workspace is once per task, and `helmholtz_decompose!` is once per field.
 Timing the allocating entry point sums all three and hides which one moved.
+
+`units` gives the call's time as a multiple of the operation it is built from, timed alone: one serial
+application of the grid's Laplacian for a staggered decomposition, one type-1 and type-2 NUFFT pair at
+the fit's modes for a Cartesian point cloud. `iters` is the CG iterations of the χ solve and of the
+largest rotational solve, or the fit's iterations; a multigrid-preconditioned solve whose count stays
+flat as the grid is refined is at its `h`-independent rate.
 
 `Base.summarysize(plan)` is reported alongside, in the same table. The plan holds one array per
 face direction for the area, one for the gap, one per direction for the Laplacian coefficients, and
@@ -17,11 +23,11 @@ which paths execute.
 
 Sizes:
 
-| set | 2-D | 3-D | batch | scattered |
-|---|---|---|---|---|
-| `quick` | 128² | 32³ | 1, 8 | 2000 |
-| `full` | 512² | 128³ | 1, 64, 256 | 2000, 100000 |
-| `huge` | 512² | 256³ | 1, 64, 256 | 2000, 100000 |
+| set | 2-D | curvilinear | 3-D | batch | scattered | clouds (default sizing) |
+|---|---|---|---|---|---|---|
+| `quick` | 128² | 192×160 | 32³ | 1, 8 | 2000 | 10000 |
+| `full` | 512² | 384×320 | 128³ | 1, 64, 256 | 2000, 100000 | 100000 |
+| `huge` | 512² | 384×320 | 256³ | 1, 64, 256 | 2000, 100000 | 100000 |
 
 `huge` is sized by its fields: a `256³` plan is about 0.11 MiB and one velocity field is 384 MiB.
 """
@@ -81,18 +87,19 @@ end
 
 const ROWS = Vector{NamedTuple}()
 
-function record!(; case, solver, plan, workspace, call, planbytes)
-    push!(ROWS, (; case, solver, plan, workspace, call, planbytes))
-    Printf.@printf("  %-34s %-26s %s %s %s %s  %s\n", case, solver,
+function record!(; case, solver, plan, workspace, call, planbytes, units = NaN, iters = "")
+    push!(ROWS, (; case, solver, plan, workspace, call, planbytes, units, iters))
+    Printf.@printf("  %-34s %-26s %s %s %s %s  %s %7s %8s\n", case, solver,
             _fmt_time(plan.time), _fmt_time(workspace.time), _fmt_time(call.time),
-            _fmt_bytes(call.bytes), _fmt_bytes(planbytes))
+            _fmt_bytes(call.bytes), _fmt_bytes(planbytes),
+            isnan(units) ? "—" : Printf.@sprintf("%.0f", units), iters)
     return nothing
 end
 
 function header()
-    Printf.@printf("  %-34s %-26s %7s %7s %7s %7s  %7s\n",
-            "case", "solver", "plan", "wspace", "call", "call B", "plan B")
-    println("  ", "-"^115)
+    Printf.@printf("  %-34s %-26s %7s %7s %7s %7s  %7s %7s %8s\n",
+            "case", "solver", "plan", "wspace", "call", "call B", "plan B", "units", "iters")
+    println("  ", "-"^132)
 end
 
 # ---------------------------------------------------------------------------
@@ -154,6 +161,18 @@ function _latlon(nlat)
     return FG.Grids.StructuredGrid(SPH, λ, φ; topology = (true, false), period = (2π, 0.0))
 end
 
+# A curvilinear mesh stretched in both directions (cell aspect ratios 0.36–2.8) and sheared, with a
+# rectangular hole.
+function _curvilinear(nx, ny)
+    s(t) = t + 0.15 * sin(π * t)
+    xv = [1e3 * (400 * s(i / nx) + 40 * (j / ny)) for i in 0:nx, j in 0:ny]
+    yv = [1e3 * (320 * s(j / ny) + 25 * sin(2π * i / nx)) for i in 0:nx, j in 0:ny]
+    mid(q) = [(q[i, j] + q[i + 1, j] + q[i, j + 1] + q[i + 1, j + 1]) / 4 for i in 1:nx, j in 1:ny]
+    hole = trues(nx, ny)
+    hole[(2nx ÷ 5):(nx ÷ 2 + 8), (3ny ÷ 8):(ny ÷ 2 + 10)] .= false
+    return FG.Grids.CurvilinearGrid(CART, mid(xv), mid(yv), hole; corners = (xv, yv))
+end
+
 # ---------------------------------------------------------------------------
 # Cases
 # ---------------------------------------------------------------------------
@@ -176,8 +195,14 @@ function structured_case(label, grid; boundary = FG.Operators.Neumann(), solver 
     u = randn(size(grid)..., N)
 
     tcall = bench(() -> HD.helmholtz_decompose!(res, u, plan, ws); samples = 3)
+    Φ = randn(size(grid)...)
+    out = similar(Φ)
+    tlap = bench(() -> FG.Operators.apply_laplacian!(out, Φ, plan.coefficients; execution = CB.SerialBackend());
+                 samples = 10)
     record!(; case = label, solver = string(nameof(typeof(plan.solver))),
-            plan = tplan, workspace = tws, call = tcall, planbytes = Base.summarysize(plan))
+            plan = tplan, workspace = tws, call = tcall, planbytes = Base.summarysize(plan),
+            units = tcall.time / tlap.time,
+            iters = "$(res.χ_solve.iterations)/$(maximum(s -> s.iterations, res.rot_solve))")
     return nothing
 end
 
@@ -244,6 +269,35 @@ function scattered_case(label, npoints::Int, nk::Int, nufft)
     return nothing
 end
 
+"""
+    cloud_case(label, grid)
+
+`helmholtz_decompose_spectral(U, grid)` on a point cloud with every setting at its default, the fit's
+modes sized from the point count. On a Cartesian cloud `units` counts type-1 and type-2 NUFFT pairs at
+those modes on the library `AutoSpectralBackend` resolves.
+"""
+function cloud_case(label, grid)
+    M = length(FG.Grids.mask(grid))
+    Random.seed!(15)
+    U = randn(M, 2)
+    t = bench(() -> HD.helmholtz_decompose_spectral(U, grid); samples = 3)
+    res = HD.helmholtz_decompose_spectral(U, grid)
+    units = NaN
+    if FG.Grids.grid_geometry(grid) isa FG.Geometry.AbstractCartesianGeometry
+        nk = HD._auto_nufft_solver(grid).nk
+        L = FG.Grids.period(grid, 1)
+        p = FTB.plan_nufft(FTB.NonuniformFFTsBackend(), Float64, ntuple(d -> FG.Grids.coordinates(grid, d), 2), nk;
+                           period = L, nthreads = Threads.nthreads())
+        F, c = FTB.allocate_modes(p), FTB.allocate_values(p)
+        c .= U[:, 1]
+        units = t.time / bench(() -> (FTB.nufft_type1!(F, p, c); FTB.nufft_type2!(c, p, F)); samples = 5).time
+        FTB.close!(p)
+    end
+    record!(; case = label, solver = "spectral, defaults", plan = NA, workspace = NA, call = t,
+            planbytes = -1, units, iters = "$(res.χ_solve.iterations)/$(maximum(s -> s.iterations, res.rot_solve))")
+    return nothing
+end
+
 # ---------------------------------------------------------------------------
 # Suites
 # ---------------------------------------------------------------------------
@@ -254,6 +308,8 @@ function suite(set::Symbol)
     batches = set === :quick ? (1, 8) : (1, 64, 256)
     scatter = set === :quick ? ((2_000, 32),) : ((2_000, 32), (100_000, 128))
     nlat = set === :quick ? 32 : 128
+    ncurv = set === :quick ? (192, 160) : (384, 320)
+    ncloud = set === :quick ? 10_000 : 100_000
 
     configuration()
 
@@ -264,6 +320,7 @@ function suite(set::Symbol)
     structured_case("masked $(n2)²", _masked(n2))
     structured_case("bounded $(n2)², Dirichlet", _bounded(n2, 2); boundary = FG.Operators.Dirichlet())
     structured_case("masked $(n2)², jacobi", _masked(n2); solver = HD.CGSolver(; multigrid = false))
+    structured_case("curvilinear $(ncurv[1])×$(ncurv[2]), stretched", _curvilinear(ncurv...))
     println()
 
     println("Cartesian 3-D, n = $n3")
@@ -290,6 +347,14 @@ function suite(set::Symbol)
     for (m, nk) in scatter, nufft in (FTB.NonuniformFFTsBackend(), FTB.FINUFFTBackend())
         scattered_case("scattered M=$m, nk=$(nk)²", m, nk, nufft)
     end
+    Random.seed!(5)
+    Lc = 1000e3
+    cloud_case("Cartesian cloud M=$ncloud, periodic",
+               FG.Grids.UnstructuredGrid(CART, (Lc .* rand(ncloud), Lc .* rand(ncloud)), fill(Lc^2 / ncloud, ncloud);
+                                         periodic = (true, true), period = (Lc, Lc)))
+    cloud_case("sphere cloud M=$ncloud",
+               FG.Grids.UnstructuredGrid(SPH, 2π .* rand(ncloud), asin.(2 .* rand(ncloud) .- 1),
+                                         fill(4π / ncloud, ncloud), trues(ncloud)))
     println()
 
     println("Batch, periodic $(n2)² (per field)")

@@ -64,15 +64,14 @@ Test.@testset "spherical transforms" begin
             Test.@test maximum(abs, Φ .- f) <= 1e-9
             solver isa HD.SphericalNUSHTSolver && HD.close!(st)
 
-            # On the staggered path `AutoSolver` preconditions conjugate gradients on the grid's `L` with
-            # a spherical transform, so the divergent part carries the field's divergence to the solver
-            # tolerance in fewer iterations than under multigrid. Under a device backend it keeps
-            # multigrid.
+            # On the staggered path, under `AutoSolver` and under multigrid-preconditioned conjugate
+            # gradients, the divergent part carries the field's divergence to the solver tolerance.
+            # Under a device backend `AutoSolver` keeps multigrid.
             Test.@test HD.select_solver(HD.AutoSolver(), grid, OPS.Neumann();
                                         execution = CB.GPUBackend(nothing)).spectral === nothing
             Random.seed!(43)
             u = randn(size(grid)..., 2)
-            iters = map((HD.AutoSolver(), HD.CGSolver())) do s
+            for s in (HD.AutoSolver(), HD.CGSolver())
                 plan = HD.plan_helmholtz(grid; solver = s, execution = CB.SerialBackend())
                 ws = HD.allocate_workspace(plan)
                 r = HD.helmholtz_decompose!(HD.allocate_result(plan), u, plan, ws)
@@ -82,9 +81,46 @@ Test.@testset "spherical transforms" begin
                 Test.@test r.χ_solve.converged
                 Test.@test maximum(abs, Dg .- Dv) <= 1e-9 * maximum(abs, Dv)
                 HD.close!(ws)
-                r.χ_solve.iterations
             end
-            Test.@test iters[1] < iters[2]
+        end
+    end
+end
+
+# A V-cycle whose coarse levels are the operator rediscretized, smoothed along the directions that couple
+# strongly, reduces the error by a factor that does not depend on the resolution, so conjugate gradients
+# take as many iterations at twice the cells per direction: on a lat–lon sphere, on a box with a hole,
+# whose rotation potential holds zero on the corners inside the hole, and on a stretched curvilinear mesh.
+Test.@testset "multigrid iterations do not grow with resolution" begin
+    sph = FG.Geometry.SphericalGeometry(1.0)
+    latlon(n) = FG.Grids.StructuredGrid(sph, FG.Axes.PeriodicAxis(0.0, 2π, 2n),
+                                        range(-π / 2 + π / (2n), π / 2 - π / (2n); length = n))
+    function holed(n)
+        x = collect(range(0.0, 1.0; length = n))
+        m = trues(n, n)
+        m[(3n ÷ 8):(5n ÷ 8), (3n ÷ 8):(5n ÷ 8)] .= false
+        return FG.Grids.StructuredGrid(CART, x, x, m)
+    end
+    # A curvilinear mesh stretched along both directions, its cells' aspect ratio between about 1/3 and 3, so
+    # the direction of strong coupling changes across it.
+    function stretched(n)
+        s(t) = t + 0.15 * sin(π * t)
+        xv = [s(i / n) + 0.1 * (j / n) for i in 0:n, j in 0:n]
+        yv = [0.8 * s(j / n) + 0.06 * sin(2π * i / n) for i in 0:n, j in 0:n]
+        mid(q) = [(q[i, j] + q[i + 1, j] + q[i, j + 1] + q[i + 1, j + 1]) / 4 for i in 1:n, j in 1:n]
+        return FG.Grids.CurvilinearGrid(CART, mid(xv), mid(yv), trues(n, n); corners = (xv, yv))
+    end
+    for (name, grids) in (("lat–lon sphere", (latlon(32), latlon(64))), ("box with a hole", (holed(64), holed(128))),
+                          ("stretched curvilinear mesh", (stretched(64), stretched(128))))
+        Test.@testset "$name" begin
+            its = map(grids) do g
+                plan = HD.plan_helmholtz(g; solver = HD.CGSolver(), execution = CB.SerialBackend())
+                Random.seed!(3)
+                r = HD.helmholtz_decompose!(HD.allocate_result(plan), randn(size(g)..., 2), plan)
+                Test.@test r.χ_solve.converged && all(s -> s.converged, r.rot_solve)
+                (r.χ_solve.iterations, maximum(s -> s.iterations, r.rot_solve))
+            end
+            Test.@test its[2][1] <= its[1][1] + 2
+            Test.@test its[2][2] <= its[1][2] + 2
         end
     end
 end

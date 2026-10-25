@@ -1,6 +1,6 @@
 # Where the loops of one decomposition run. The operators are FlowGeometries': `FaceMetrics`,
 # `gradient!`, `divergence!`, `curl!`, `rotational_velocity!`, `to_faces!`, `to_centres!` and the
-# assembled `LaplacianCoefficients` with its Galerkin hierarchy, all under `FlowGeometries.Operators`.
+# assembled `LaplacianCoefficients` with its multigrid hierarchy, all under `FlowGeometries.Operators`.
 
 """
     resolve_execution_backend(backend) -> concrete backend

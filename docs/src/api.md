@@ -118,7 +118,7 @@ HelmholtzDecomposition.spectral_inverse!
 
 The staggered operators are FlowGeometries': `FG.Operators.FaceMetrics` with `gradient!`,
 `divergence!`, `curl!`, `rotational_velocity!`, `to_faces!` and `to_centres!`, and the assembled
-`FG.Operators.LaplacianCoefficients` with its null space and Galerkin hierarchy. A plan holds the
+`FG.Operators.LaplacianCoefficients` with its null space and coarse levels. A plan holds the
 primal grid's metrics and coefficients and, per rotation pair, a dual grid with its own operator:
 
 ```@docs
@@ -140,6 +140,10 @@ HelmholtzDecomposition.loop_backend
 ```@docs
 HelmholtzDecomposition.multigrid
 HelmholtzDecomposition.MultigridPreconditioner
+HelmholtzDecomposition.PointJacobi
+HelmholtzDecomposition.ZebraLines
+HelmholtzDecomposition.AlternatingLines
+HelmholtzDecomposition.default_smoother
 HelmholtzDecomposition.LevelBuffers
 HelmholtzDecomposition.MultigridBuffers
 HelmholtzDecomposition.multigrid_buffers

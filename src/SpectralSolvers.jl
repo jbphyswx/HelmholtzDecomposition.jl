@@ -60,17 +60,15 @@ FlowTransformBindings tag, or `AutoSpectralBackend()` for NUFSHT's own choice. N
 under the execution backend of the call, a `GPUBackend`'s device included, given a NUFFT library for
 that device's arrays.
 
-`lmax = nothing` sizes the expansion from the grid. The fit recovers `(lmax+1)²` coefficients from
-`M` nodes, so a degree chosen without reference to `M` truncates a fine grid and outruns a coarse
-one.
+`lmax = nothing` sizes the expansion from the grid: the degree a grid of latitude rings or with a
+sampling recipe represents, and on scattered nodes the largest degree leaving four nodes per
+coefficient, where the fit is well conditioned.
 
 A degree that outruns the nodes by enough corrupts the split while leaving the fit exact: the
 samples are reproduced, the three parts sum back to the input, and the rotational/divergent share
 is wrong, because that share reads the coefficient vector and the samples stop pinning it down.
-The residual is at round-off throughout, so it reports nothing about this. On a lat-lon grid the
-split holds to round-off well past `(lmax+1)² = M` and degrades beyond roughly twice it; the
-crossing depends on the field and the node layout, so `lmax` is left to the caller and sized from
-the grid when it is unset.
+The residual is at round-off throughout, so it reports nothing about this. Where that happens
+depends on the field and the node layout.
 """
 struct SphericalNUSHTSolver{T<:AbstractFloat,L<:Union{Nothing,Int},N<:SpectralBackends.AbstractSpectralBackend} <:
        AbstractPoissonSolver
@@ -123,16 +121,6 @@ preconditions(::_SphericalTransform) = true
 # FastSphericalHarmonics and FFTW's real-to-real transforms hold their state in host memory.
 supports_backend(::Union{SphericalSpectralSolver,CartesianBoundedSolver}, backend, grid) =
     backend isa _HostBackend
-
-"""
-    _preconditioner_candidates(grid) -> Tuple
-
-The transforms [`AutoSolver`](@ref) tries as the preconditioner of [`CGSolver`](@ref) when no solver of
-[`_auto_candidates`](@ref) applies: on a spherical grid FastSphericalHarmonics, then NUFSHT. It tries
-them on a host backend; on a device one a transform preconditions when named.
-"""
-_preconditioner_candidates(::_SphericalGrid) = (SphericalSpectralSolver(), SphericalNUSHTSolver())
-_preconditioner_candidates(::FlowGeometries.Grids.AbstractGrid) = ()
 
 """
     _auto_candidates(grid) -> Tuple

@@ -8,7 +8,7 @@ src/
   BoundaryConditions.jl       # CornerDirichlet, the dual grid's condition
   Execution.jl                # the execution backend of one decomposition
   Solvers.jl                  # AbstractPoissonSolver, CGSolver, AutoSolver
-  Multigrid.jl                # geometric V-cycle preconditioner over FlowGeometries' Galerkin levels
+  Multigrid.jl                # geometric V-cycle preconditioner over FlowGeometries' coarse levels
   DualGrid.jl                 # the corner grid the rotation potential lives on
   Decomposition.jl            # plan/workspace/result/batch and helmholtz_decompose[!]
   Spectral.jl                 # Leray projector in mode space
@@ -95,9 +95,7 @@ that applies:
 
 - a Cartesian transform that inverts `L`: `CartesianSpectralSolver`, `CartesianBoundedSolver`,
   `CartesianRealTransformSolver` (`_auto_candidates`);
-- on a sphere, `CGSolver` preconditioned by `SphericalSpectralSolver` or `SphericalNUSHTSolver`
-  (`_preconditioner_candidates`), which invert the continuous Laplacian;
-- `CGSolver` with multigrid.
+- `CGSolver` with multigrid, smoothed along longitude on a sphere.
 
 `helmholtz_decompose_spectral` keeps its own list (`_spectral_candidates`): the periodic FFT and
 the scattered NUFFT on a Cartesian grid, FastSphericalHarmonics and NUFSHT on a sphere. Each list is

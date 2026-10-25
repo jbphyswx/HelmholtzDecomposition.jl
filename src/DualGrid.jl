@@ -99,6 +99,15 @@ values `rotational_velocity!` reads there; in three or more dimensions `Dirichle
 """
 dual_boundary(::FlowGeometries.Grids.FaceIndexedGrid{T,G,2}, a::Integer, b::Integer) where {G,T} =
     CornerDirichlet((true, true))
+dual_boundary(grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, a::Integer, b::Integer) where {G,T} =
+    CornerDirichlet((true, true), ntuple(d -> _dropped_corners(grid, d), Val(2)))
+
+# The coordinates of the two corners a bounded direction's dual drops, its end faces; none where it wraps.
+function _dropped_corners(grid::FlowGeometries.Grids.StructuredGrid{T}, d::Int) where {T}
+    FlowGeometries.Grids.isperiodic(grid, d) && return nothing
+    f = FlowGeometries.Grids.face_coordinates(grid, d)
+    return (T(first(f)), T(last(f)))
+end
 dual_boundary(::FlowGeometries.Grids.FaceIndexedGrid, a::Integer, b::Integer) =
     FlowGeometries.Operators.Dirichlet()
 

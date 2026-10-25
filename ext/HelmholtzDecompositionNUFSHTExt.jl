@@ -17,19 +17,21 @@ using NUFSHT: NUFSHT
 
 The expansion degree for `grid`, when the solver was built without one.
 
-Two bounds, both from the grid. The node count caps it at `(lmax+1)² ≤ M`, which is conservative —
-the fit and its split hold past that — and it needs no knowledge of the field. The sampling caps it
-at the degree the node set represents, which `FlowGeometries` answers from the recipe where the grid
-carries one and from the latitude count otherwise.
+A grid with a sampling recipe or a product of latitude rings takes the degree its nodes represent,
+which `FlowGeometries` answers from the recipe where the grid carries one and from the latitude count
+otherwise, within `(lmax+1)² ≤ M`. Scattered nodes take the largest degree leaving four nodes per
+coefficient, `(lmax+1)² ≤ M/4`: for `M` random nodes and `n` coefficients the fit's matrix has
+condition number near `(1 + √(n/M)) / (1 − √(n/M))` (Marchenko–Pastur), 3 at a quarter, and
+unbounded as `n` approaches `M`.
 """
 function _resolve_lmax(solver::HD.SphericalNUSHTSolver, grid)
     solver.lmax === nothing || return solver.lmax
     npoints = length(FG.Grids.mask(grid))
-    from_nodes = isqrt(npoints) - 1
     s = FG.Grids.sampling(grid)
+    s === nothing && ndims(grid) == 1 && return max(1, isqrt(npoints ÷ 4) - 1)
     nlat = ndims(grid) == 2 ? size(grid, 2) : npoints
     from_sampling = s === nothing ? nlat - 1 : FG.SphericalSampling.bandlimit(s, nlat)
-    return max(1, min(from_nodes, from_sampling))
+    return max(1, min(isqrt(npoints) - 1, from_sampling))
 end
 
 # The expansion is in spherical harmonics over the whole sphere, so the samples must cover it and
