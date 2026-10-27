@@ -1,9 +1,10 @@
 # Spherical Poisson solves and the spectral decomposition through FastSphericalHarmonics: forward
-# SHT, divide by the eigenvalue `−ℓ(ℓ+1)/R²`, inverse SHT. The transform is defined on the
-# Clenshaw–Curtis node set `θᵢ = π(i−½)/N_θ`, `λⱼ = 2π(j−1)/(2N_θ−1)` (`FastSphericalHarmonics.sph_points`)
-# alone, so a grid's node positions are checked against it: `N_λ = 2N_θ − 1` holds on many grids it
-# does not apply to. The set spans the whole sphere; a regional patch is a boundary value problem,
-# which the iterative solver takes.
+# SHT, divide by the eigenvalue `−ℓ(ℓ+1)/R²`, inverse SHT. The transform is defined on Fejér's
+# first-rule node set `θᵢ = π(i−½)/N_θ`, `λⱼ = 2π(j−1)/(2N_θ−1)` (`FastSphericalHarmonics.sph_points`)
+# alone, which a grid states by its sampling type and size. FastTransforms computes in Float64, so the
+# transforms run on Float64 buffers and a field of another element type converts on the way in and out.
+# The set spans the whole sphere; a regional patch is a boundary value problem, which the iterative
+# solver takes.
 module HelmholtzDecompositionFSHExt
 
 using HelmholtzDecomposition: HelmholtzDecomposition as HD
@@ -19,57 +20,39 @@ HD.supports_boundary(::HD.SphericalSpectralSolver, ::FG.Operators.AbstractBounda
 HD.requires_full_domain(::HD.SphericalSpectralSolver) = true
 
 """
-    _is_clenshaw_curtis(grid) -> Bool
+    _is_fsh_grid(grid) -> Bool
 
-Whether `grid`'s nodes are the Clenshaw–Curtis set this transform is defined on.
-
-A grid built from a sampling recipe carries it as a zero-size type parameter, so the first test is
-answered from the type. A grid built from bare axes carries `nothing`, and its nodes are compared
-against the reconstructed set.
-
-The node set is symmetric under `θ → π − θ`, so either latitude order is accepted: the reflection
-is an isometry of `S²` and commutes with `Δ`.
+Whether `grid`'s nodes are the set this transform is defined on, from its type and size: a grid whose
+sampling is Fejér's first rule with `N_λ = 2N_θ − 1`, of any float element type. Either latitude order
+is accepted: the reflection `θ → π − θ` is an isometry of `S²` and commutes with `Δ`.
 """
-_is_clenshaw_curtis(grid) = false
+_is_fsh_grid(grid) = false
+_is_fsh_grid(grid::FG.Grids.StructuredGrid{<:AbstractFloat,<:FG.Geometry.AbstractSphericalGeometry,2}) =
+    FG.Grids.sampling(grid) isa FG.SphericalSampling.AbstractFejer1Sampling && size(grid, 1) == 2 * size(grid, 2) - 1
 
-function _is_clenshaw_curtis(
-    grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2},
-) where {T}
-    FG.Grids.sampling(grid) isa FG.SphericalSampling.AbstractClenshawCurtisSampling && return true
-    nlon, nlat = size(grid)
-    want = FG.SphericalSampling.spherical_axes(T, FG.SphericalSampling.ClenshawCurtisSampling(), nlat)
-    length(want.λ) == nlon || return false
-    λ = FG.Grids.coordinates(grid, 1)
-    φ = FG.Grids.coordinates(grid, 2)
-    tol = sqrt(eps(T)) * T(2π)
-    all(i -> abs(T(λ[i]) - want.λ[i]) <= tol, 1:nlon) || return false
-    return all(j -> abs(T(φ[j]) - want.φ[j]) <= tol, 1:nlat) ||
-           all(j -> abs(T(φ[j]) - want.φ[nlat - j + 1]) <= tol, 1:nlat)
-end
-
-HD.supports_sampling(::HD.SphericalSpectralSolver, grid) = _is_clenshaw_curtis(grid)
+HD.library_loaded(::HD.SphericalSpectralSolver) = true
+HD.supports_sampling(::HD.SphericalSpectralSolver, grid) = _is_fsh_grid(grid)
+HD.sampling_known(::HD.SphericalSpectralSolver, grid) = _is_fsh_grid(grid)
 
 function HD._sampling_message(::HD.SphericalSpectralSolver, grid)
     sz = size(grid)
     nlat = length(sz) == 2 ? sz[2] : 0
-    return "FastSphericalHarmonics is defined on the Clenshaw–Curtis node set, " *
-           "θᵢ = π(i−½)/N_θ and λⱼ = 2π(j−1)/(2N_θ−1); this grid ($(join(sz, "×"))) is not it. " *
-           "On another node set the transform returns a smooth, plausible, wrong field. Build the " *
-           "grid from `FlowGeometries.SphericalSampling.spherical_axes(T, " *
-           "ClenshawCurtisSampling(), $nlat)`, load `NUFSHT` for an arbitrary node set, or use " *
-           "the iterative solver for a regional patch."
+    return "FastSphericalHarmonics is defined on Fejér's first-rule node set, θᵢ = π(i−½)/N_θ and " *
+           "λⱼ = 2π(j−1)/(2N_θ−1), which a grid states by its sampling; this grid ($(join(sz, "×"))) does " *
+           "not. Build it with `FlowGeometries.Connectivity.structured_grid(T, Fejer1Sampling(), $nlat)`, " *
+           "load `NUFSHT` for an arbitrary node set, or use the iterative solver for a regional patch."
 end
 
 """
     SphericalSpectralState
 
-The transposed coefficient array and the per-mode eigenvalues, built once.
+The transposed coefficient array and the per-mode eigenvalues, in Float64, built once.
 
 `FastSphericalHarmonics` wants `(nlat, nlon)` where the grid is `(nlon, nlat)`, so a solve has to
-transpose in and out. Allocating that array inside `solve_poisson!` allocates it once per potential
-per field of a batch.
+transpose in and out, converting the grid's element type to Float64 and back. Allocating that array
+inside `solve_poisson!` allocates it once per potential per field of a batch.
 """
-struct SphericalSpectralState{T,A<:AbstractMatrix{T},E<:AbstractVector{T},C}
+struct SphericalSpectralState{A<:AbstractMatrix{Float64},E<:AbstractVector{Float64},C}
     coeffs::A
     inv_eig::E      # 1/λ_ℓ per ℓ, with ℓ = 0 zeroed
     cache::C        # this task's own FastTransforms plans
@@ -92,24 +75,24 @@ function HD.prepare_solver(solver::HD.SphericalSpectralSolver,
                            execution = CB.SerialBackend(), shared = nothing) where {T}
     HD._require_backend(solver, execution, grid)
     nlon, nlat = size(grid)
-    R = FG.Geometry.radius(FG.Grids.grid_geometry(grid))
-    coeffs = zeros(T, nlat, nlon)
+    R = Float64(FG.Geometry.radius(FG.Grids.grid_geometry(grid)))
+    coeffs = zeros(Float64, nlat, nlon)
     # Column `|m|` holds the degrees `|m| … |m| + nlat − 1`, so the stored degrees run to
     # `nlon ÷ 2 + nlat − 1`. ℓ = 0 is the constant the Laplacian annihilates, and stays zero.
-    inv_eig = zeros(T, nlon ÷ 2 + nlat)
+    inv_eig = zeros(Float64, nlon ÷ 2 + nlat)
     @inbounds for ℓ in 1:(length(inv_eig) - 1)
-        inv_eig[ℓ + 1] = -R^2 / T(ℓ * (ℓ + 1))
+        inv_eig[ℓ + 1] = -R^2 / (ℓ * (ℓ + 1))
     end
     # Both plans are built here, on this task, so a solve executes and plans nothing. The warm-up
     # runs one transform and one evaluation over `coeffs`, which is left zeroed for the first solve.
-    cache = FSH.SphPlanCache{T}()
+    cache = FSH.SphPlanCache{Float64}()
     FFTW.set_num_threads(HD._library_threads(execution)) do
         FTB.with_fasttransforms_threads() do
             FSH.sph_transform!(coeffs; cache = cache)
             FSH.sph_evaluate!(coeffs; cache = cache)
         end
     end
-    fill!(coeffs, zero(T))
+    fill!(coeffs, zero(Float64))
     return SphericalSpectralState(coeffs, inv_eig, cache)
 end
 
@@ -151,7 +134,7 @@ function HD.spectral_inverse!(
 end
 
 # ---------------------------------------------------------------------------
-# Vector Hodge decomposition on the Clenshaw–Curtis grid
+# Vector Hodge decomposition on the Fejér first-rule grid
 # ---------------------------------------------------------------------------
 #
 # `ð̄` lowers spin weight and, on a spin-1 tangent field, is the divergence; `ð` raises it and, on a
@@ -235,20 +218,53 @@ function _potential_coefficients(S::AbstractMatrix{ComplexF64})
 end
 
 """
+    FSHSpectralState
+
+The spin-weighted transforms' plans on one Fejér first-rule grid, for spin 1 and spin 0, and the spin-1
+field the forward transform runs in place on, in Float64. `spinsph_transform!` and `spinsph_evaluate!`
+key their plans on `(s, N)` and share the `spinsph2fourier` plan; all of them are built here, under
+FFTW.jl's planner lock, so a decomposition plans nothing.
+"""
+struct FSHSpectralState{C,V<:AbstractMatrix{ComplexF64}}
+    cache::C
+    V::V
+end
+
+HD.close!(s::FSHSpectralState) = s
+
+function HD.prepare_spectral(solver::HD.SphericalSpectralSolver,
+                             grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2};
+                             execution = CB.AutoBackend()) where {T}
+    exec = HD.resolve_execution_backend(execution)
+    HD._require_backend(solver, exec, grid)
+    nlon, nlat = size(grid)
+    V = zeros(ComplexF64, nlat, nlon)
+    cache = FSH.SpinSphPlanCache{ComplexF64}()
+    FFTW.set_num_threads(HD._library_threads(exec)) do
+        FTB.with_fasttransforms_threads() do
+            C = FSH.spinsph_transform!(V, 1; cache = cache)
+            FSH.spinsph_evaluate!(C, 1; cache = cache)
+            FSH.spinsph_evaluate!(zeros(ComplexF64, nlat, nlon), 0; cache = cache)
+        end
+    end
+    return FSHSpectralState(cache, fill!(V, zero(ComplexF64)))
+end
+
+"""
     _decompose_spectral(solver, geometry, U, grid, execution, state) -> HelmholtzResult
 
-Helmholtz decomposition of a tangent velocity field on the Clenshaw–Curtis grid, by spin-weighted
-quadrature, at the thread count `execution` gives. `U` is component-last carrying `(u_east, u_north)`.
-`S²` is simply connected, so `u_harm` is zero; `χ`, the streamfunction `ψ` (`u_rot = k̂ × ∇ψ`) and
-`∇·u` come from the same coefficients.
+Helmholtz decomposition of a tangent velocity field on the Fejér first-rule grid, by spin-weighted
+quadrature through `state`'s plans. `U` is component-last carrying `(u_east, u_north)`. `S²` is simply
+connected, so `u_harm` is zero; `χ`, the streamfunction `ψ` (`u_rot = k̂ × ∇ψ`) and `∇·u` come from the
+same coefficients.
 """
 function HD._decompose_spectral(
     ::HD.SphericalSpectralSolver,
     ::FG.Geometry.AbstractSphericalGeometry,
-    U::AbstractArray{Float64,3},
-    grid::FG.Grids.StructuredGrid{Float64,<:FG.Geometry.AbstractSphericalGeometry,2},
-    execution, ::Nothing,
-)
+    U::AbstractArray{T,3},
+    grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2},
+    execution, st::FSHSpectralState,
+) where {T<:AbstractFloat}
     nlon, nlat = size(grid)
     R = Float64(FG.Geometry.radius(FG.Grids.grid_geometry(grid)))
     φ = FG.Grids.coordinates(grid, 2)
@@ -258,32 +274,25 @@ function HD._decompose_spectral(
     # `(nlon, nlat)`. The spin-1 field is carried as the complex combination `u_θ + i u_φ`: FSH's
     # `SVector{2,Float64}` spin-1 interface requires the `m = 0` coefficient to be real, which a
     # tangent field with a zonal mean — solid-body rotation — does not satisfy.
-    V = Array{ComplexF64}(undef, nlat, nlon)
+    V = st.V
     @inbounds for i in 1:nlon, j in 1:nlat
         V[_fsh_row(j, nlat, flip), i] = complex(-U[i, j, 2], U[i, j, 1])
     end
 
-    # One cache for both transforms: `spinsph_transform!` and `spinsph_evaluate!` key on `(s, N)`
-    # and share the `spinsph2fourier` plan. The cache plans on first use and this entry point holds no
-    # per-task state, so the whole section runs under FFTW.jl's planner lock — see the note above
-    # `prepare_solver`.
-    cache = FSH.SpinSphPlanCache{ComplexF64}()
-    D, Φ, Δ = FFTW.set_num_threads(HD._library_threads(execution)) do
-        FTB.with_fasttransforms_threads() do
-            C = FSH.spinsph_transform!(V, 1; cache = cache)   # spin-1 coefficients, in place over `V`
-            S = FSH.spinsph_ethbar(C, 1)                      # spin-0 coefficients of ð̄V
-            P, St = _potential_coefficients(S)
-            _invert_and_project!(S)
-            Dv = FSH.spinsph_evaluate!(FSH.spinsph_eth(S, 0), 1; cache = cache)   # ∇χ at the nodes
-            return Dv, FSH.spinsph_evaluate!(P, 0; cache = cache),
-                   FSH.spinsph_evaluate!(St, 0; cache = cache)
-        end
+    cache = st.cache
+    D, Φ, Δ = FTB.with_fasttransforms_threads() do
+        C = FSH.spinsph_transform!(V, 1; cache = cache)   # spin-1 coefficients, in place over `V`
+        S = FSH.spinsph_ethbar(C, 1)                      # spin-0 coefficients of ð̄V
+        P, St = _potential_coefficients(S)
+        _invert_and_project!(S)
+        Dv = FSH.spinsph_evaluate!(FSH.spinsph_eth(S, 0), 1; cache = cache)   # ∇χ at the nodes
+        return Dv, FSH.spinsph_evaluate!(P, 0; cache = cache), FSH.spinsph_evaluate!(St, 0; cache = cache)
     end
 
     u_div = similar(U)
     u_rot = similar(U)
     u_harm = zero(U)
-    χ = Matrix{Float64}(undef, nlon, nlat)
+    χ = Matrix{T}(undef, nlon, nlat)
     ψ = similar(χ)
     δ = similar(χ)
     @inbounds for i in 1:nlon, j in 1:nlat
@@ -297,19 +306,10 @@ function HD._decompose_spectral(
         ψ[i, j] = -R * imag(Φ[row, i])
         δ[i, j] = -real(Δ[row, i]) / R
     end
-    ok = HD.SolverResult{Float64}(true, 1, 0.0)
+    ok = HD.SolverResult{T}(true, 1, zero(T))
     rfrac = HD._measure_ratio(U .- u_rot .- u_div .- u_harm, U, grid)
-    return HD.HelmholtzResult{2,1,Float64,typeof(u_rot),typeof(χ),Tuple{typeof(ψ)}}(
-        u_rot, u_div, u_harm, χ, (ψ,), δ, 0.0, rfrac, ok, (ok,))
+    return HD.HelmholtzResult{2,1,T,typeof(u_rot),typeof(χ),Tuple{typeof(ψ)}}(
+        u_rot, u_div, u_harm, χ, (ψ,), δ, zero(T), rfrac, ok, (ok,))
 end
-
-# FastSphericalHarmonics is built on `Float64`/`ComplexF64`; another element type is refused here
-# with the alternative named, ahead of an assertion from inside the transform.
-HD._decompose_spectral(
-    ::HD.SphericalSpectralSolver, ::FG.Geometry.AbstractSphericalGeometry, U::AbstractArray{T},
-    grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2}, execution, ::Nothing,
-) where {T} = throw(ArgumentError(
-    "FastSphericalHarmonics works in Float64; this grid carries $T. Load `NUFSHT`, whose spin " *
-    "transforms follow the element type, or build the grid in Float64."))
 
 end # module

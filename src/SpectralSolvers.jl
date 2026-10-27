@@ -44,8 +44,9 @@ struct CartesianRealTransformSolver <: AbstractPoissonSolver end
 """
     SphericalSpectralSolver()
 
-Spectral Poisson solver on FastSphericalHarmonics' Clenshaw–Curtis grid
-(`using FastSphericalHarmonics`): forward SHT, divide by `−ℓ(ℓ+1)/R²`, inverse SHT.
+Spectral Poisson solver on FastSphericalHarmonics' Fejér first-rule grid
+(`using FastSphericalHarmonics`): forward SHT, divide by `−ℓ(ℓ+1)/R²`, inverse SHT, computed in
+Float64 whatever the grid's element type.
 """
 struct SphericalSpectralSolver <: AbstractPoissonSolver end
 
@@ -60,9 +61,14 @@ FlowTransformBindings tag, or `AutoSpectralBackend()` for NUFSHT's own choice. N
 under the execution backend of the call, a `GPUBackend`'s device included, given a NUFFT library for
 that device's arrays.
 
-`lmax = nothing` sizes the expansion from the grid: the degree a grid of latitude rings or with a
-sampling recipe represents, and on scattered nodes the largest degree leaving four nodes per
-coefficient, where the fit is well conditioned.
+`lmax = nothing` sizes the expansion from the grid: the band limit of a sampling that ties one to its
+latitude count, one below the latitude count of another rectilinear grid, and elsewhere the largest
+degree leaving four nodes per coefficient, where the fit is well conditioned.
+
+The expansion is over the whole sphere: a field known on part of it does not determine `Δ⁻¹` even
+there. [`AutoSolver`](@ref) takes this solver on a grid whose type shows it covers the sphere
+(`FlowGeometries.Grids.covers_sphere`); named, it takes any spherical node set, the caller stating that
+the nodes cover it.
 
 A degree that outruns the nodes by enough corrupts the split while leaving the fit exact: the
 samples are reproduced, the three parts sum back to the input, and the rotational/divergent share
@@ -84,11 +90,9 @@ SphericalNUSHTSolver(; lmax::Union{Nothing,Int} = nothing, tol::AbstractFloat = 
                      nufft::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend()) =
     SphericalNUSHTSolver(lmax, promote(tol, rtol)..., maxiter, nufft)
 
-library_loaded(::CartesianBoundedSolver) = _extension_loaded(:HelmholtzDecompositionFFTWExt)
-library_loaded(::Union{CartesianSpectralSolver,CartesianRealTransformSolver}) =
-    _extension_loaded(:HelmholtzDecompositionAbstractFFTsExt)
-library_loaded(::SphericalSpectralSolver) = _extension_loaded(:HelmholtzDecompositionFSHExt)
-library_loaded(::SphericalNUSHTSolver) = _extension_loaded(:HelmholtzDecompositionNUFSHTExt)
+# `true` from the extension of the library each transforms with.
+library_loaded(::Union{CartesianSpectralSolver,CartesianBoundedSolver,CartesianRealTransformSolver,
+                       SphericalSpectralSolver,SphericalNUSHTSolver}) = false
 
 _unavailable_message(::CartesianBoundedSolver) =
     "CartesianBoundedSolver transforms with FFTW; run `using FFTW`."
@@ -118,6 +122,8 @@ has_spectral_route(::Union{CartesianSpectralSolver,CartesianNUFFTSolver,Spherica
 
 const _SphericalTransform = Union{SphericalSpectralSolver,SphericalNUSHTSolver}
 preconditions(::_SphericalTransform) = true
+# A spherical transform reads a grid's nodes on the sphere; which node sets each takes is its extension's.
+sampling_known(::_SphericalTransform, grid) = false
 # FastSphericalHarmonics and FFTW's real-to-real transforms hold their state in host memory.
 supports_backend(::Union{SphericalSpectralSolver,CartesianBoundedSolver}, backend, grid) =
     backend isa _HostBackend

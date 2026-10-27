@@ -1,7 +1,7 @@
 # Spherical Poisson solves and the spectral decomposition through NUFSHT, on any node set covering the
 # sphere: analysis, divide by `−ℓ(ℓ+1)/R²`, synthesis. The analysis is the least-squares fit
 # `NUFSHT.nusht_solve!`, each node weighted by its cell's measure, the inverse of synthesis at any node
-# set; `nusht_type1!` is its adjoint, the inverse only on the Clenshaw–Curtis grid. Plans are built under
+# set; `nusht_type1!` is its adjoint, the inverse only on the Fejér first-rule grid. Plans are built under
 # the `execution` each call is given, so a `GPUBackend` puts their nodes and buffers in its memory; every
 # array here is allocated from the plans' memory and the coefficient-space steps are broadcasts.
 module HelmholtzDecompositionNUFSHTExt
@@ -15,80 +15,45 @@ using NUFSHT: NUFSHT
 """
     _resolve_lmax(solver, grid) -> Int
 
-The expansion degree for `grid`, when the solver was built without one.
-
-A grid with a sampling recipe or a product of latitude rings takes the degree its nodes represent,
-which `FlowGeometries` answers from the recipe where the grid carries one and from the latitude count
-otherwise, within `(lmax+1)² ≤ M`. Scattered nodes take the largest degree leaving four nodes per
-coefficient, `(lmax+1)² ≤ M/4`: for `M` random nodes and `n` coefficients the fit's matrix has
-condition number near `(1 + √(n/M)) / (1 − √(n/M))` (Marchenko–Pastur), 3 at a quarter, and
+The expansion degree for `grid`, when the solver was built without one, within `(lmax+1)² ≤ M` for `M`
+nodes: the band limit of a sampling that ties one to its latitude count (`has_bandlimit`), one below
+the latitude count of another rectilinear grid, and on any other layout the largest degree leaving four
+nodes per coefficient, `(lmax+1)² ≤ M/4`. For `M` random nodes and `n` coefficients the fit's matrix
+has condition number near `(1 + √(n/M)) / (1 − √(n/M))` (Marchenko–Pastur), 3 at a quarter, and
 unbounded as `n` approaches `M`.
 """
 function _resolve_lmax(solver::HD.SphericalNUSHTSolver, grid)
     solver.lmax === nothing || return solver.lmax
-    npoints = length(FG.Grids.mask(grid))
-    s = FG.Grids.sampling(grid)
-    s === nothing && ndims(grid) == 1 && return max(1, isqrt(npoints ÷ 4) - 1)
-    nlat = ndims(grid) == 2 ? size(grid, 2) : npoints
-    from_sampling = s === nothing ? nlat - 1 : FG.SphericalSampling.bandlimit(s, nlat)
-    return max(1, min(isqrt(npoints) - 1, from_sampling))
+    M = length(FG.Grids.mask(grid))
+    return max(1, min(isqrt(M) - 1, _grid_degree(FG.Grids.sampling(grid), grid, M)))
 end
+
+_grid_degree(s::FG.SphericalSampling.AbstractSphericalSampling, grid, M::Int) =
+    FG.SphericalSampling.has_bandlimit(s) ? FG.SphericalSampling.bandlimit(s, _latitude_count(grid)) :
+    _grid_degree(nothing, grid, M)
+_grid_degree(::Nothing, grid::FG.Grids.StructuredGrid, M::Int) = size(grid, 2) - 1
+_grid_degree(::Nothing, grid, M::Int) = isqrt(M ÷ 4) - 1
+
+_latitude_count(grid::FG.Grids.StructuredGrid) = size(grid, 2)
+_latitude_count(grid::FG.Grids.RingGrid) = FG.Grids.nrings(grid)
 
 # The expansion is in spherical harmonics over the whole sphere, so the samples must cover it and
 # none may be masked out; a covering set has no boundary, making a boundary condition vacuous.
 HD.supports_boundary(::HD.SphericalNUSHTSolver, ::FG.Operators.AbstractBoundaryCondition) = true
 HD.requires_full_domain(::HD.SphericalNUSHTSolver) = true
 
-"""
-    _covers_sphere(grid) -> Bool
+# Named, the solver takes any spherical node set, the caller stating that it covers the sphere;
+# `AutoSolver` takes it where the grid's type shows that it does.
+HD.library_loaded(::HD.SphericalNUSHTSolver) = true
+HD.supports_sampling(::HD.SphericalNUSHTSolver, grid) = false
+HD.supports_sampling(::HD.SphericalNUSHTSolver, ::FG.Grids.AbstractGrid{<:FG.Geometry.AbstractSphericalGeometry}) = true
+HD.sampling_known(::HD.SphericalNUSHTSolver, grid) = false
+HD.sampling_known(::HD.SphericalNUSHTSolver, grid::FG.Grids.AbstractGrid{<:FG.Geometry.AbstractSphericalGeometry}) =
+    FG.Grids.covers_sphere(grid)
 
-Whether `grid`'s nodes cover `S²`, which a fit in spherical harmonics needs: a field known on part of
-the sphere does not determine `Δ⁻¹` of it even there, and the fit's coefficients are ill-conditioned off
-the sampled region (the Slepian concentration problem).
-
-A rectilinear grid covers it when longitude wraps and each pole lies within one and a half spacings of
-its two outermost latitudes. A cell-centred grid sits about half a spacing from the pole and the dual
-grid of one about a whole spacing, each half a spacing inside the bound, on a stretched axis too. Any
-other layout tiles the sphere with its cells, and covers it when their total measure is `4πR²`.
-"""
-_covers_sphere(grid) = false
-
-function _covers_sphere(
-    grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2},
-) where {T}
-    FG.Grids.isperiodic(grid, 1) || return false
-    φ = FG.Grids.coordinates(grid, 2)
-    n = length(φ)
-    n >= 2 || return false
-    # The southmost and northmost latitudes with their inward neighbours, whichever way the axis runs.
-    south, south2, north2, north = T(φ[1]), T(φ[2]), T(φ[n - 1]), T(φ[n])
-    south > north && ((south, south2, north2, north) = (north, north2, south2, south))
-    half = T(π) / 2
-    return south + half <= 3 * (south2 - south) / 2 && half - north <= 3 * (north - north2) / 2
-end
-
-function _covers_sphere(
-    grid::FG.Grids.AbstractGrid{<:FG.Geometry.AbstractSphericalGeometry,T},
-) where {T}
-    R = T(FG.Geometry.radius(FG.Grids.grid_geometry(grid)))
-    return isapprox(T(sum(FG.Grids.measure(grid))), 4 * T(π) * R^2; rtol = sqrt(eps(T)))
-end
-
-HD.supports_sampling(::HD.SphericalNUSHTSolver, grid) = _covers_sphere(grid)
-
-function HD._sampling_message(::HD.SphericalNUSHTSolver, grid)
-    detail = if grid isa FG.Grids.StructuredGrid && ndims(grid) == 2
-        lo, hi = extrema(FG.Grids.coordinates(grid, 2))
-        "longitude wraps: $(FG.Grids.isperiodic(grid, 1)); latitude spans " *
-        "$(round(lo; digits = 3))…$(round(hi; digits = 3)) of ±π/2"
-    else
-        string(nameof(typeof(grid)))
-    end
-    return "SphericalNUSHTSolver expands in spherical harmonics over the whole sphere, and these " *
-           "nodes do not cover it ($detail). Analysis integrates over S² and the inverse Laplacian " *
-           "there is nonlocal, so a regional patch does not determine the solution even on the " *
-           "patch. Solve a patch as a boundary value problem with the iterative solver."
-end
+HD._sampling_message(::HD.SphericalNUSHTSolver, grid) =
+    "SphericalNUSHTSolver expands in spherical harmonics and takes a spherical grid; this grid is " *
+    "$(nameof(typeof(grid)))."
 
 """
     _spherical_nodes(grid) -> (θ, λ)
@@ -211,7 +176,7 @@ end
 # `grid` is in the memory `execution` allocates, as a plan's own grid is, so its measure broadcasts into
 # the plan's.
 function HD.prepare_solver(solver::HD.SphericalNUSHTSolver,
-                           grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2},
+                           grid::FG.Grids.AbstractGrid{<:FG.Geometry.AbstractSphericalGeometry,T},
                            ::FG.Operators.AbstractBoundaryCondition;
                            execution = CB.SerialBackend(), shared = nothing) where {T}
     lmax = _resolve_lmax(solver, grid)
@@ -232,9 +197,9 @@ function HD.prepare_solver(solver::HD.SphericalNUSHTSolver,
 end
 
 function HD.solve_poisson!(
-    Φ::AbstractMatrix{T},
-    RHS::AbstractMatrix{T},
-    grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2},
+    Φ::AbstractArray{T},
+    RHS::AbstractArray{T},
+    grid::FG.Grids.AbstractGrid{<:FG.Geometry.AbstractSphericalGeometry,T},
     solver::HD.SphericalNUSHTSolver;
     boundary::FG.Operators.AbstractBoundaryCondition = FG.Operators.Neumann(),
     state::SphericalNUSHTState = HD.prepare_solver(solver, grid, boundary),
@@ -245,8 +210,8 @@ function HD.solve_poisson!(
 end
 
 function HD.spectral_inverse!(
-    Φ::AbstractMatrix{T}, RHS::AbstractMatrix{T},
-    grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2},
+    Φ::AbstractArray{T}, RHS::AbstractArray{T},
+    grid::FG.Grids.AbstractGrid{<:FG.Geometry.AbstractSphericalGeometry,T},
     solver::HD.SphericalNUSHTSolver, state::SphericalNUSHTState,
 ) where {T<:AbstractFloat}
     _inverse!(Φ, RHS, solver, state)
@@ -280,11 +245,49 @@ end
 # over the full complex coefficient array: the plans carry a complex element type.
 
 """
-    _spin_hodge(solver, planp, plan0, U, grid, lmax, R) -> HelmholtzResult
+    NUSHTSpectralState
 
-The decomposition of `U`, component-last `(u_east, u_north)` over `grid`'s nodes, through the spin-1 plan
-`planp` and the spin-0 plan `plan0` of those nodes, in the plans' memory: `U` is staged there whole and
-every part comes back there. The fit weights each node by its cell's measure.
+What the spin-weighted decomposition reuses on one spherical node set: the spin-1 and spin-0 plans of its
+nodes, built under the backend of the call, the expansion degree, the radius, and each node's measure in
+the plans' memory. One per task; [`close!`](@ref HelmholtzDecomposition.close!) releases the plans.
+"""
+struct NUSHTSpectralState{T,PP,P0,W}
+    planp::PP
+    plan0::P0
+    w::W
+    lmax::Int
+    R::T
+end
+
+HD.close!(s::NUSHTSpectralState) = (NUFSHT.close!(s.planp); NUFSHT.close!(s.plan0); s)
+
+function HD.prepare_spectral(solver::HD.SphericalNUSHTSolver,
+                             grid::FG.Grids.AbstractGrid{<:FG.Geometry.AbstractSphericalGeometry,T};
+                             execution = CB.AutoBackend()) where {T}
+    exec = HD.resolve_execution_backend(execution)
+    θ, Λ = _spherical_nodes(grid)
+    lmax = _resolve_lmax(solver, grid)
+    _warn_underdetermined(lmax, length(θ), 1)
+    R = T(FG.Geometry.radius(FG.Grids.grid_geometry(grid)))
+    plan(s) = NUFSHT.make_spin_plan(Complex{T}, θ, Λ, lmax, s; tol = solver.tol, nufft = solver.nufft,
+                                    execution = exec)
+    planp = plan(+1)
+    plan0 = try
+        plan(0)
+    catch
+        NUFSHT.close!(planp)
+        rethrow()
+    end
+    w = copyto!(similar(NUFSHT.allocate_coefficients(planp), T, size(grid)...), Array{T}(FG.Grids.measure(grid)))
+    return NUSHTSpectralState(planp, plan0, w, lmax, R)
+end
+
+"""
+    _spin_hodge(solver, state, U, grid) -> HelmholtzResult
+
+The decomposition of `U`, component-last `(u_east, u_north)` over `grid`'s nodes, through `state`'s spin-1
+and spin-0 plans of those nodes, in the plans' memory: `U` is staged there whole and every part comes back
+there. The fit weights each node by its cell's measure.
 
 With `ₛY_ℓm = N_ℓ d^ℓ_{m,−s}(θ) e^{imφ}` (NUFSHT's convention) and the Wigner-d derivative relations,
 `∇Y_ℓm` has `u_θ + i u_φ = L ₁Y_ℓm` and `u_θ − i u_φ = −L ₋₁Y_ℓm`, `L = √(ℓ(ℓ+1))`; `k̂ × ∇` multiplies
@@ -296,8 +299,8 @@ one, `χ + iψ = R ₊a/L`, and `∇·u = −L·(₊a − ₋a)/(2R)` per mode.
 `₋a_{ℓm} = (−1)^{m+1} conj(₊a_{ℓ,−m})`: one fit gives both. Each part's coefficients obey the same
 relation, so its spin −1 field is the conjugate of its spin 1 field and `(u_θ, u_φ) = (Re V, Im V)`.
 """
-function _spin_hodge(solver::HD.SphericalNUSHTSolver, planp, plan0, U::AbstractArray{T}, grid, lmax::Int,
-                     R::T) where {T}
+function _spin_hodge(solver::HD.SphericalNUSHTSolver, st::NUSHTSpectralState{T}, U::AbstractArray{T}, grid) where {T}
+    planp, plan0, w, lmax, R = st.planp, st.plan0, st.w, st.lmax, st.R
     CT = Complex{T}
     sz = size(grid)
     M = prod(sz)
@@ -306,11 +309,10 @@ function _spin_hodge(solver::HD.SphericalNUSHTSolver, planp, plan0, U::AbstractA
     mem = NUFSHT.allocate_coefficients(planp)
 
     # `U` in the plans' memory, `(u_east, u_north)` as two columns; with `θ̂` south and `φ̂` east,
-    # `V = u_θ + i u_φ = −u_north + i u_east`. `w` holds the cells' measures.
+    # `V = u_θ + i u_φ = −u_north + i u_east`.
     stage = copyto!(similar(mem, T, M, 2), U)
     V = similar(mem, CT, M)
     V .= complex.(.-view(stage, :, 2), view(stage, :, 1))
-    w = copyto!(similar(mem, T, sz...), Array{T}(FG.Grids.measure(grid)))
 
     ap = fill!(similar(mem, CT, lmax + 1, 2lmax + 1), zero(CT))
     _, iters, resid, ok = NUFSHT.nusht_solve_spin!(ap, V, planp; weights = vec(w), rtol = solver.rtol,
@@ -357,35 +359,14 @@ end
 """
     _decompose_spectral(solver, geometry, U, grid, execution, state) -> HelmholtzResult
 
-Helmholtz decomposition of a tangent velocity field on any spherical node set, on `execution`: the spin
-plans are built under it and released on return, and the parts come back in their memory. `U` is
-component-last carrying `(u_east, u_north)`, and the parts come back in that layout. `S²` is simply
-connected, so `u_harm` is zero; the fit's residual at the nodes is `residual_fraction`.
+Helmholtz decomposition of a tangent velocity field on any spherical node set, through `state`'s plans; the
+parts come back in their memory. `U` is component-last carrying `(u_east, u_north)`, and the parts come
+back in that layout. `S²` is simply connected, so `u_harm` is zero; the fit's residual at the nodes is
+`residual_fraction`.
 """
-function HD._decompose_spectral(
-    solver::HD.SphericalNUSHTSolver,
-    ::FG.Geometry.AbstractSphericalGeometry,
-    U::AbstractArray{T},
-    grid::FG.Grids.AbstractGrid{<:FG.Geometry.AbstractSphericalGeometry,T},
-    execution, ::Nothing,
-) where {T}
-    θ, Λ = _spherical_nodes(grid)
-    lmax = _resolve_lmax(solver, grid)
-    _warn_underdetermined(lmax, length(θ), 1)
-    R = T(FG.Geometry.radius(FG.Grids.grid_geometry(grid)))
-    plan(s) = NUFSHT.make_spin_plan(Complex{T}, θ, Λ, lmax, s; tol = solver.tol, nufft = solver.nufft,
-                                    execution = execution)
-    planp = plan(+1)
-    try
-        plan0 = plan(0)
-        try
-            return _spin_hodge(solver, planp, plan0, U, grid, lmax, R)
-        finally
-            NUFSHT.close!(plan0)
-        end
-    finally
-        NUFSHT.close!(planp)
-    end
-end
+HD._decompose_spectral(solver::HD.SphericalNUSHTSolver, ::FG.Geometry.AbstractSphericalGeometry, U::AbstractArray{T},
+                       grid::FG.Grids.AbstractGrid{<:FG.Geometry.AbstractSphericalGeometry,T}, execution,
+                       st::NUSHTSpectralState) where {T} =
+    _spin_hodge(solver, st, U, grid)
 
 end # module

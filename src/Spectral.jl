@@ -74,31 +74,42 @@ three sum to `velocity_hat`.
 function helmholtz_project_spectral!(û_rot, û_div, û_harm, velocity_hat, ks::NTuple{N,Any}) where {N}
     T = real(eltype(velocity_hat))
     K = _derivative_symbol(velocity_hat, T, ks)
-
-    k2 = K[1] .^ 2
-    for d in 2:N
-        k2 = k2 .+ K[d] .^ 2
-    end
-    inv_k2 = @. ifelse(k2 == zero(T), zero(T), one(T) / k2)
-
+    k2 = lazy_axis_sum(map(k -> k .^ 2, K))
     comp(A, c) = _component(A, c, Val(N))
 
-    # k·û  (sum over components, broadcast over the spectral grid).
-    kdotu = K[1] .* comp(velocity_hat, 1)
-    for b in 2:N
-        kdotu = kdotu .+ K[b] .* comp(velocity_hat, b)
-    end
-
+    # `k·û` in the last harmonic component, which is written after every divergent one is.
+    kdotu = comp(û_harm, N)
+    kdotu .= _k_dot(K, velocity_hat, Val(N))
     for a in 1:N
-        ûa = comp(velocity_hat, a)
-        diva = comp(û_div, a)
-        rota = comp(û_rot, a)
-        harma = comp(û_harm, a)
-        @. diva = K[a] * kdotu * inv_k2
-        _harmonic!(harma, ûa, ks, k2)
-        @. rota = ûa - diva - harma
+        comp(û_div, a) .= K[a] .* kdotu .* _inverse_k2.(k2)
+    end
+    for a in 1:N
+        _harmonic!(comp(û_harm, a), comp(velocity_hat, a), ks, k2)
+        comp(û_rot, a) .= comp(velocity_hat, a) .- comp(û_div, a) .- comp(û_harm, a)
     end
     return nothing
+end
+
+# `1/k²`, zero where `k² = 0`.
+@inline _inverse_k2(x::T) where {T} = iszero(x) ? zero(T) : one(T) / x
+
+# `k·û` over the components of a component-last spectral array, unmaterialized.
+_k_dot(K::NTuple{N,Any}, vh, ::Val{N}) where {N} =
+    lazy_axis_sum(ntuple(b -> Broadcast.broadcasted(*, K[b], _component(vh, b, Val(N))), Val(N)))
+
+# `χ̂ = −i (k·û)/k²`, the `P` rotation-potential spectra `−i (k_a û_b − k_b û_a)/k²` and the divergence
+# `i k·û` of the component-last spectral velocity `vh`, into the `P + 2` slices of `S` along its last axis.
+function _scalar_spectra!(S, vh, K::NTuple{N,Any}, ::Val{N}) where {N}
+    k2 = lazy_axis_sum(map(k -> k .^ 2, K))
+    kdotu = _k_dot(K, vh, Val(N))
+    comp(A, c) = _component(A, c, Val(N))
+    selectdim(S, N + 1, 1) .= -im .* kdotu .* _inverse_k2.(k2)
+    pairs = FlowGeometries.Operators.rotation_pairs(Val(N))
+    for (p, (a, b)) in enumerate(pairs)
+        selectdim(S, N + 1, 1 + p) .= -im .* (K[a] .* comp(vh, b) .- K[b] .* comp(vh, a)) .* _inverse_k2.(k2)
+    end
+    selectdim(S, N + 1, length(pairs) + 2) .= im .* kdotu
+    return S
 end
 
 """
@@ -114,36 +125,29 @@ function helmholtz_potentials_spectral(velocity_hat::AbstractArray, ks::NTuple{N
     T = real(eltype(velocity_hat))
     CT = Complex{T}
     K = _derivative_symbol(velocity_hat, T, ks)
-    k2 = K[1] .^ 2
-    for d in 2:N
-        k2 = k2 .+ K[d] .^ 2
-    end
-    inv_k2 = @. ifelse(k2 == zero(T), zero(T), one(T) / k2)
+    k2 = lazy_axis_sum(map(k -> k .^ 2, K))
     comp(A, c) = _component(A, c, Val(N))
 
-    kdotu = K[1] .* comp(velocity_hat, 1)
-    for b in 2:N
-        kdotu = kdotu .+ K[b] .* comp(velocity_hat, b)
-    end
-    χ_hat = @. -im * kdotu * inv_k2
+    kdims = ntuple(d -> size(velocity_hat, d), Val(N))
+    χ_hat = similar(velocity_hat, CT, kdims)
+    χ_hat .= -im .* _k_dot(K, velocity_hat, Val(N)) .* _inverse_k2.(k2)
 
-    kdims = size(velocity_hat)[1:N]
     P = FlowGeometries.Operators.n_rotation_components(N)
     R_hat = similar(velocity_hat, CT, (kdims..., P))
     pairs = FlowGeometries.Operators.rotation_pairs(Val(N))
     for (p, (a, b)) in enumerate(pairs)
-        ûa = comp(velocity_hat, a)
-        ûb = comp(velocity_hat, b)
-        Rp = comp(R_hat, p)
-        @. Rp = -im * (K[a] * ûb - K[b] * ûa) * inv_k2
+        comp(R_hat, p) .= -im .* (K[a] .* comp(velocity_hat, b) .- K[b] .* comp(velocity_hat, a)) .*
+                          _inverse_k2.(k2)
     end
     return χ_hat, R_hat
 end
 
 """
     helmholtz_project_spectral(velocity_hat, ks::NTuple) -> SpectralCartesianResult
+    helmholtz_project_spectral(E, velocity_hat, grid) -> SpectralCartesianResult
 
-Allocating Leray projection from a component-last spectral array.
+Allocating Leray projection from a component-last spectral array. The grid form takes the wavenumbers
+of `grid` for a field of element type `E`: a real field's coefficients are the `rfft` half along axis 1.
 """
 function helmholtz_project_spectral(velocity_hat::AbstractArray, ks::NTuple{N,Any}) where {N}
     û_rot = similar(velocity_hat)
@@ -154,25 +158,24 @@ function helmholtz_project_spectral(velocity_hat::AbstractArray, ks::NTuple{N,An
 end
 
 # 2-D convenience: separate (u_hat, v_hat) with explicit wavenumber vectors.
-function helmholtz_project_spectral(u_hat::AbstractMatrix, v_hat::AbstractMatrix, kx::AbstractVector, ky::AbstractVector; kwargs...)
-    velocity_hat = _stack_spectral(u_hat, v_hat)
-    return helmholtz_project_spectral(velocity_hat, (kx, ky))
-end
+helmholtz_project_spectral(u_hat::AbstractMatrix, v_hat::AbstractMatrix, kx::AbstractVector, ky::AbstractVector) =
+    helmholtz_project_spectral(_stack_spectral(u_hat, v_hat), (kx, ky))
 
-# Convenience: separate component arrays + grid (builds wavenumbers from the grid).
-function helmholtz_project_spectral(velocity_hat::AbstractArray, grid::FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,N}; kwargs...) where {T,N}
-    ks = _grid_wavenumbers(velocity_hat, grid)
+function helmholtz_project_spectral(::Type{E}, velocity_hat::AbstractArray,
+        grid::FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,N}) where {E<:Number,T,N}
+    ks = _grid_wavenumbers(E, grid)
+    size(velocity_hat) == (map(length, ks)..., N) || throw(DimensionMismatch(
+        "velocity_hat is $(size(velocity_hat)); a $E field on this grid has coefficients $((map(length, ks)..., N))"))
     return helmholtz_project_spectral(velocity_hat, ks)
 end
 
-function helmholtz_project_spectral(u_hat::AbstractMatrix, v_hat::AbstractMatrix, grid::FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,2}; kwargs...) where {T}
-    velocity_hat = _stack_spectral(u_hat, v_hat)
-    return helmholtz_project_spectral(velocity_hat, grid)
-end
+helmholtz_project_spectral(::Type{E}, u_hat::AbstractMatrix, v_hat::AbstractMatrix,
+        grid::FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,2}) where {E<:Number,T} =
+    helmholtz_project_spectral(E, _stack_spectral(u_hat, v_hat), grid)
 
 function _stack_spectral(comps::Vararg{AbstractArray{<:Complex},M}) where {M}
     sz = size(comps[1])
-    out = Array{eltype(comps[1])}(undef, sz..., M)
+    out = similar(comps[1], (sz..., M))
     N = length(sz)
     for c in 1:M
         copyto!(_component(out, c, Val(N)), comps[c])
@@ -181,18 +184,14 @@ function _stack_spectral(comps::Vararg{AbstractArray{<:Complex},M}) where {M}
 end
 
 """
-    _grid_wavenumbers(velocity_hat, grid) -> NTuple{N}
+    _grid_wavenumbers(E, grid) -> NTuple{N}
 
-The FlowTransformBindings wavenumber axes of a component-last spectral array on a Cartesian grid:
-axis 1 halved (`rfft`) when its spectral length is `N₁÷2 + 1`, every axis full otherwise.
+The FlowTransformBindings wavenumber axes of a field of element type `E` on a Cartesian grid: axis 1
+halved (`rfft`) for a real field, every axis full for a complex one.
 """
-function _grid_wavenumbers(velocity_hat::AbstractArray{<:Complex}, grid::FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,N}) where {N,T}
-    dims = size(grid)
-    Ls = ntuple(d -> T(FlowGeometries.Grids.domain_length(grid, d)), Val(N))
-    return size(velocity_hat, 1) == dims[1] ÷ 2 + 1 ?
-           FlowTransformBindings.wavenumber_axes(Ls, dims, Val(true)) :
-           FlowTransformBindings.wavenumber_axes(Ls, dims, Val(false))
-end
+_grid_wavenumbers(::Type{E}, grid::FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,N}) where {E,T,N} =
+    FlowTransformBindings.wavenumber_axes(E, ntuple(d -> T(FlowGeometries.Grids.domain_length(grid, d)), Val(N)),
+                                          size(grid))
 
 # ---------------------------------------------------------------------------
 # Unified physical-input entry points and geometry dispatch
@@ -205,15 +204,16 @@ end
 
 Decompose a velocity field on `grid` with a spectral transform into a [`HelmholtzResult`](@ref): the
 FFT on a periodic uniform Cartesian grid, the NUFFT fit on a Cartesian point cloud,
-FastSphericalHarmonics on a Clenshaw–Curtis sphere, NUFSHT on any node set covering the sphere.
+FastSphericalHarmonics on its Fejér first-rule sphere, NUFSHT on any node set covering the sphere.
 
 `solver` names the transform, its library loaded by the caller; `AutoSolver()` takes the first of
 [`_spectral_candidates`](@ref) that applies under `execution`. A host `execution` sets the libraries'
 thread count. A `GPUBackend` moves `u` to its device and returns the parts there, which the periodic
 FFT and NUFSHT routes support; the scattered fit and FastSphericalHarmonics hold host state. `state` is
-a `CartesianNUFFTSolver`'s [`prepare_solver`](@ref) state of the point set, reused across calls and
-released with [`close!`](@ref). A fit stopped short of its tolerance returns with its convergence in
-`χ_solve`; [`helmholtz_project_spectral`](@ref) projects raw coefficients.
+the solver's [`prepare_spectral`](@ref) state for `grid`, reused across calls and released with
+[`close!`](@ref); without one, a state is built for the call and released on return. A fit stopped
+short of its tolerance returns with its convergence in `χ_solve`; [`helmholtz_project_spectral`](@ref)
+projects raw coefficients.
 """
 function helmholtz_decompose_spectral(
     u::AbstractArray, grid::FlowGeometries.Grids.AbstractGrid;
@@ -233,19 +233,34 @@ helmholtz_decompose_spectral(u::AbstractArray{<:Any,N}, v::AbstractArray{<:Any,N
     helmholtz_decompose_spectral(_stack_components(grid, u, v, w), grid; kwargs...)
 
 """
+    prepare_spectral(solver, grid; execution = AutoBackend()) -> state
+
+What [`helmholtz_decompose_spectral`](@ref) with `solver` reuses across fields on `grid`: the transform
+plans and the buffers one decomposition writes, built under `execution`. One per task; [`close!`](@ref)
+releases the foreign plans it holds.
+"""
+function prepare_spectral end
+
+"""
     _spectral_dispatch(u, grid, solver, execution, state)
 
 Resolve a solver with a spectral route ([`_spectral_candidates`](@ref) under `AutoSolver`) that runs
 under `execution`, and dispatch to its extension's `_decompose_spectral(solver, geometry, u, grid,
-execution, state)`, which places `u` in the memory its transforms run in.
+execution, state)`, which places `u` in the memory its transforms run in. Without a `state`, one is built
+for the call and released on return.
 """
 function _spectral_dispatch(u::AbstractArray, grid::FlowGeometries.Grids.AbstractGrid,
                             solver::AbstractPoissonSolver, execution, state)
     exec = resolve_execution_backend(execution)
     s = _resolve_spectral_solver(grid, solver, exec)
-    state === nothing || s isa CartesianNUFFTSolver || throw(ArgumentError(
-        "`state` holds a CartesianNUFFTSolver's plan of a point set; $(nameof(typeof(s))) takes none."))
-    return _decompose_spectral(s, FlowGeometries.Grids.grid_geometry(grid), u, grid, exec, state)
+    geom = FlowGeometries.Grids.grid_geometry(grid)
+    state === nothing || return _decompose_spectral(s, geom, u, grid, exec, state)
+    st = prepare_spectral(s, grid; execution = exec)
+    try
+        return _decompose_spectral(s, geom, u, grid, exec, st)
+    finally
+        close!(st)
+    end
 end
 
 function _resolve_spectral_solver(grid::FlowGeometries.Grids.AbstractGrid, solver::AbstractPoissonSolver,
@@ -256,7 +271,7 @@ function _resolve_spectral_solver(grid::FlowGeometries.Grids.AbstractGrid, solve
         "helmholtz_decompose_spectral found no spectral solver for this grid under " *
         "$(nameof(typeof(execution))). Load one that applies (an FFT library for the array for a " *
         "periodic uniform Cartesian grid, `NonuniformFFTs` or `FINUFFT` for scattered Cartesian " *
-        "samples, `FastSphericalHarmonics` for a Clenshaw–Curtis sphere, `NUFSHT` for an arbitrary " *
+        "samples, `FastSphericalHarmonics` for a Fejér first-rule sphere, `NUFSHT` for an arbitrary " *
         "covering sphere, the last three on a host backend), or call `helmholtz_decompose`."))
     has_spectral_route(s) || throw(ArgumentError(
         "$(nameof(typeof(s))) has no spectral decomposition route; pass it to `helmholtz_decompose`, " *
@@ -268,12 +283,8 @@ function _resolve_spectral_solver(grid::FlowGeometries.Grids.AbstractGrid, solve
     return s
 end
 
-function _auto_spectral_solver(grid::FlowGeometries.Grids.AbstractGrid, execution)
-    for candidate in _spectral_candidates(grid)
-        _applicable(candidate, grid, FlowGeometries.Operators.Neumann(), execution) && return candidate
-    end
-    return nothing
-end
+_auto_spectral_solver(grid::FlowGeometries.Grids.AbstractGrid, execution) =
+    _first_applicable(_spectral_candidates(grid), grid, FlowGeometries.Operators.Neumann(), execution, nothing)
 
 # Hook implemented by spectral extensions: dispatch on the solver type.
 function _decompose_spectral end

@@ -18,7 +18,7 @@ nrm(a) = sqrt(sum(abs2, a))
 Test.@testset "spectral path against closed forms" begin
     n = 16
     xr = range(0.0, 1.0 - 1 / n; length = n)
-    grid = FG.Grids.StructuredGrid(CARTA, xr, xr; topology = (true, true), period = (1.0, 1.0))
+    grid = FG.Grids.StructuredGrid(CARTA, xr, xr; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (1.0, 1.0))
     k = 2π
     f = [sin(k * x) * sin(k * y) for x in xr, y in xr]
     fx = [k * cos(k * x) * sin(k * y) for x in xr, y in xr]
@@ -31,11 +31,15 @@ Test.@testset "spectral path against closed forms" begin
     r = HD.helmholtz_decompose_spectral(cat(-fy, fx; dims = 3), grid)
     Test.@test nrm(r.u_div) / nrm(f) < 1e-12
     Test.@test maximum(abs, HD.streamfunction(r) .- f) < 1e-12
+    # A held state gives the one-shot result.
+    st = HD.prepare_spectral(HD.CartesianSpectralSolver(), grid)
+    held = HD.helmholtz_decompose_spectral(cat(fx, fy; dims = 3), grid; solver = HD.CartesianSpectralSolver(), state = st)
+    Test.@test held.χ == g.χ && held.u_div == g.u_div
 
     # The ABC flow is Beltrami, `∇ × u = u`, so its divergence-free vector potential is `A = u`.
     m = 8
     x3 = range(0.0, 2π - 2π / m; length = m)
-    g3 = FG.Grids.StructuredGrid(CARTA, x3, x3, x3; topology = (true, true, true), period = (2π, 2π, 2π))
+    g3 = FG.Grids.StructuredGrid(CARTA, x3, x3, x3; topology = ntuple(_ -> FG.Grids.Periodic(), 3), period = (2π, 2π, 2π))
     U = zeros(m, m, m, 3)
     for (k3, z) in enumerate(x3), (j, y) in enumerate(x3), (i, x) in enumerate(x3)
         U[i, j, k3, :] .= (sin(z) + cos(y), sin(x) + cos(z), sin(y) + cos(x))
@@ -56,10 +60,10 @@ Test.@testset "spectral path at the Nyquist slots" begin
         N = length(dims)
         Ls = ntuple(d -> 1.0 + d / 4, N)
         xs = ntuple(d -> range(0.0, Ls[d] - Ls[d] / dims[d]; length = dims[d]), N)
-        grid = FG.Grids.StructuredGrid(CARTA, xs...; topology = ntuple(_ -> true, N), period = Ls)
+        grid = FG.Grids.StructuredGrid(CARTA, xs...; topology = ntuple(_ -> FG.Grids.Periodic(), N), period = Ls)
         U = randn(rng, dims..., N)
         res = HD.helmholtz_decompose_spectral(U, grid)
-        K = FTB.wavenumber_arrays(zeros(dims), Float64, FTB.wavenumber_axes(Ls, dims, Val(false)); derivative = true)
+        K = FTB.wavenumber_arrays(zeros(dims), Float64, FTB.wavenumber_axes(ComplexF64, Ls, dims); derivative = true)
         comp(A, c) = selectdim(A, N + 1, c)
         ûr = [FFTW.fft(comp(res.u_rot, c)) for c in 1:N]
         ûd = [FFTW.fft(comp(res.u_div, c)) for c in 1:N]

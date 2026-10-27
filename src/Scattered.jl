@@ -103,6 +103,7 @@ supports_sampling(::CartesianNUFFTSolver, grid) = false
 supports_sampling(::CartesianNUFFTSolver{L,D},
                   ::_CartesianCloud{T,D}) where {L<:SpectralBackends.AbstractSpectralBackend,D,T} =
     true
+sampling_known(s::CartesianNUFFTSolver, grid) = supports_sampling(s, grid)
 
 _sampling_message(::CartesianNUFFTSolver{L,D}, grid) where {L,D} =
     "CartesianNUFFTSolver expands a cloud of $D-dimensional samples and takes an " *
@@ -193,14 +194,13 @@ them once: the sizes depend on the node count and the mode count, and on nothing
 between calls.
 """
 struct CGBuffers{A,S,V,L}
-    b::A
     r::A
     d::A
     Ap::A
     scratch::S
-    # `b − A F` in point space, carried alongside the mode-space residual. `A d` is already formed
-    # each iteration, so this follows by one axpy and costs no transform. It is what the
-    # discrepancy principle tests, and the mode-space residual cannot answer that.
+    # `b − A F` in point space, carried alongside the mode-space residual where the discrepancy principle
+    # is tested (`atol > 0`), and empty otherwise. `A d` is already formed each iteration, so this follows
+    # by one axpy and costs no transform; the mode-space residual cannot answer that test.
     rpt::S
     # A point-space vector times the node weights, which the adjoint is applied to.
     wpt::S
@@ -214,12 +214,12 @@ struct CGBuffers{A,S,V,L}
     lanczos::L
 end
 
-function CGBuffers(::Type{T}, modes::AbstractArray, values::AbstractArray,
-                   maxiter::Int) where {T}
+function CGBuffers(::Type{T}, modes::AbstractArray, values::AbstractArray, maxiter::Int,
+                   noise::Bool) where {T}
     nc = size(modes)[end]
     v() = zeros(T, nc)
-    return CGBuffers(similar(modes), similar(modes), similar(modes), similar(modes),
-                     similar(values), similar(values), similar(values), v(), v(), v(), v(), v(),
+    return CGBuffers(similar(modes), similar(modes), similar(modes), similar(values),
+                     similar(values, noise ? size(values, 1) : 0, nc), similar(values), v(), v(), v(), v(), v(),
                      CGLanczos(Float64, maxiter, nc))
 end
 
@@ -234,31 +234,21 @@ the inner product that weights each row `k₁ > 0` by two, the row standing for 
 `−k` as well (`FlowTransformBindings.plan_nufft`). The fit's operator `type 1 ∘ type 2` is
 self-adjoint under that product, so conjugate gradients take their scalars from it.
 """
-@inline function _coldot(A::AbstractArray, B::AbstractArray, out::AbstractVector{T},
-                         ::Nothing) where {T}
+@inline function _coldot(A::AbstractArray, B::AbstractArray, out::AbstractVector{T}, weight) where {T}
     modes = CartesianIndices(Base.front(size(A)))
     @inbounds for c in eachindex(out)
         acc = zero(T)
         for I in modes
-            acc += real(conj(A[I, c]) * B[I, c])
+            acc += _row_weight(weight, I[1]) * real(conj(A[I, c]) * B[I, c])
         end
         out[c] = acc
     end
     return out
 end
 
-@inline function _coldot(A::AbstractArray, B::AbstractArray, out::AbstractVector{T},
-                         weight::AbstractVector) where {T}
-    modes = CartesianIndices(Base.front(size(A)))
-    @inbounds for c in eachindex(out)
-        acc = zero(T)
-        for I in modes
-            acc += weight[I[1]] * real(conj(A[I, c]) * B[I, c])
-        end
-        out[c] = acc
-    end
-    return out
-end
+# The inner-product weight of axis-1 row `i`: one throughout a full spectrum (`nothing`).
+@inline _row_weight(::Nothing, ::Int) = true
+@inline _row_weight(w::AbstractVector, i::Int) = @inbounds w[i]
 
 """
     inverse_nufft!(F, vals, plan, cg, weight, w; rtol, maxiter, atol = 0) -> SolverResult
@@ -277,23 +267,22 @@ function inverse_nufft!(F::AbstractArray, vals::AbstractArray,
     nc = size(F)[end]
     npt = size(vals, 1)
     modes = CartesianIndices(Base.front(size(F)))
-    b = cg.b
-    wpt = cg.wpt
+    r, d, Ap, scratch, wpt, rpt = cg.r, cg.d, cg.Ap, cg.scratch, cg.wpt, cg.rpt
+    check_atol = atol > 0
+    check_atol && size(rpt, 1) != npt && throw(ArgumentError(
+        "these buffers carry no point-space residual; build them for a fit with `atol > 0`"))
+    # The residual at `F = 0` is `b = AᴴW u`, written straight into `r`.
     wpt .= w .* vals
-    FlowTransformBindings.nufft_type1!(b, plan, wpt)
-    r = cg.r; copyto!(r, b)
-    d = cg.d; copyto!(d, b)
-    Ap = cg.Ap
-    scratch = cg.scratch
-    rpt = cg.rpt; copyto!(rpt, vals)        # `b − A F` at `F = 0`
+    FlowTransformBindings.nufft_type1!(r, plan, wpt)
+    copyto!(d, r)
+    check_atol && copyto!(rpt, vals)        # `u − A F` at `F = 0`
     fill!(F, zero(eltype(F)))
     rs = cg.rs; rs_new = cg.rs_new; den = cg.den; bn = cg.bn; rn = cg.rn
     RT = eltype(rs)
     _coldot(r, r, rs, weight)
-    _coldot(b, b, bn, weight)
+    copyto!(bn, rs)
     all(iszero, bn) && return SolverResult{RT}(true, 0, zero(RT))
     copyto!(rs_new, rs)
-    check_atol = atol > 0
     converged = false
     iters = 0
     for iter in 1:maxiter
@@ -303,18 +292,23 @@ function inverse_nufft!(F::AbstractArray, vals::AbstractArray,
         FlowTransformBindings.nufft_type1!(Ap, plan, wpt)         # Aᴴ W A d
         _coldot(d, Ap, den, weight)
         @inbounds for c in 1:nc
-            iszero(den[c]) && continue
+            iszero(den[c]) && (rs_new[c] = rs[c]; continue)
             α = rs[c] / den[c]
+            acc = zero(RT)
             for I in modes
                 F[I, c] += α * d[I, c]
-                r[I, c] -= α * Ap[I, c]
+                rI = r[I, c] - α * Ap[I, c]
+                r[I, c] = rI
+                acc += _row_weight(weight, I[1]) * abs2(rI)
             end
+            rs_new[c] = acc
             # `A F` advanced by `α A d`, so the point-space residual follows the same step.
-            for i in 1:npt
-                rpt[i, c] -= α * scratch[i, c]
+            if check_atol
+                for i in 1:npt
+                    rpt[i, c] -= α * scratch[i, c]
+                end
             end
         end
-        _coldot(r, r, rs_new, weight)
         @inbounds for c in 1:nc
             β = iszero(rs[c]) ? zero(eltype(rs)) : rs_new[c] / rs[c]
             α = iszero(den[c]) ? zero(eltype(rs)) : rs[c] / den[c]
@@ -409,17 +403,18 @@ end
     ScatteredState
 
 Everything a scattered decomposition reuses: the library plan with its node set, the mode-space
-and point-space buffers of one fit, the conjugate-gradient working set, the wavenumbers, the
-inner-product weights of the mode space, and each node's measure, which weights its residual.
+and point-space buffers of one fit, the conjugate-gradient working set, the wavenumbers and their
+derivative symbol, the inner-product weights of the mode space, each node's measure, which weights its
+residual, and the spectra of the three parts and of the `P + 2` scalars.
 
 None of it depends on the field, so a caller decomposing a time series over one point set builds
-it once with [`prepare_solver`](@ref), passes it as `helmholtz_decompose_spectral`'s `state`, and
+it once with [`prepare_spectral`](@ref), passes it as `helmholtz_decompose_spectral`'s `state`, and
 releases its library plan with [`close!`](@ref).
 
 **One per task.** Every buffer here is written through during a solve, so concurrent
 decompositions need one each.
 """
-struct ScatteredState{D,T,S,P,A,B,C,G,K,W,V<:AbstractVector{T}}
+struct ScatteredState{D,T,S,P,A,B,C,G,K,KD,W,V<:AbstractVector{T},Q,R}
     packing::S
     plan::P
     packed::A          # one fit's coefficients: (mode_size…, 1)
@@ -427,8 +422,11 @@ struct ScatteredState{D,T,S,P,A,B,C,G,K,W,V<:AbstractVector{T}}
     velocity_hat::C    # (mode_size…, D)
     cg::G
     ks::K
+    K::KD              # the derivative symbol, one array per axis shaped to broadcast along it
     weight::W          # axis-1 inner-product weights of a half spectrum; `nothing` otherwise
     measure::V         # each node's measure
+    parts::Q           # the rotational, divergent and harmonic spectra, each like `velocity_hat`
+    spectra::R         # (mode_size…, P + 2): χ̂, the rotation potential, the divergence
 end
 
 Base.show(io::IO, s::ScatteredState{D,T}) where {D,T} =
@@ -447,13 +445,11 @@ _inner_weights(::_ComplexPairs, plan, ::Type{T}) where {T} = nothing
 _inner_weights(::_RealComponents, plan, ::Type{T}) where {T} =
     T[k == 0 ? one(T) : T(2) for k in FlowTransformBindings.mode_frequencies(plan, 1)]
 
-function prepare_solver(solver::CartesianNUFFTSolver{L,D}, grid::_CartesianCloud{T,D},
-                        ::FlowGeometries.Operators.AbstractBoundaryCondition;
-                        execution = ComputationalBackends.SerialBackend(),
-                        shared = nothing) where {L,D,T}
+function prepare_spectral(solver::CartesianNUFFTSolver{L,D}, grid::_CartesianCloud{T,D};
+                          execution = ComputationalBackends.AutoBackend()) where {L,D,T}
     lib = _nufft_library(solver.nufft)
     lib === nothing && throw(ArgumentError(_unavailable_message(solver)))
-    return _scattered_state(_packing(lib), lib, solver, grid, T, Val(D), execution)
+    return _scattered_state(_packing(lib), lib, solver, grid, T, Val(D), resolve_execution_backend(execution))
 end
 
 function _scattered_state(packing, lib, solver::CartesianNUFFTSolver, grid, ::Type{T}, ::Val{D},
@@ -474,31 +470,25 @@ function _scattered_state(packing, lib, solver::CartesianNUFFTSolver, grid, ::Ty
     packed = similar(proto, Complex{T}, kdims..., 1)
     buf = similar(proto, VT, M, 1)
     velocity_hat = similar(proto, Complex{T}, kdims..., D)
-    cg = CGBuffers(T, packed, buf, solver.maxiter)
+    cg = CGBuffers(T, packed, buf, solver.maxiter, solver.atol > 0)
     ks = ntuple(Val(D)) do d
         T[T(2π) * k / periods[d] for k in FlowTransformBindings.mode_frequencies(plan, d)]
     end
+    K = _derivative_symbol(velocity_hat, T, ks)
     weight = _inner_weights(packing, plan, T)
     measure = copyto!(similar(proto, T, M), FlowGeometries.Grids.measure(grid))
+    parts = ntuple(_ -> similar(velocity_hat), Val(3))
+    spectra = similar(proto, Complex{T}, kdims..., FlowGeometries.Operators.n_rotation_components(D) + 2)
     return ScatteredState{D,T,typeof(packing),typeof(plan),typeof(packed),typeof(buf),
-                          typeof(velocity_hat),typeof(cg),typeof(ks),typeof(weight),typeof(measure)}(
-        packing, plan, packed, buf, velocity_hat, cg, ks, weight, measure)
+                          typeof(velocity_hat),typeof(cg),typeof(ks),typeof(K),typeof(weight),typeof(measure),
+                          typeof(parts),typeof(spectra)}(
+        packing, plan, packed, buf, velocity_hat, cg, ks, K, weight, measure, parts, spectra)
 end
 
-function _decompose_spectral(solver::CartesianNUFFTSolver{L,D},
-                             ::FlowGeometries.Geometry.AbstractCartesianGeometry,
-                             U::AbstractMatrix{T}, grid::_CartesianCloud{T,D}, execution,
-                             state::Union{Nothing,ScatteredState}) where {L,D,T}
-    # A state the caller supplies is reused and stays open; one built here is released on return.
-    owned = state === nothing
-    st = owned ? prepare_solver(solver, grid, FlowGeometries.Operators.Neumann(); execution = execution) :
-         state
-    try
-        return _decompose_scattered(solver, U, st, grid)
-    finally
-        owned && close!(st)
-    end
-end
+_decompose_spectral(solver::CartesianNUFFTSolver{L,D}, ::FlowGeometries.Geometry.AbstractCartesianGeometry,
+                    U::AbstractMatrix{T}, grid::_CartesianCloud{T,D}, execution,
+                    state::ScatteredState) where {L,D,T} =
+    _decompose_scattered(solver, U, state, grid)
 
 function _decompose_scattered(solver::CartesianNUFFTSolver{L,D}, U::AbstractMatrix{T},
                               st::ScatteredState{D,T}, grid) where {L,D,T}
@@ -523,9 +513,7 @@ function _decompose_scattered(solver::CartesianNUFFTSolver{L,D}, U::AbstractMatr
         _store_fit!(velocity_hat, st.packing, st.packed, q, D)
     end
 
-    rot = similar(velocity_hat)
-    div = similar(velocity_hat)
-    harm = similar(velocity_hat)
+    rot, div, harm = st.parts
     helmholtz_project_spectral!(rot, div, harm, velocity_hat, st.ks)
 
     # The outputs follow the caller's array type.
@@ -538,22 +526,9 @@ function _decompose_scattered(solver::CartesianNUFFTSolver{L,D}, U::AbstractMatr
 
     # χ, the `P` rotation-potential components and the divergence, as `P + 2` real scalars.
     P = FlowGeometries.Operators.n_rotation_components(D)
-    χ_hat, R_hat = helmholtz_potentials_spectral(velocity_hat, st.ks)
-    K = _derivative_symbol(velocity_hat, T, st.ks)
-    kdims = size(χ_hat)
-    S = similar(velocity_hat, Complex{T}, (kdims..., P + 2))
-    copyto!(selectdim(S, D + 1, 1), χ_hat)
-    for p in 1:P
-        copyto!(selectdim(S, D + 1, 1 + p), selectdim(R_hat, D + 1, p))
-    end
-    δ_hat = selectdim(S, D + 1, P + 2)
-    fill!(δ_hat, zero(Complex{T}))
-    for d in 1:D
-        Kd, ûd = K[d], selectdim(velocity_hat, D + 1, d)
-        @. δ_hat += im * Kd * ûd
-    end
+    _scalar_spectra!(st.spectra, velocity_hat, st.K, Val(D))
     scalars = similar(U, T, M, P + 2)
-    _synthesize!(scalars, S, st)
+    _synthesize!(scalars, st.spectra, st)
     χ = scalars[:, 1]
     Rpot = ntuple(p -> scalars[:, 1 + p], Val(P))
     divergence = scalars[:, P + 2]

@@ -46,14 +46,15 @@ Test.@testset "split and potentials against closed forms" begin
     # `∇χ` is divergent with velocity potential `χ` and divergence `Δχ = −ℓ(ℓ+1)χ`; `k̂ × ∇χ` is rotational
     # with streamfunction `χ`. The sphere is simply connected, so the harmonic part is zero.
     nlat = 16
-    cc = sampled(FG.SphericalSampling.ClenshawCurtisSampling(), nlat)
-    flipped = FG.Grids.StructuredGrid(SPH, FG.Grids.coordinates(cc, 1), reverse(FG.Grids.coordinates(cc, 2)))
+    cc = sampled(FG.SphericalSampling.Fejer1Sampling(), nlat)
+    flipped = FG.Grids.StructuredGrid(SPH, FG.Grids.coordinates(cc, 1), reverse(FG.Grids.coordinates(cc, 2));
+                                      sampling = FG.Grids.sampling(cc))
     nu(lib = SB_AUTO) = HD.SphericalNUSHTSolver(; lmax = nlat - 1, tol = 1e-12, rtol = 1e-12, nufft = lib)
     quad(s) = sampled(s, nlat)
     routes = [
-        ("FSH, Clenshaw–Curtis", cc, HD.SphericalSpectralSolver()),
-        ("FSH, Clenshaw–Curtis, latitudes reversed", flipped, HD.SphericalSpectralSolver()),
-        ("NUFSHT, Clenshaw–Curtis", cc, nu()),
+        ("FSH, Fejér first rule", cc, HD.SphericalSpectralSolver()),
+        ("FSH, Fejér first rule, latitudes reversed", flipped, HD.SphericalSpectralSolver()),
+        ("NUFSHT, Fejér first rule", cc, nu()),
         ("NUFSHT over FINUFFT, longitude–latitude", latlon(nlat), nu(FTB.FINUFFTBackend())),
         ("NUFSHT over NonuniformFFTs, longitude–latitude", latlon(nlat), nu(FTB.NonuniformFFTsBackend())),
         ("Auto, Gauss–Legendre", quad(FG.SphericalSampling.GaussLegendreSampling()), HD.AutoSolver()),
@@ -111,44 +112,71 @@ Test.@testset "the NUFSHT route on GPUBackend(KernelAbstractions.CPU()) equals t
 end
 
 Test.@testset "coverage of the sphere" begin
-    # A grid covers the sphere when each pole lies within one and a half spacings of its two outermost
-    # latitudes: a dual grid's `Δ`, nudged either way by a rounding, does; a ±74.5° band does not.
+    # `AutoSolver` takes NUFSHT where the grid's type shows that it covers the sphere: built from a sampling
+    # that always does. A grid of bare axes, or a band, does not show it; named, the solver takes any
+    # spherical grid, and no Cartesian one.
     nlat = 16
-    λ = FG.Axes.PeriodicAxis(0.0, 2π, 2nlat)
-    Δ = π / nlat
     nu = HD.SphericalNUSHTSolver()
-    for nudge in (-4eps(), 0.0, 4eps())
-        Test.@test HD.supports_sampling(nu, FG.Grids.StructuredGrid(SPH, λ, range(-π / 2 + Δ + nudge, π / 2 - Δ - nudge;
-                                                                                  length = nlat - 1)))
-    end
-    let g = latlon(nlat)
-        Test.@test HD.supports_sampling(nu, HD.dual_grid(g, 1, 2, FG.Operators.face_metrics(g, FG.Operators.Neumann())))
-    end
-    Test.@test !HD.supports_sampling(nu, FG.Grids.StructuredGrid(SPH, λ, range(-1.3, 1.3; length = nlat)))
-
-    # On a stretched axis: cell centres 0.071 from each pole with outermost spacing 0.12, and their dual
-    # 0.131 from it with spacing 0.15, cover the sphere in either latitude order; rows 0.02 apart that
-    # stop 0.171 short of each pole, 8.5 of their spacings, do not.
-    λs = FG.Axes.PeriodicAxis(0.0, 2π, 22)
-    φc = [-1.50, -1.38, -1.20, -0.9, -0.5, 0.0, 0.5, 0.9, 1.20, 1.38, 1.50]
-    for φs in (φc, reverse(φc))
-        g = FG.Grids.StructuredGrid(SPH, λs, φs)
-        Test.@test HD.supports_sampling(nu, g)
-        Test.@test HD.supports_sampling(nu, HD.dual_grid(g, 1, 2, FG.Operators.face_metrics(g, FG.Operators.Neumann())))
-    end
-    φh = [-1.40, -1.38, -1.36, -1.0, -0.6, -0.2, 0.2, 0.6, 1.0, 1.36, 1.38, 1.40]
-    Test.@test !HD.supports_sampling(nu, FG.Grids.StructuredGrid(SPH, λs, φh))
+    gl = sampled(FG.SphericalSampling.GaussLegendreSampling(), nlat)
+    band = FG.Grids.StructuredGrid(SPH, FG.Axes.PeriodicAxis(0.0, 2π, 2nlat), range(-1.3, 1.3; length = nlat))
+    Test.@test HD.sampling_known(nu, gl)
+    Test.@test !HD.sampling_known(nu, latlon(nlat)) && !HD.sampling_known(nu, band)
+    Test.@test HD._resolve_spectral_solver(gl, HD.AutoSolver()) isa HD.SphericalNUSHTSolver
+    Test.@test_throws ArgumentError HD._resolve_spectral_solver(band, HD.AutoSolver())
+    Test.@test HD.supports_sampling(nu, band) && HD.supports_sampling(nu, latlon(nlat))
+    cart = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), range(0.0, 1.0; length = 4),
+                                   range(0.0, 1.0; length = 4))
+    Test.@test !HD.supports_sampling(nu, cart)
 end
 
-Test.@testset "a threaded batch on a Clenshaw–Curtis sphere equals the serial one" begin
+Test.@testset "FastSphericalHarmonics on a Float32 grid" begin
+    # FastTransforms computes in Float64; a Float32 field converts on the way in and out, so the split and
+    # the Poisson solve hold to Float32 rounding.
+    nlat = 16
+    g32 = FG.Connectivity.structured_grid(Float32, FG.SphericalSampling.Fejer1Sampling(), nlat;
+                                          geometry = FG.Geometry.SphericalGeometry(1.0f0))
+    λ, φ = FG.Grids.coordinates(g32, 1), FG.Grids.coordinates(g32, 2)
+    χ, G, _ = harmonic_fields(λ, φ, 2, 2, 1)
+    r = HD.helmholtz_decompose_spectral(Float32.(G), g32; solver = HD.SphericalSpectralSolver())
+    Test.@test eltype(r.u_div) === Float32 && eltype(r.χ) === Float32
+    Test.@test nrm(r.u_div .- G) / nrm(G) < 100 * eps(Float32)
+    Test.@test maximum(abs, r.χ .- χ) <= 1000 * eps(Float32) * maximum(abs, χ)
+    solver = HD.SphericalSpectralSolver()
+    st = HD.prepare_solver(solver, g32, FG.Operators.Neumann())
+    f = Float32.(repeat(sin.(φ)', size(g32, 1)))
+    Φ = zeros(Float32, size(g32))
+    HD.solve_poisson!(Φ, -2 .* f, g32, solver; boundary = FG.Operators.Neumann(), state = st)
+    Test.@test maximum(abs, Φ .- f) <= 100 * eps(Float32)
+end
+
+Test.@testset "a held spectral state gives the one-shot result" begin
+    # `prepare_spectral` builds the plans once; two fields through one state equal their one-shot results.
+    # Serial, so the NUFFT's spreading adds in one order and the results compare exactly.
+    nlat = 12
+    serial = CB.SerialBackend()
+    for (grid, solver) in ((sampled(FG.SphericalSampling.Fejer1Sampling(), nlat), HD.SphericalSpectralSolver()),
+                           (latlon(nlat), HD.SphericalNUSHTSolver(; lmax = nlat - 1, tol = 1e-12, rtol = 1e-12)))
+        Random.seed!(37)
+        fields = [randn(size(grid)..., 2) for _ in 1:2]
+        st = HD.prepare_spectral(solver, grid; execution = serial)
+        for U in fields
+            held = HD.helmholtz_decompose_spectral(U, grid; solver, execution = serial, state = st)
+            once = HD.helmholtz_decompose_spectral(U, grid; solver, execution = serial)
+            Test.@test held.u_rot == once.u_rot && held.χ == once.χ
+        end
+        HD.close!(st)
+    end
+end
+
+Test.@testset "a threaded batch on a Fejér first-rule sphere equals the serial one" begin
     # Conjugate gradients preconditioned by FastTransforms, which a batch reaches from worker tasks;
     # pinned to one thread there it returns what the root task returns. The dual's nodes are not
     # FastSphericalHarmonics' grid, so its solves take multigrid.
     nlat = 12
-    cc = sampled(FG.SphericalSampling.ClenshawCurtisSampling(), nlat)
-    plan = HD.plan_helmholtz(cc; solver = HD.CGSolver(; spectral = HD.SphericalSpectralSolver()),
+    cc = sampled(FG.SphericalSampling.Fejer1Sampling(), nlat)
+    plan = HD.plan_helmholtz(cc; solver = HD.CGSolver(; preconditioner = HD.SphericalSpectralSolver()),
                              execution = CB.SerialBackend())
-    Test.@test plan.solver.spectral isa HD.SphericalSpectralSolver
+    Test.@test plan.solver.preconditioner isa HD.SphericalSpectralSolver
     Random.seed!(31)
     fields = [randn(size(cc)..., 2) for _ in 1:4]
     bser = HD.helmholtz_decompose_batch(plan, fields; execution = CB.SerialBackend())

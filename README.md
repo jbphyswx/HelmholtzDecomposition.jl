@@ -82,8 +82,9 @@ library is loaded:
 | **Spherical** | `using FastSphericalHarmonics` (Clenshaw–Curtis) | `using NUFSHT` (any covering node set) |
 
 `AutoSolver()` (the default) takes the first of those solvers, in the order of the table below, whose
-library is loaded and whose requirements the grid and the execution backend meet — mask, axis
-uniformity, topology, node layout, and whether the solver's state can live where the backend runs.
+library is loaded and whose requirements the types of the grid and the execution backend meet — mask,
+axis spacing, topology, node layout, and whether the solver's state can live where the backend runs. A
+grid holding a mask array counts as masked.
 
 **Build axes from ranges.** FlowGeometries proves uniformity from the axis *type*, so a
 `collect`ed range is a `Vector`, carries no such proof, and quietly costs every transform fast
@@ -146,8 +147,8 @@ batch = HD.helmholtz_decompose_batch(plan, fields; execution = CB.ThreadedBacken
 `AutoBackend()`, the default, threads a loop when it gives each of Julia's threads at least 16384 of
 its indices and runs it serially otherwise, so the coarse levels of a multigrid cycle stay on one
 thread; it does not read the array type, so a device array needs its `GPUBackend` named. On a device
-`AutoSolver` takes the FFT solvers where an FFT library implements the device's arrays and
-multigrid-preconditioned conjugate gradients otherwise. NUFSHT runs on the device it is given, as
+`AutoSolver` takes the FFT solvers where the package owning the device's arrays declares an FFT library
+for them (CUDA's CUFFT for a `CuArray`) and multigrid-preconditioned conjugate gradients otherwise. NUFSHT runs on the device it is given, as
 `helmholtz_decompose_spectral`'s route on any covering sphere and as a named preconditioner, where a
 NUFFT library takes the device's arrays; FastSphericalHarmonics, FFTW's real-to-real transforms and the
 scattered fit hold host state and run on host backends. The device path is checked
@@ -246,7 +247,7 @@ The package keeps two orthogonal axes separate:
 
 | Solver | When to use |
 |--------|-------------|
-| `HD.CGSolver()` (base, dimension-generic) | any grid: masked domains, any boundary condition, any geometry. Multigrid-preconditioned by default |
+| `HD.CGSolver(; preconditioner)` (base, dimension-generic) | any grid: masked domains, any boundary condition, any geometry. `MultigridCycle()` (the default), `DiagonalScaling()` or a spherical transform preconditions |
 | `HD.CartesianSpectralSolver()` (AbstractFFTs: FFTW, CUFFT) | uniform periodic Cartesian, any dimension, host or device |
 | `HD.CartesianBoundedSolver()` (FFTW) | uniform Cartesian with any mix of bounded and periodic directions, including a channel, on the host |
 | `HD.CartesianRealTransformSolver()` (AbstractFFTs: FFTW, CUFFT) | the same, through whichever FFT library implements the array, host or device |
@@ -256,11 +257,11 @@ The package keeps two orthogonal axes separate:
 
 The spherical transforms invert the continuous Laplacian. `helmholtz_decompose_spectral` uses them
 directly; on the staggered path (`helmholtz_decompose`, `plan_helmholtz`) a named one preconditions
-`CGSolver` on the grid's own discrete Laplacian, `CGSolver(; spectral = SphericalSpectralSolver())`, so
-the divergent part carries the field's divergence on the grid to the solver tolerance.
+`CGSolver` on the grid's own discrete Laplacian, `CGSolver(; preconditioner = SphericalSpectralSolver())`,
+so the divergent part carries the field's divergence on the grid to the solver tolerance.
 
-`AutoSolver` is mask-aware (never picks a transform on a masked domain) and backend-aware (never picks
-a solver whose state lives on the host for a device backend), and takes a Cartesian transform where
+`AutoSolver` is mask-aware (never picks a transform on a grid holding a mask) and backend-aware (never
+picks a solver whose state lives on the host for a device backend), and takes a Cartesian transform where
 one applies and multigrid otherwise: on a sphere with line smoothing along longitude, elsewhere with
 lines along each direction in turn where the coupling of some cell is more than twice as strong along
 one direction as along another (a stretched or curvilinear mesh), and point smoothing otherwise.

@@ -20,9 +20,9 @@ package:
 | Cartesian  | an FFT library for the array (`using FFTW`)    | `using FINUFFT`, `using NonuniformFFTs`|
 | Spherical  | `using FastSphericalHarmonics`                 | `using NUFSHT`                         |
 
-`AutoSolver` picks among the loaded ones on the grid's own properties — mask, axis uniformity,
-topology and node layout — and on the execution backend, and refuses a solver named directly that
-cannot solve the problem given.
+`AutoSolver` picks among the loaded ones from the types of the grid — its mask, axis spacing, topology
+and node layout — and of the execution backend, and refuses a solver named directly that cannot solve
+the problem given.
 
 # Quick start
 ```julia

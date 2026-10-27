@@ -49,14 +49,21 @@ preconditioner of [`CGSolver`](@ref) on the grids whose nodes it accepts, and a 
 it does not accept takes the default preconditioner.
 
 `execution` is the *intra-field* backend: it drives the operator and solver loops of a single field.
-A parallel batch runs each field with a serial inner backend.
+A parallel batch runs each field with a serial inner backend. Under a `DistributedBackend` (Distributed
+extension) each worker builds its own plan under the backend's inner one and holds it, and
+[`helmholtz_decompose_batch`](@ref) with that plan sends each worker only its fields.
 """
-function plan_helmholtz(
-    grid::FlowGeometries.Grids.FaceIndexedGrid{T,G,N};
+plan_helmholtz(
+    grid::FlowGeometries.Grids.FaceIndexedGrid;
     boundary::FlowGeometries.Operators.AbstractBoundaryCondition = FlowGeometries.Operators.Neumann(),
     solver::AbstractPoissonSolver = AutoSolver(),
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-) where {G,T,N}
+) = _plan_helmholtz(grid, boundary, solver, execution)
+
+function _plan_helmholtz(grid::FlowGeometries.Grids.FaceIndexedGrid{T,G,N},
+                         boundary::FlowGeometries.Operators.AbstractBoundaryCondition,
+                         solver::AbstractPoissonSolver,
+                         execution::ComputationalBackends.AbstractExecutionBackend) where {G,T,N}
     P = FlowGeometries.Operators.n_rotation_components(N)
     exec = resolve_execution_backend(execution)
     pairs = FlowGeometries.Operators.rotation_pairs(Val(N))
@@ -66,7 +73,7 @@ function plan_helmholtz(
     # happen before anything moves.
     hmetrics = FlowGeometries.Operators.face_metrics(grid, boundary)
     hcoeff = FlowGeometries.Operators.laplacian_coefficients(hmetrics)
-    hduals = ntuple(p -> dual_grid(grid, pairs[p][1], pairs[p][2], hmetrics), Val(P))
+    hduals = FlowGeometries.Operators.map_rotation_pairs((va, vb) -> dual_grid(grid, va, vb, hmetrics), Val(N))
     # The rotation potential is zero on the corners the dual grid drops and on those it masks,
     # whatever the primal condition: each boundary component is a streamline of `u_rot`.
     dbcs = ntuple(p -> dual_boundary(grid, pairs[p]...), Val(P))
@@ -83,17 +90,24 @@ function plan_helmholtz(
     hshared = prepare_shared(concrete, grid, boundary; coefficients = hcoeff)
     hdshared = ntuple(p -> prepare_shared(dsolvers[p], hduals[p], dbcs[p]; coefficients = hdcoef[p]),
                       Val(P))
+    return _helmholtz_plan(grid, boundary, exec, hcoeff, hmetrics, hduals, dbcs, hdcoef, concrete, dsolvers,
+                           hshared, hdshared)
+end
 
+# The plan in `exec`'s memory, from its parts assembled on the host.
+function _helmholtz_plan(grid::FlowGeometries.Grids.FaceIndexedGrid{T,G,N}, boundary, exec, hcoeff, hmetrics,
+                         hduals, dbcs, hdcoef, concrete, dsolvers, hshared, hdshared) where {T,G,N}
+    P = FlowGeometries.Operators.n_rotation_components(N)
     move(x) = FlowGeometries.Execution.on_backend(exec, x)
     g = move(grid)
     coeff = move(hcoeff)
     metrics = move(hmetrics)
-    duals = ntuple(p -> move(hduals[p]), Val(P))
-    dcoef = ntuple(p -> move(hdcoef[p]), Val(P))
+    duals = map(move, hduals)
+    dcoef = map(move, hdcoef)
     # The shared solver state is assembled on the host alongside the coefficients and moves with
     # them; a kernel reads it during every solve.
     shared = move(hshared)
-    dshared = ntuple(p -> move(hdshared[p]), Val(P))
+    dshared = map(move, hdshared)
 
     return HelmholtzPlan{N,P,T,typeof(g),typeof(boundary),typeof(coeff),typeof(metrics),
                          typeof(duals),typeof(dbcs),typeof(dcoef),typeof(concrete),typeof(dsolvers),
@@ -337,6 +351,20 @@ function allocate_batch(plan::HelmholtzPlan{N,P,T}, nfields::Int) where {N,P,T}
                           typeof(rots)}(u_rot, u_div, u_harm, χ, Rpot, div, frac, resid, χs, rots)
 end
 
+# A zeroed batch of `nfields` slots, its arrays shaped and typed like `b`'s.
+function _batch_like(b::HelmholtzBatch{N,P,T}, nfields::Int) where {N,P,T}
+    grow(A) = fill!(similar(A, (Base.front(size(A))..., nfields)), zero(eltype(A)))
+    u_rot = grow(b.u_rot)
+    χ = grow(b.χ)
+    Rpot = map(grow, b.rotation_potential)
+    dummy = SolverResult{T}(false, 0, zero(T))
+    frac = zeros(T, nfields)
+    χs = fill(dummy, nfields)
+    rots = fill(ntuple(_ -> dummy, Val(P)), nfields)
+    return HelmholtzBatch{N,P,T,typeof(u_rot),typeof(χ),typeof(Rpot),typeof(frac),typeof(χs),typeof(rots)}(
+        u_rot, grow(b.u_div), grow(b.u_harm), χ, Rpot, grow(b.divergence), frac, zeros(T, nfields), χs, rots)
+end
+
 # A view onto one slice, with the batch axis dropped.
 @inline _slice(A::AbstractArray{<:Any,M}, b::Int) where {M} =
     view(A, ntuple(_ -> Colon(), Val(M - 1))..., b)
@@ -508,20 +536,21 @@ helmholtz_decompose!(result::AbstractHelmholtzResult{N,P,T}, u::AbstractArray, p
 end
 
 # One decomposition with its loops on `execution`: the plan's own backend, or the one a batch driver
-# runs each field on.
-function _decompose!(result::PotentialsResult{N,P,T}, u::AbstractArray, plan::HelmholtzPlan{N,P,T},
+# runs each field on. An operator over the grid's cells runs its loops on `lb`.
+function _decompose!(result::AbstractHelmholtzResult{N,P,T}, u::AbstractArray, plan::HelmholtzPlan{N,P,T},
                      ws::HelmholtzWorkspace, execution) where {N,P,T}
     _check_velocity(u, plan, Val(N))
-    return _solve_potentials!(result, u, plan, ws, execution)
+    return _decompose!(result, u, plan, ws, execution, loop_backend(execution, length(plan.coefficients.measure)))
 end
 
-function _decompose!(result::HelmholtzResult{N,P,T}, u::AbstractArray, plan::HelmholtzPlan{N,P,T},
-                     ws::HelmholtzWorkspace, execution) where {N,P,T}
-    _check_velocity(u, plan, Val(N))
-    _solve_potentials!(result, u, plan, ws, execution)
+_decompose!(result::PotentialsResult, u, plan::HelmholtzPlan, ws::HelmholtzWorkspace, execution, lb) =
+    _solve_potentials!(result, u, plan, ws, execution, lb)
+
+function _decompose!(result::HelmholtzResult{N,P,T}, u, plan::HelmholtzPlan{N,P,T}, ws::HelmholtzWorkspace,
+                     execution, lb) where {N,P,T}
+    _solve_potentials!(result, u, plan, ws, execution, lb)
 
     grid, fm = plan.grid, plan.metrics
-    lb = loop_backend(execution, length(plan.coefficients.measure))
     FlowGeometries.Operators.rotational_velocity!(ws.urot, result.rotation_potential, fm; execution = lb)
     _face_remainder!(ws.harm, ws.v, ws.gχ, ws.urot)
     FlowGeometries.Operators.to_centres!(_components(result.u_div, Val(N)), ws.gχ, fm; execution = lb)
@@ -530,21 +559,20 @@ function _decompose!(result::HelmholtzResult{N,P,T}, u::AbstractArray, plan::Hel
 
     vnorm = _face_norm(ws.v, fm, lb)
     result.harmonic_fraction = iszero(vnorm) ? zero(T) : _face_norm(ws.harm, fm, lb) / vnorm
-    unorm = velocity_norm(u, grid; execution = lb)
+    unorm = _velocity_norm(u, grid, fm.volume, lb)
     result.residual_fraction = iszero(unorm) ? zero(T) :
-        _remainder_norm(u, result.u_div, result.u_rot, result.u_harm, grid, lb) / unorm
+        _remainder_norm(u, result.u_div, result.u_rot, result.u_harm, grid, fm.volume, lb) / unorm
     return result
 end
 
 # `χ` and `R`: what both entry points share. Writes only fields the two result types have in
 # common, so one body serves both.
 function _solve_potentials!(result, u::AbstractArray, plan::HelmholtzPlan{N,P,T},
-                            ws::HelmholtzWorkspace, backend) where {N,P,T}
+                            ws::HelmholtzWorkspace, backend, lb) where {N,P,T}
     grid, bc = plan.grid, plan.boundary
     concrete = plan.solver
     state = ws.state
     fm = plan.metrics
-    lb = loop_backend(backend, length(plan.coefficients.measure))
 
     # 1. To faces, where the projection is exact.
     FlowGeometries.Operators.to_faces!(ws.v, _components(u, Val(N)), fm; execution = lb)
@@ -570,12 +598,14 @@ function _solve_potentials!(result, u::AbstractArray, plan::HelmholtzPlan{N,P,T}
     result.rot_solve = map(result.rotation_potential, ws.W, plan.dual_grids, plan.dual_boundaries,
                            plan.dual_coefficients, plan.dual_solvers,
                            ws.dual_states) do Rp, Wp, dg, dbc, dc, ds, st
-        FlowGeometries.Operators.project_out_constant!(Wp, dc; execution = loop_backend(backend, length(Wp)))
+        _project_out_constant!(Wp, dc, loop_backend(backend, length(Wp)))
         solve_poisson!(Rp, Wp, dg, ds; boundary = dbc, coefficients = dc, state = st,
                        execution = backend)
     end
     return result
 end
+
+_project_out_constant!(Φ, c, lb) = FlowGeometries.Operators.project_out_constant!(Φ, c; execution = lb)
 
 """
     _divergent_faces!(g, χ, v, fm, backend) -> g
@@ -615,15 +645,15 @@ function _add_edge_flux!(δ, v::NTuple{N,AbstractArray}, fm::FlowGeometries.Oper
     fm.area_flux === fm.area_op && return δ
     ntuple(Val(N)) do d
         FlowGeometries.Grids.isperiodic(fm.grid, d) ||
-            _edge_flux!(δ, v[d], fm.area_flux[d], fm.area_op[d], fm.orientation[d], fm.grid, d, backend)
+            _edge_flux!(δ, v[d], fm.area_flux[d], fm.area_op[d], fm.orientation[d], fm.grid, fm.volume, d, backend)
         return nothing
     end
     return δ
 end
 
-function _edge_flux!(δ::AbstractArray{S}, vd, ad, od, σ, grid, d::Int, backend) where {S}
+# The divergence `δ` is per unit of `fm.volume`, each cell's region measure, so the edge flux is too.
+function _edge_flux!(δ::AbstractArray{S}, vd, ad, od, σ, grid, meas, d::Int, backend) where {S}
     msk = FlowGeometries.Grids.mask(grid)
-    meas = FlowGeometries.Grids.measure(grid)
     dims = FlowGeometries.Grids.size_tuple(grid)
     plane = CartesianIndices(ntuple(e -> e == d ? 1 : dims[e], Val(length(dims))))
     # The face below cell 1 counts outward as `−σ`, the face above cell `n` as `+σ`. The two edges run
@@ -671,13 +701,12 @@ function _face_sum(fd, ad, gd, backend, ::Type{T}) where {T}
 end
 
 """
-    _remainder_norm(U, A, B, C, grid, backend) -> T
+    _remainder_norm(U, A, B, C, grid, meas, backend) -> T
 
-`‖U − A − B − C‖` in the measure-weighted norm of [`velocity_norm`](@ref), over the active cells.
+`‖U − A − B − C‖` weighted by the cell measures `meas`, over the active cells.
 """
-function _remainder_norm(U, A, B, C, grid::FlowGeometries.Grids.FaceIndexedGrid{T,G,N}, backend) where {G,T,N}
+function _remainder_norm(U, A, B, C, grid::FlowGeometries.Grids.FaceIndexedGrid{T,G,N}, meas, backend) where {G,T,N}
     msk = FlowGeometries.Grids.mask(grid)
-    meas = FlowGeometries.Grids.measure(grid)
     cart = CartesianIndices(size(grid))
     u, a, b, c = map(X -> ntuple(k -> _component(X, k, Val(N)), Val(N)), (U, A, B, C))
     acc = FlowGeometries.Execution.reduce_indices(+, zero(T), length(cart), backend) do lin
@@ -712,7 +741,7 @@ function count_holes(grid::FlowGeometries.Grids.AbstractGrid)
     labels, ncomp = FlowGeometries.Connectivity.connected_components(grid; active = false)
     ncomp == 0 && return 0
     N = ndims(grid)
-    bounded = ntuple(d -> !FlowGeometries.Grids.isperiodic(grid, d), N)
+    bounded = ntuple(d -> !FlowGeometries.Grids.isperiodic(grid, d), Val(ndims(grid)))
     any(bounded) || return ncomp        # no boundary anywhere: every region is enclosed
     open = falses(ncomp)
     @inbounds for I in CartesianIndices(size(grid))
@@ -734,11 +763,14 @@ end
 
 Measure-weighted `‖U‖ = sqrt(∫|U|² dV)` over the active cells, reduced on `execution`.
 """
-function velocity_norm(U, grid::FlowGeometries.Grids.FaceIndexedGrid{T,G,N};
-                       execution = ComputationalBackends.SerialBackend()) where {G,T,N}
+velocity_norm(U, grid::FlowGeometries.Grids.FaceIndexedGrid;
+              execution = ComputationalBackends.SerialBackend()) =
+    _velocity_norm(U, grid, FlowGeometries.Grids.measure(grid), execution)
+
+# `‖U‖` weighted by the cell measures `meas`: the grid's own, or a decomposition's `fm.volume`, the measure
+# its operators divide by. A measure is nonzero on inactive cells, so the mask is read separately.
+function _velocity_norm(U, grid::FlowGeometries.Grids.FaceIndexedGrid{T,G,N}, meas, execution) where {G,T,N}
     msk = FlowGeometries.Grids.mask(grid)
-    # The grid's own measure is nonzero on inactive cells, so the mask is read separately.
-    meas = FlowGeometries.Grids.measure(grid)
     cart = CartesianIndices(size(grid))
     comps = ntuple(c -> _component(U, c, Val(N)), Val(N))
     acc = FlowGeometries.Execution.reduce_indices(+, zero(T), length(cart), execution) do lin
@@ -781,7 +813,7 @@ function helmholtz_decompose(
     solver::AbstractPoissonSolver = AutoSolver(),
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
 )
-    plan = plan_helmholtz(grid; boundary = boundary, solver = solver, execution = execution)
+    plan = _plan_helmholtz(grid, boundary, solver, resolve_execution_backend(execution))
     return helmholtz_decompose!(allocate_result(plan), u, plan)
 end
 
@@ -807,7 +839,7 @@ function helmholtz_potentials(
     solver::AbstractPoissonSolver = AutoSolver(),
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
 )
-    plan = plan_helmholtz(grid; boundary = boundary, solver = solver, execution = execution)
+    plan = _plan_helmholtz(grid, boundary, solver, resolve_execution_backend(execution))
     return helmholtz_decompose!(allocate_potentials(plan), u, plan)
 end
 
@@ -815,14 +847,6 @@ end
 # Batch
 # ---------------------------------------------------------------------------
 
-"""
-    _extension_loaded(name) -> Bool
-
-Whether one of this package's extensions is loaded.
-"""
-@inline _extension_loaded(name::Symbol) = Base.get_extension(@__MODULE__, name) !== nothing
-
-@inline _threading_available() = _extension_loaded(:HelmholtzDecompositionOhMyThreadsExt)
 
 """
     helmholtz_decompose_batch(plan, fields; execution = AutoBackend())
@@ -880,7 +904,7 @@ thread, and the threading extension loaded. A concrete backend passes through un
 """
 _resolve_batch_backend(b::ComputationalBackends.AbstractExecutionBackend, _) = b
 function _resolve_batch_backend(::ComputationalBackends.AbstractAutoBackend, fields)
-    parallel = length(fields) > 1 && Threads.nthreads() > 1 && _threading_available()
+    parallel = (length(fields) > 1) && (Threads.nthreads() > 1) && _available(_Threads())
     return parallel ? ComputationalBackends.ThreadedBackend() : ComputationalBackends.SerialBackend()
 end
 

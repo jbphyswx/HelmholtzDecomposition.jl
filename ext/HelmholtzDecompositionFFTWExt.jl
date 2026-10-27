@@ -13,6 +13,9 @@ using FlowGeometries: FlowGeometries as FG
 HD._plan_kwargs(::Array{<:Union{Float32,Float64,ComplexF32,ComplexF64}}, backend) =
     (; num_threads = HD._library_threads(backend))
 
+HD._available(::HD._HostFFT) = true
+
+HD.library_loaded(::HD.CartesianBoundedSolver) = true
 HD.supports_boundary(::HD.CartesianBoundedSolver, ::FG.Operators.Dirichlet) = true
 HD.supports_boundary(::HD.CartesianBoundedSolver, ::FG.Operators.Neumann) = true
 HD.supports_boundary(::HD.CartesianBoundedSolver, ::HD.CornerDirichlet) = true

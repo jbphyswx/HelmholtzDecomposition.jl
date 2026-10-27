@@ -75,6 +75,8 @@ HelmholtzDecomposition.CornerDirichlet
 HelmholtzDecomposition.AbstractPoissonSolver
 HelmholtzDecomposition.AutoSolver
 HelmholtzDecomposition.CGSolver
+HelmholtzDecomposition.MultigridCycle
+HelmholtzDecomposition.DiagonalScaling
 HelmholtzDecomposition.solve_poisson!
 HelmholtzDecomposition.prepare_solver
 HelmholtzDecomposition.prepare_shared
@@ -97,15 +99,16 @@ HelmholtzDecomposition.SphericalNUSHTSolver
 
 ### Capability
 
-`AutoSolver` chooses on these. A named solver whose state cannot live on the execution backend is
-refused, as is one that cannot invert the grid's `L`, except a spherical transform, which becomes the
-preconditioner of [`CGSolver`](@ref HelmholtzDecomposition.CGSolver).
+`AutoSolver` chooses on these, each answered from types. A named solver whose state cannot live on the
+execution backend is refused, as is one that cannot invert the grid's `L`, except a spherical transform,
+which becomes the preconditioner of [`CGSolver`](@ref HelmholtzDecomposition.CGSolver).
 
 ```@docs
 HelmholtzDecomposition.supports_boundary
 HelmholtzDecomposition.requires_full_domain
 HelmholtzDecomposition.requires_uniform_axes
 HelmholtzDecomposition.requires_periodic_domain
+HelmholtzDecomposition.sampling_known
 HelmholtzDecomposition.supports_sampling
 HelmholtzDecomposition.supports_backend
 HelmholtzDecomposition.library_loaded
@@ -143,6 +146,7 @@ HelmholtzDecomposition.MultigridPreconditioner
 HelmholtzDecomposition.PointJacobi
 HelmholtzDecomposition.ZebraLines
 HelmholtzDecomposition.AlternatingLines
+HelmholtzDecomposition.CouplingSmoother
 HelmholtzDecomposition.default_smoother
 HelmholtzDecomposition.LevelBuffers
 HelmholtzDecomposition.MultigridBuffers
