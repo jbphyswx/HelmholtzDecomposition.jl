@@ -20,7 +20,7 @@ function cloud(D, M; seed = 21, band = 2π)
     Random.seed!(seed)
     x = ntuple(d -> (d == 2 ? band : 2π) .* rand(M), D)
     grid = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), x, fill((2π)^D / M, M);
-                                     period = ntuple(_ -> 2π, D), periodic = ntuple(_ -> true, D))
+                                     period = ntuple(_ -> 2π, D), topology = ntuple(_ -> FG.Grids.Periodic(), D))
     return grid, x
 end
 
@@ -84,6 +84,19 @@ Test.@testset "split and potentials against closed forms" begin
         Test.@test maximum(abs, r.u_div .- gd) < 1e-7
         Test.@test maximum(abs, r.u_rot .+ r.u_harm .- gr) < 1e-7
     end
+end
+
+Test.@testset "a held state gives the one-shot result" begin
+    grid, x = cloud(2, 1200)
+    U = first(field(x))
+    s = HD.CartesianNUFFTSolver(FTB.NonuniformFFTsBackend(); nk = (12, 12), tol = 1e-12, rtol = 1e-12, maxiter = 400)
+    st = HD.prepare_spectral(s, grid)
+    for V in (U, 2 .* U)
+        held = HD.helmholtz_decompose_spectral(V, grid; solver = s, state = st)
+        once = HD.helmholtz_decompose_spectral(V, grid; solver = s)
+        Test.@test isapprox(held.χ, once.χ; rtol = 1e-12) && isapprox(held.u_rot, once.u_rot; rtol = 1e-12)
+    end
+    HD.close!(st)
 end
 
 Test.@testset "a capped fit returns flagged" begin

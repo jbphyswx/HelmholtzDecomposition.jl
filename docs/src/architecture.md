@@ -22,6 +22,7 @@ ext/
   HelmholtzDecompositionFSHExt.jl                 # Clenshaw–Curtis sphere
   HelmholtzDecompositionNUFSHTExt.jl              # arbitrary covering sphere
   HelmholtzDecompositionAdaptExt.jl               # how a plan's structs move to a device
+  HelmholtzDecompositionCUDAExt.jl                # CUFFT serves the FFT solvers on a CuArray
   HelmholtzDecompositionOhMyThreadsExt.jl         # threaded batch
   HelmholtzDecompositionDistributedExt.jl         # multiprocess batch
   HelmholtzDecompositionMPIExt.jl                 # MPI batch
@@ -73,15 +74,16 @@ a workspace of its own releases it before returning.
 
 ## Two orthogonal backend axes
 
-- **Which transform** — `AbstractPoissonSolver`. `AutoSolver` chooses on capability: geometry,
-  node layout, mask, axis uniformity, boundary condition, the execution backend, and which libraries
-  are loaded. A solver named directly that cannot solve the problem on that backend raises: a solver
-  that solves a different boundary value problem returns a smooth, plausible, wrong field.
+- **Which transform** — `AbstractPoissonSolver`. `AutoSolver` chooses from types: the grid's
+  geometry, node layout, mask, axis spacing and topology, the boundary condition, the execution backend,
+  and which libraries are loaded, so a plan's type follows from the types of its inputs. A solver named
+  directly that cannot solve the problem on that backend raises.
 - **Where it runs** — `ComputationalBackends.AbstractExecutionBackend`, passed to
   `plan_helmholtz` as `execution`. Every hot loop is written once against `FlowGeometries.Execution.run_indices`,
   which resolves to a serial loop, threaded chunks, or a KernelAbstractions launch with no
   branching here. On a device backend the solver state lives on the device: `AutoSolver` takes the
-  Cartesian FFT solvers where an FFT library takes the device's arrays and multigrid-preconditioned
+  Cartesian FFT solvers where the package owning the device's arrays declares an FFT library for them
+  (`HelmholtzDecompositionCUDAExt` for a `CuArray`) and multigrid-preconditioned
   conjugate gradients otherwise, and NUFSHT's plans are built on the device when it is named or is the
   spectral route of a covering sphere. FastSphericalHarmonics, FFTW's real-to-real transforms and the
   scattered fit hold host state.
@@ -106,7 +108,7 @@ written down once, so load order decides nothing.
 ```
 AbstractPoissonSolver
 ├── AutoSolver
-├── CGSolver{R,S}                     # multigrid or spectral (S) preconditioning; R the tolerance type
+├── CGSolver{R,P}                     # preconditioner P: MultigridCycle, DiagonalScaling or a transform; R the tolerance type
 ├── CartesianSpectralSolver           (AbstractFFTs)    periodic rfft, any FFT library
 ├── CartesianBoundedSolver            (FFTW)            r2r, per-direction kind, host
 ├── CartesianRealTransformSolver      (AbstractFFTs)    bounded/channel/periodic, any FFT library

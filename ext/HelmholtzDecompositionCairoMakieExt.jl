@@ -40,8 +40,4 @@ function HD.plot_decomposition(
     return fig
 end
 
-# Backwards-friendly 4-arg form (original passed as separate components).
-HD.plot_decomposition(result::HD.HelmholtzResult{2}, grid::FG.Grids.StructuredGrid{T,G,2} where {T,G}, u_orig::AbstractMatrix, v_orig::AbstractMatrix; kwargs...) =
-    HD.plot_decomposition(result, grid; orig = cat(u_orig, v_orig; dims = 3), kwargs...)
-
 end # module

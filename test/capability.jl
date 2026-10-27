@@ -48,10 +48,10 @@ end
 Test.@testset "spherical transforms" begin
     sph = FG.Geometry.SphericalGeometry(1.0)
     nlat = 24
-    cc = FG.Connectivity.structured_grid(FG.SphericalSampling.ClenshawCurtisSampling(), nlat; geometry = sph)
+    cc = FG.Connectivity.structured_grid(FG.SphericalSampling.Fejer1Sampling(), nlat; geometry = sph)
     ll = FG.Grids.StructuredGrid(sph, FG.Axes.PeriodicAxis(0.0, 2π, 48),
                                  range(-π / 2 + π / 48, π / 2 - π / 48; length = 24))
-    for (name, grid, solver) in (("Clenshaw–Curtis, FastSphericalHarmonics", cc, HD.SphericalSpectralSolver()),
+    for (name, grid, solver) in (("Fejér first rule, FastSphericalHarmonics", cc, HD.SphericalSpectralSolver()),
                                  ("longitude–latitude, NUFSHT", ll,
                                   HD.SphericalNUSHTSolver(; tol = 1e-10, rtol = 1e-12)))
         Test.@testset "$name" begin
@@ -68,7 +68,7 @@ Test.@testset "spherical transforms" begin
             # gradients, the divergent part carries the field's divergence to the solver tolerance.
             # Under a device backend `AutoSolver` keeps multigrid.
             Test.@test HD.select_solver(HD.AutoSolver(), grid, OPS.Neumann();
-                                        execution = CB.GPUBackend(nothing)).spectral === nothing
+                                        execution = CB.GPUBackend(nothing)).preconditioner isa HD.MultigridCycle
             Random.seed!(43)
             u = randn(size(grid)..., 2)
             for s in (HD.AutoSolver(), HD.CGSolver())
@@ -131,8 +131,8 @@ Test.@testset "Float32 converges; a capped solve returns flagged" begin
     grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float32}(), xr, xr)
     Random.seed!(12)
     u = randn(Float32, n, n, 2)
-    for mg in (true, false)
-        plan = HD.plan_helmholtz(grid; solver = HD.CGSolver(; multigrid = mg), execution = CB.SerialBackend())
+    for pre in (HD.MultigridCycle(), HD.DiagonalScaling())
+        plan = HD.plan_helmholtz(grid; solver = HD.CGSolver(; preconditioner = pre), execution = CB.SerialBackend())
         ws = HD.allocate_workspace(plan)
         res = HD.helmholtz_decompose!(HD.allocate_result(plan), u, plan, ws)
         Test.@test res.χ_solve.converged && all(s -> s.converged, res.rot_solve)
@@ -140,7 +140,7 @@ Test.@testset "Float32 converges; a capped solve returns flagged" begin
         δ = OPS.divergence!(zeros(Float32, n, n), HD.face_divergent(ws), OPS.face_metrics(grid, OPS.Dirichlet()))
         Test.@test sqrt(sum(abs2, δ .- res.divergence)) <= 10 * eps(Float32) * (8 * n^2 / π^2) * sqrt(sum(abs2, res.divergence))
     end
-    capped = HD.plan_helmholtz(grid; solver = HD.CGSolver(; max_iter = 2, multigrid = false),
+    capped = HD.plan_helmholtz(grid; solver = HD.CGSolver(; max_iter = 2, preconditioner = HD.DiagonalScaling()),
                                execution = CB.SerialBackend())
     rc = HD.helmholtz_decompose!(HD.allocate_result(capped), u, capped)
     Test.@test !rc.χ_solve.converged && rc.χ_solve.iterations == 2

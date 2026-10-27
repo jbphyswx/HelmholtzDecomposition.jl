@@ -27,8 +27,8 @@ end
 function LevelBuffers(c::FlowGeometries.Operators.LaplacianCoefficients{N,T}, smoother;
                       execution = ComputationalBackends.SerialBackend()) where {N,T}
     dims = FlowGeometries.Grids.size_tuple(c.grid)
-    z() = _zeros(execution, T, dims)
-    return LevelBuffers(z(), z(), z(), _line_scratch(smoother, z))
+    z(sz = dims) = _zeros(execution, T, sz)
+    return LevelBuffers(z(), z(), z(), _line_scratch(smoother, z, dims))
 end
 
 """
@@ -38,7 +38,7 @@ What one task's cycles write: the finest level's second iterate and line scratch
 right-hand side are the preconditioner's output and input) and a [`LevelBuffers`](@ref) per coarser
 level.
 """
-struct MultigridBuffers{A,S,L<:Tuple}
+struct MultigridBuffers{A,S,L<:AbstractVector}
     scratch::A
     line::S
     coarse::L
@@ -75,21 +75,36 @@ both directions, every cell is relaxed along its strong direction.
 """
 struct AlternatingLines end
 
+"""
+    CouplingSmoother(lines, ω)
+
+[`AlternatingLines`](@ref) where `lines` holds and [`PointJacobi`](@ref)`(ω)` otherwise: the smoother
+[`default_smoother`](@ref) chooses from an operator's couplings, held as a value, so a hierarchy's type
+follows from its operator's.
+"""
+struct CouplingSmoother{T<:AbstractFloat}
+    lines::Bool
+    ω::T
+end
+
 const _LineSmoother = Union{ZebraLines, AlternatingLines}
 
-# The line solves' scratch: the Thomas factors and the second solution of the periodic correction.
-_line_scratch(::PointJacobi, z) = nothing
-_line_scratch(::_LineSmoother, z) = (cp = z(), dp = z(), w = z())
+# The line solves' scratch over a level of `dims`: the Thomas factors and the second solution of the
+# periodic correction, `z(dims)` building one array.
+_line_scratch(::PointJacobi, z, dims) = nothing
+_line_scratch(::_LineSmoother, z, dims) = (cp = z(dims), dp = z(dims), w = z(dims))
+_line_scratch(s::CouplingSmoother, z, dims) = _line_scratch(AlternatingLines(), z, s.lines ? dims : map(zero, dims))
 
 """
-    default_smoother(c::LaplacianCoefficients) -> PointJacobi, ZebraLines or AlternatingLines
+    default_smoother(c::LaplacianCoefficients) -> ZebraLines, CouplingSmoother or PointJacobi
 
 The smoother of the operator `c` describes. [`ZebraLines`](@ref) on a sphere or spheroid of two or more
-directions, whose cells narrow along longitude towards the poles. Elsewhere [`AlternatingLines`](@ref)
-where some cell couples to its neighbours along one direction more than twice as strongly as along
-another, and [`PointJacobi`](@ref)`(0.8)` otherwise: a damped-Jacobi sweep reduces an error that is smooth
-along the strong direction of a cell with coupling ratio `ε ≤ 1` by the factor `1 − ωε/(1 + ε)`, 0.6 at
-`ε = 1`, 0.73 at `ε = 1/2`, and towards 1 as `ε` falls.
+directions, whose cells narrow along longitude towards the poles. Elsewhere, in two or more directions,
+[`AlternatingLines`](@ref) where some cell couples to its neighbours along one direction more than twice as
+strongly as along another and [`PointJacobi`](@ref)`(0.8)` otherwise, held as a [`CouplingSmoother`](@ref):
+a damped-Jacobi sweep reduces an error that is smooth along the strong direction of a cell with coupling
+ratio `ε ≤ 1` by the factor `1 − ωε/(1 + ε)`, 0.6 at `ε = 1`, 0.73 at `ε = 1/2`, and towards 1 as `ε`
+falls. `PointJacobi(0.8)` in one direction.
 """
 default_smoother(c::FlowGeometries.Operators.LaplacianCoefficients{N,T}) where {N,T} =
     _default_smoother(FlowGeometries.Grids.grid_geometry(c.grid), Val(N), T, c)
@@ -97,7 +112,7 @@ _default_smoother(::Union{FlowGeometries.Geometry.AbstractSphericalGeometry,
                           FlowGeometries.Geometry.AbstractEllipsoidalGeometry}, ::Val{N}, ::Type{T}, c) where {N,T} =
     N ≥ 2 ? ZebraLines() : PointJacobi(T(0.8))
 _default_smoother(::Any, ::Val{N}, ::Type{T}, c) where {N,T} =
-    N ≥ 2 && _coupling_ratio(c) > 2 ? AlternatingLines() : PointJacobi(T(0.8))
+    N ≥ 2 ? CouplingSmoother(_coupling_ratio(c) > 2, T(0.8)) : PointJacobi(T(0.8))
 
 # The largest ratio, over the active cells, of a cell's strongest face coefficient along one direction to
 # its strongest along another; a direction whose faces at a cell are both closed does not enter.
@@ -117,6 +132,7 @@ end
 
 _default_sweeps(::PointJacobi) = 2
 _default_sweeps(::_LineSmoother) = 1
+_default_sweeps(s::CouplingSmoother) = s.lines ? 1 : 2
 
 """
     smooth!(x, b, c, r, ω, n; execution)
@@ -221,6 +237,13 @@ function _postsmooth!(x, b, c::FlowGeometries.Operators.LaplacianCoefficients{N}
     end
     return x
 end
+
+_presmooth!(x, b, c, r, line, s::CouplingSmoother, ν::Int, backend) =
+    s.lines ? _presmooth!(x, b, c, r, line, AlternatingLines(), ν, backend) :
+              _presmooth!(x, b, c, r, line, PointJacobi(s.ω), ν, backend)
+_postsmooth!(x, b, c, r, line, s::CouplingSmoother, ν::Int, backend) =
+    s.lines ? _postsmooth!(x, b, c, r, line, AlternatingLines(), ν, backend) :
+              _postsmooth!(x, b, c, r, line, PointJacobi(s.ω), ν, backend)
 
 # Zebra passes along directions `d` to `stop`, a step of one towards `stop`, each pass taking colour
 # `first` and then the other.
@@ -355,46 +378,54 @@ end
 end
 
 """
-    vcycle!(levels, x, b, r, line, coarse, smoother, ν, backend)
+    vcycle!(c, x, b, r, line, mg, k, bufs, backend)
 
-One V-cycle over `levels`, coarsest last, for `−L x = b` on `levels[1]` from `x = 0`: smooth, restrict
-the residual, recurse on the tail, prolong the correction, smooth again. `x`'s entry values are not
-read, `r` and `line` are the level's second iterate and line scratch, and `coarse` holds the
-[`LevelBuffers`](@ref) of the levels below.
-
-The recursion is on the tuple's tail, so each step's argument is a shorter tuple type and the
-compiler sees the depth terminate.
+One V-cycle for `−L x = b` from `x = 0` on level `k` of `mg`, whose operator is `c`: `mg.fine` at `k = 0`,
+`mg.coarse[k]` below it. Smooth, restrict the residual to level `k + 1`, cycle there, prolong the
+correction, smooth again; the coarsest level is relaxed to convergence. `x`'s entry values are not read,
+`r` and `line` are the level's second iterate and line scratch, and `bufs.coarse` holds the
+[`LevelBuffers`](@ref) of the levels below the finest.
 """
-function vcycle!(levels::Tuple{LC}, x, b, r, line, ::Tuple{}, sm, ν::Int, backend) where {LC}
-    # The coarsest grid is a handful of cells, relaxed to convergence.
-    _presmooth!(x, b, levels[1], r, line, sm, 20ν, backend)
+function vcycle!(c, x, b, r, line, mg, k::Int, bufs, backend)
+    sm, ν = mg.smoother, mg.ν
+    if k == length(mg.coarse)
+        # The coarsest grid is a handful of cells, relaxed to convergence.
+        _presmooth!(x, b, c, r, line, sm, 20ν, backend)
+        return nothing
+    end
+    cn, nxt = mg.coarse[k + 1], bufs.coarse[k + 1]
+    _presmooth!(x, b, c, r, line, sm, ν, backend)
+    _restrict!(nxt, b, x, c, cn, loop_backend(backend, length(x)), loop_backend(backend, length(nxt.b)))
+    vcycle!(cn, nxt.x, nxt.b, nxt.r, nxt.line, mg, k + 1, bufs, backend)
+    _prolong!(x, nxt.x, c, cn, loop_backend(backend, length(x)))
+    _postsmooth!(x, b, c, r, line, sm, ν, backend)
     return nothing
 end
 
-function vcycle!(levels::Tuple, x, b, r, line, coarse::Tuple, sm, ν::Int, backend)
-    c, rest = levels[1], Base.tail(levels)
-    cn, nxt = rest[1], coarse[1]
-    lb = loop_backend(backend, length(x))
-    _presmooth!(x, b, c, r, line, sm, ν, backend)
-    # `R (b − A x)`, `A = −L`; on a closed problem it is projected onto the coarse operator's range.
-    FlowGeometries.Operators.restrict_residual!(nxt.b, b, x, c, cn; execution = lb)
-    FlowGeometries.Operators.project_out_constant!(nxt.b, cn;
-                                                   execution = loop_backend(backend, length(nxt.b)))
-    vcycle!(rest, nxt.x, nxt.b, nxt.r, nxt.line, Base.tail(coarse), sm, ν, backend)
-    FlowGeometries.Operators.prolong_add!(x, nxt.x, c, cn; execution = lb)
-    _postsmooth!(x, b, c, r, line, sm, ν, backend)
+# `R (b − A x)`, `A = −L`, into the next level's right-hand side, the fine loops on `fine` and the coarse ones
+# on `coarse`; on a closed problem it is projected onto the coarse operator's range.
+function _restrict!(nxt, b, x, c, cn, fine, coarse)
+    FlowGeometries.Operators.restrict_residual!(nxt.b, b, x, c, cn; execution = fine)
+    FlowGeometries.Operators.project_out_constant!(nxt.b, cn; execution = coarse)
+    return nothing
+end
+
+function _prolong!(x, xc, c, cn, lb)
+    FlowGeometries.Operators.prolong_add!(x, xc, c, cn; execution = lb)
     return nothing
 end
 
 """
     MultigridPreconditioner
 
-A hierarchy of `FlowGeometries.Operators.LaplacianCoefficients`, finest first, applied as
-`z ← M⁻¹ r` inside conjugate gradients, with its smoother ([`PointJacobi`](@ref) or
-[`ZebraLines`](@ref)) and sweeps per side. A tuple, so each level keeps its own grid and mask types.
+A hierarchy of `FlowGeometries.Operators.LaplacianCoefficients` applied as `z ← M⁻¹ r` inside conjugate
+gradients: the operator `fine` and the levels below it, `coarse`, coarsest last, with its smoother
+([`PointJacobi`](@ref), [`ZebraLines`](@ref) or [`AlternatingLines`](@ref)) and sweeps per side. The levels
+below the finest share one type, which the number of levels does not change.
 """
-struct MultigridPreconditioner{L<:Tuple,S}
-    levels::L
+struct MultigridPreconditioner{F,V<:AbstractVector,S}
+    fine::F
+    coarse::V
     smoother::S
     ν::Int
 end
@@ -402,8 +433,8 @@ end
 """
     multigrid(c, boundary; smoother = default_smoother(c), ν, maxlevels = 12) -> MultigridPreconditioner
 
-The hierarchy below the operator `c` describes under `boundary`, each coarser level the operator
-rediscretized on `FlowGeometries.Operators.coarsen` of the grid above
+The hierarchy below the operator `c` describes under `boundary`, at most `maxlevels` levels with `c`'s,
+each coarser level the operator rediscretized on `FlowGeometries.Operators.coarsen` of the grid above
 (`FlowGeometries.Operators.coarse_coefficients`), smoothed by `smoother` with `ν` sweeps a side: two of
 [`PointJacobi`](@ref)`(0.8)`, the damped-Jacobi weight that reduces the highest-frequency error of a
 five-point Laplacian, or one pass of [`ZebraLines`](@ref) or [`AlternatingLines`](@ref).
@@ -412,17 +443,24 @@ function multigrid(c::FlowGeometries.Operators.LaplacianCoefficients{N,T},
                    boundary::FlowGeometries.Operators.AbstractBoundaryCondition;
                    smoother = default_smoother(c), ν::Int = _default_sweeps(smoother),
                    maxlevels::Int = 12) where {N,T}
-    return MultigridPreconditioner(_levels(c, boundary, maxlevels - 1), smoother, ν)
+    return MultigridPreconditioner(c, _coarse_levels(c, boundary, maxlevels - 1), smoother, ν)
 end
 
-# Grown by recursion, so each level's own type survives into the tuple.
-function _levels(c, boundary, remaining::Int)
-    remaining <= 0 && return (c,)
+# The levels below `c`, at most `remaining` of them, down to the first grid `coarsen` leaves as it is. The
+# first is built whether or not it is kept, so the vector holds coarse levels' type when it is empty.
+function _coarse_levels(c, boundary, remaining::Int)
     gc = FlowGeometries.Operators.coarsen(c.grid; pinned = _pinned(boundary))
-    gc === nothing && return (c,)
-    return (c, _levels(FlowGeometries.Operators.coarse_coefficients(c, gc, boundary; ghost = _ghost(boundary)),
-                       boundary, remaining - 1)...)
+    levels = [FlowGeometries.Operators.coarse_coefficients(c, gc; ghost = _ghost(boundary))]
+    (remaining > 0 && _shrinks(gc, c.grid)) || return empty!(levels)
+    while length(levels) < remaining
+        g = FlowGeometries.Operators.coarsen(levels[end].grid; pinned = _pinned(boundary))
+        _shrinks(g, levels[end].grid) || break
+        push!(levels, FlowGeometries.Operators.coarse_coefficients(levels[end], g; ghost = _ghost(boundary)))
+    end
+    return levels
 end
+
+_shrinks(coarse, fine) = FlowGeometries.Grids.size_tuple(coarse) != FlowGeometries.Grids.size_tuple(fine)
 
 # Where a condition holds its zeros off the end faces.
 _ghost(bc::CornerDirichlet) = bc.ghost
@@ -439,10 +477,11 @@ _pinned(::Any) = false
 The vectors one task's cycles write. The hierarchy itself is shared.
 """
 function multigrid_buffers(mg::MultigridPreconditioner; execution = ComputationalBackends.SerialBackend())
-    top = mg.levels[1]
-    z() = _zeros(execution, eltype(top.diag), FlowGeometries.Grids.size_tuple(top.grid))
-    return MultigridBuffers(z(), _line_scratch(mg.smoother, z),
-                            map(c -> LevelBuffers(c, mg.smoother; execution = execution), Base.tail(mg.levels)))
+    top = mg.fine
+    dims = FlowGeometries.Grids.size_tuple(top.grid)
+    z(sz = dims) = _zeros(execution, eltype(top.diag), sz)
+    return MultigridBuffers(z(), _line_scratch(mg.smoother, z, dims),
+                            map(c -> LevelBuffers(c, mg.smoother; execution = execution), mg.coarse))
 end
 
 _precondition!(z, r, grid, c, mg::MultigridPreconditioner, bufs;
@@ -458,6 +497,6 @@ caller removes.
 """
 function apply_preconditioner!(z, r, mg::MultigridPreconditioner, bufs::MultigridBuffers;
                                execution = ComputationalBackends.SerialBackend())
-    vcycle!(mg.levels, z, r, bufs.scratch, bufs.line, bufs.coarse, mg.smoother, mg.ν, execution)
+    vcycle!(mg.fine, z, r, bufs.scratch, bufs.line, mg, 0, bufs, execution)
     return z
 end

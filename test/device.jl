@@ -24,9 +24,12 @@ KA.synchronize(::JLArrays.JLBackend) = nothing
 
 module DeviceWalk
 
-# Every `Array` or `BitArray` reachable from `x`, with the field path that reached it. FlowGeometries'
-# lazy wrappers are walked into; any other array type is device storage and a leaf; a foreign
-# transform plan owns memory this package does not allocate.
+# Every `Array` or `BitArray` of values reachable from `x`, with the field path that reached it. An
+# `Array` of structs (a list of multigrid levels) is walked into; FlowGeometries' lazy wrappers are walked
+# into; any other array type is device storage and a leaf; a foreign transform plan owns memory this
+# package does not allocate. A `ComponentNullspace` keeps `offsets` and `totals` on the host by contract.
+using FlowGeometries: FlowGeometries as FG
+
 function host_arrays(x)
     out = Tuple{String,Type}[]
     _walk!(out, Base.IdSet{Any}(), x, "")
@@ -36,6 +39,11 @@ end
 function _walk!(out, seen, x, path)
     (x === nothing || isbits(x) || x in seen) && return nothing
     push!(seen, x)
+    x isa FG.Operators.ComponentNullspace && return _walk!(out, seen, x.perm, path * ".perm")
+    if x isa Array && !isbitstype(eltype(x))
+        foreach(i -> _walk!(out, seen, x[i], string(path, "[", i, "]")), eachindex(x))
+        return nothing
+    end
     if x isa AbstractArray
         (x isa Array || x isa BitArray) && return (push!(out, (path, typeof(x))); nothing)
         (x isa SubArray || x isa Base.ReshapedArray) && return _walk!(out, seen, parent(x), path * "→parent")
@@ -61,8 +69,9 @@ const CART = FG.Geometry.CartesianGeometry{Float64}()
 
 Test.@testset "device parity with the serial host path" begin
     Random.seed!(21)
-    for dims in ((10, 10), (6, 6, 6)), (sname, solver) in (("jacobi", HD.CGSolver(; multigrid = false)),
-                                                           ("multigrid", HD.CGSolver(; multigrid = true)))
+    for dims in ((10, 10), (6, 6, 6)),
+        (sname, solver) in (("jacobi", HD.CGSolver(; preconditioner = HD.DiagonalScaling())),
+                            ("multigrid", HD.CGSolver(; preconditioner = HD.MultigridCycle())))
         N = length(dims)
         grid = FG.Grids.StructuredGrid(CART, ntuple(d -> range(0.0, 1.0; length = dims[d]), N)...)
         fields = [randn(dims..., N) for _ in 1:2]
@@ -122,10 +131,10 @@ Test.@testset "the periodic spectral result is assembled on the device" begin
     # wrapped, since JLArrays has none.
     n = 12
     xr = range(0.0, 1.0 - 1 / n; length = n)
-    grid = FG.Grids.StructuredGrid(CART, xr, xr; topology = (true, true), period = (1.0, 1.0))
+    grid = FG.Grids.StructuredGrid(CART, xr, xr; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (1.0, 1.0))
     Random.seed!(25)
     U = randn(n, n, 2)
-    ks = FTB.wavenumber_axes((1.0, 1.0), (n, n), Val(true))
+    ks = FTB.wavenumber_axes(Float64, (1.0, 1.0), (n, n))
     V̂ = cat(FFTW.rfft(U[:, :, 1]), FFTW.rfft(U[:, :, 2]); dims = 3)
     assemble(U, V̂, invert!) = HD._cartesian_result(grid, U, V̂, HD._derivative_symbol(V̂, Float64, ks),
                                                     similar(V̂, size(V̂)[1:2]), similar(V̂, size(V̂)[1:2]), invert!)

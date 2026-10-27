@@ -12,6 +12,8 @@ using FlowGeometries: FlowGeometries
 using FlowTransformBindings: FlowTransformBindings as FTB
 using OhMyThreads: OhMyThreads
 
+HD._available(::HD._Threads) = true
+
 function HD._decompose_batch!(
     ::ComputationalBackends.AbstractThreadedBackend, batch::HD.HelmholtzBatch, fields,
     plan::HD.HelmholtzPlan,

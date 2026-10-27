@@ -16,21 +16,26 @@ A bounded direction contributes its interior corners; `R = 0` on the pair it dro
 On a `CurvilinearGrid` the primal's cell vertices are the dual's cell centres and its cell centres are
 the dual's vertices; a periodic direction takes its first vertex column across the seam, one period
 back.
+
+`a` and `b` may be given as `Val`s, as `FlowGeometries.Operators.map_rotation_pairs` passes them; the
+dual grid's type is then known where it is built.
 """
-function dual_grid(grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, a::Integer, b::Integer,
+dual_grid(grid::FlowGeometries.Grids.StructuredGrid, a::Integer, b::Integer, fm::FlowGeometries.Operators.FaceMetrics) =
+    dual_grid(grid, Val(Int(a)), Val(Int(b)), fm)
+
+function dual_grid(grid::FlowGeometries.Grids.StructuredGrid{T,G,N}, va::Val, vb::Val,
                    fm::FlowGeometries.Operators.FaceMetrics) where {G,T,N}
-    axes_dual = ntuple(Val(N)) do d
-        d == a || d == b ? FlowGeometries.Grids.corner_coordinates(grid, d) :
-                           _cell_axis(FlowGeometries.Grids.coordinates(grid, d))
-    end
-    topo = ntuple(d -> FlowGeometries.Grids.isperiodic(grid, d), Val(N))
-    per = ntuple(d -> FlowGeometries.Grids.isperiodic(grid, d) ?
-                      FlowGeometries.Grids.period(grid, d) : nothing, Val(N))
+    a, b = _val(va), _val(vb)
+    axes_dual = FlowGeometries.Operators.map_directions(vd -> _dual_axis(grid, vd, va, vb), Val(N))
     return FlowGeometries.Grids.StructuredGrid(
         FlowGeometries.Grids.grid_geometry(grid), axes_dual...;
-        mask = FlowGeometries.Operators.corner_mask(fm, a, b), topology = topo, period = per,
+        mask = FlowGeometries.Operators.corner_mask(fm, a, b), topology = FlowGeometries.Grids.topology(grid),
+        period = ntuple(d -> FlowGeometries.Grids.period(grid, d), Val(N)),
     )
 end
+
+dual_grid(grid::FlowGeometries.Grids.CurvilinearGrid, ::Val{a}, ::Val{b}, fm::FlowGeometries.Operators.FaceMetrics) where {a,b} =
+    dual_grid(grid, a, b, fm)
 
 function dual_grid(grid::FlowGeometries.Grids.CurvilinearGrid{T,G,2}, a::Integer, b::Integer,
                    fm::FlowGeometries.Operators.FaceMetrics) where {G,T}
@@ -71,8 +76,8 @@ function dual_grid(grid::FlowGeometries.Grids.CurvilinearGrid{T,G,2}, a::Integer
 
     return FlowGeometries.Grids.CurvilinearGrid(
         FlowGeometries.Grids.grid_geometry(grid), centres..., FlowGeometries.Operators.corner_mask(fm, a, b);
-        corners = verts, topology = per,
-        period = ntuple(d -> per[d] ? FlowGeometries.Grids.period(grid, d) : nothing, Val(2)),
+        corners = verts, topology = FlowGeometries.Grids.topology(grid),
+        period = ntuple(d -> FlowGeometries.Grids.period(grid, d), Val(2)),
     )
 end
 
@@ -84,6 +89,13 @@ end
     periodic || return (q, 0)
     return q == 1 ? (n, 1) : (q - 1, 0)
 end
+
+# Direction `d` of the `(a, b)` dual grid: the corners along `a` and `b`, the cells elsewhere.
+_dual_axis(grid, ::Val{d}, ::Val{a}, ::Val{b}) where {d,a,b} =
+    d == a || d == b ? FlowGeometries.Grids.corner_coordinates(grid, Val(d)) :
+                       _cell_axis(FlowGeometries.Grids.coordinates(grid)[d])
+
+@inline _val(::Val{v}) where {v} = v
 
 # A primal direction's axis in the form a corner axis of a uniform direction takes, so the `P` dual
 # grids of one primal grid share a type.
@@ -100,11 +112,13 @@ values `rotational_velocity!` reads there; in three or more dimensions `Dirichle
 dual_boundary(::FlowGeometries.Grids.FaceIndexedGrid{T,G,2}, a::Integer, b::Integer) where {G,T} =
     CornerDirichlet((true, true))
 dual_boundary(grid::FlowGeometries.Grids.StructuredGrid{T,G,2}, a::Integer, b::Integer) where {G,T} =
-    CornerDirichlet((true, true), ntuple(d -> _dropped_corners(grid, d), Val(2)))
+    CornerDirichlet((true, true), map((t, d) -> _dropped_corners(grid, d, t), FlowGeometries.Grids.topology(grid),
+                                      (1, 2)))
 
 # The coordinates of the two corners a bounded direction's dual drops, its end faces; none where it wraps.
-function _dropped_corners(grid::FlowGeometries.Grids.StructuredGrid{T}, d::Int) where {T}
-    FlowGeometries.Grids.isperiodic(grid, d) && return nothing
+_dropped_corners(::FlowGeometries.Grids.StructuredGrid, ::Int, ::FlowGeometries.Grids.Periodic) = nothing
+function _dropped_corners(grid::FlowGeometries.Grids.StructuredGrid{T}, d::Int,
+                          ::FlowGeometries.Grids.Bounded) where {T}
     f = FlowGeometries.Grids.face_coordinates(grid, d)
     return (T(first(f)), T(last(f)))
 end

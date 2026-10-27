@@ -8,7 +8,9 @@ Test.@testset "HelmholtzDecomposition.jl" begin
     include("spherical.jl")
     include("potentials.jl")
     include("device.jl")
+    include("distributed.jl")
 
     include("test_allocs.jl")
+    include("test_jet.jl")
     include("test_quality.jl")
 end

@@ -93,14 +93,19 @@ requires_periodic_domain(::AbstractPoissonSolver) = false
 """
     supports_sampling(solver, grid) -> Bool
 
-Whether `grid`'s node layout is one `solver` is defined on. A transform defined on a single node
-set answers here.
-
-[`AutoSolver`](@ref) selects on this, so it returns a `Bool` and never throws. A predicate that
-throws makes selection raise on the first candidate it cannot use, which on a spherical grid
-reaches every solver including the iterative one.
+Whether `solver`, named for `grid`, takes its nodes, from `grid`'s type and sizes. A solver named for
+`grid` is checked against this; it returns a `Bool` and never throws.
 """
 supports_sampling(::AbstractPoissonSolver, grid) = true
+
+"""
+    sampling_known(solver, grid) -> Bool
+
+Whether `grid`'s type shows its nodes are a set `solver` is defined on, where naming the solver need not.
+[`AutoSolver`](@ref) and the choice of a dual grid's solver read this, so the solvers a plan holds follow
+from the types of its inputs.
+"""
+sampling_known(::AbstractPoissonSolver, grid) = true
 
 """
     _sampling_message(solver, grid) -> String
@@ -174,7 +179,8 @@ _backend_message(solver::AbstractPoissonSolver, backend) =
 """
     library_loaded(solver) -> Bool
 
-Whether the library `solver` transforms with is loaded. [`AutoSolver`](@ref) passes over a solver
+Whether the library `solver` transforms with is loaded: `true` for a solver that needs none, and for a
+transform solver a method the library's extension defines. [`AutoSolver`](@ref) passes over a solver
 whose library is not, and a solver named directly raises, naming the package to load.
 """
 library_loaded(::AbstractPoissonSolver) = true
@@ -266,37 +272,34 @@ end
 """
     AutoSolver()
 
-Sentinel for automatic selection. It chooses on capability: geometry, node layout, mask, axis
-uniformity, the boundary condition, the execution backend and which libraries are loaded. For a
-staggered decomposition it takes the first of [`_auto_candidates`](@ref) that applies, and otherwise
-[`CGSolver`](@ref)`()`, preconditioned by multigrid. A spherical transform preconditions conjugate
-gradients when named, `CGSolver(; spectral = SphericalSpectralSolver())`.
+Sentinel for automatic selection. It chooses from types: the grid's geometry, node layout, mask, axis
+spacing and topology, the boundary condition, the execution backend and which libraries are loaded. A
+grid holding a mask array counts as masked. For a staggered decomposition it takes the first of
+[`_auto_candidates`](@ref) that applies, and otherwise [`CGSolver`](@ref)`()`, preconditioned by
+multigrid. A spherical transform preconditions conjugate gradients when named,
+`CGSolver(; preconditioner = SphericalSpectralSolver())`.
 """
 struct AutoSolver <: AbstractPoissonSolver end
 
-function _applicable(solver::AbstractPoissonSolver, grid, boundary,
-                     backend = ComputationalBackends.SerialBackend())
-    library_loaded(solver) || return false
-    supports_backend(solver, backend, grid) || return false
-    supports_boundary(solver, boundary) || return false
-    requires_full_domain(solver) && !all(FlowGeometries.Grids.mask(grid)) && return false
-    if requires_uniform_axes(solver)
-        all(d -> FlowGeometries.Grids.isuniform(grid, d), 1:ndims(grid)) || return false
-    end
-    supports_sampling(solver, grid) || return false
-    if requires_periodic_domain(solver)
-        all(d -> FlowGeometries.Grids.isperiodic(grid, d), 1:ndims(grid)) || return false
-    end
-    return true
-end
+# Whether `solver` applies to `grid` under `boundary` and `backend`, answered from their types.
+@inline _applicable(solver::AbstractPoissonSolver, grid, boundary,
+                    backend = ComputationalBackends.SerialBackend()) =
+    library_loaded(solver) && supports_backend(solver, backend, grid) &&
+    supports_boundary(solver, boundary) &&
+    (!requires_full_domain(solver) || FlowGeometries.Grids.mask(grid) isa FlowGeometries.Grids.AllActive) &&
+    (!requires_uniform_axes(solver) || FlowGeometries.Grids.isuniform(grid)) &&
+    sampling_known(solver, grid) &&
+    (!requires_periodic_domain(solver) || all(FlowGeometries.Grids.periodic_flags(grid)))
 
-function _resolve_auto_solver(grid::FlowGeometries.Grids.AbstractGrid, boundary;
-                              execution = ComputationalBackends.SerialBackend())
-    for candidate in _auto_candidates(grid)
-        _applicable(candidate, grid, boundary, execution) && return candidate
-    end
-    return CGSolver()
-end
+_resolve_auto_solver(grid::FlowGeometries.Grids.AbstractGrid, boundary;
+                     execution = ComputationalBackends.SerialBackend()) =
+    _first_applicable(_auto_candidates(grid), grid, boundary, execution, CGSolver())
+
+# The first of `candidates` that applies, and `fallback` where none does.
+_first_applicable(::Tuple{}, grid, boundary, backend, fallback) = fallback
+_first_applicable(candidates::Tuple, grid, boundary, backend, fallback) =
+    _applicable(first(candidates), grid, boundary, backend) ? first(candidates) :
+    _first_applicable(Base.tail(candidates), grid, boundary, backend, fallback)
 
 """
     select_solver(solver, grid, boundary; execution = SerialBackend()) -> AbstractPoissonSolver
@@ -306,8 +309,8 @@ resolved and validated once. Resolution reads the mask, so a caller with several
 grid calls this once and hands the result to each solve.
 
 A solver that does not [`invert the discrete Laplacian`](@ref inverts_discrete_laplacian) and
-[`preconditions`](@ref) is returned as `CGSolver(; spectral = solver)`, so the solve is of `L`; one
-that does neither is refused, as is one whose state cannot live where `execution` runs.
+[`preconditions`](@ref) is returned as `CGSolver(; preconditioner = solver)`, so the solve is of `L`;
+one that does neither is refused, as is one whose state cannot live where `execution` runs.
 """
 function select_solver(solver::AbstractPoissonSolver, grid, boundary;
                        execution = ComputationalBackends.SerialBackend())
@@ -318,7 +321,7 @@ function select_solver(solver::AbstractPoissonSolver, grid, boundary;
     _require_domain(concrete, grid)
     _require_backend(concrete, execution, grid)
     inverts_discrete_laplacian(concrete) && return _require_spectral(concrete, grid, boundary)
-    preconditions(concrete) && return CGSolver(; spectral = concrete)
+    preconditions(concrete) && return CGSolver(; preconditioner = concrete)
     throw(ArgumentError(
         "$(nameof(typeof(concrete))) has no discrete Laplacian of this grid to invert or " *
         "precondition. Decompose with it through `helmholtz_decompose_spectral`, or plan with " *
@@ -327,18 +330,6 @@ end
 
 # A conjugate-gradient solver's spectral preconditioner has to apply to the grid it solves on.
 _require_spectral(s::AbstractPoissonSolver, grid, boundary) = s
-
-# The solver a dual grid takes when the primal's was `solver`, the dual's condition `bc`. A transform
-# that does not apply to the dual's nodes or condition gives way to conjugate gradients with the
-# default preconditioner: either way the solve is of the dual `L`.
-function _dual_request(solver::AbstractPoissonSolver, dual, bc, backend)
-    solver isa AutoSolver && return solver
-    s = solver isa CGSolver ? solver.spectral : solver
-    s === nothing && return solver
-    _applicable(s, dual, bc, backend) && return solver
-    return solver isa CGSolver ? CGSolver(solver.max_iter, solver.rtol, solver.multigrid, nothing) :
-           CGSolver()
-end
 
 # ---------------------------------------------------------------------------
 # Iterative solvers on L
@@ -358,13 +349,28 @@ array of symbol values is stored or read.
 @inline lazy_axis_sum(v::NTuple{N,Any}) where {N} = Broadcast.broadcasted(+, v...)
 
 """
-    CGSolver(; max_iter = 1000, rtol = nothing, multigrid = true, spectral = nothing)
+    MultigridCycle()
+
+[`CGSolver`](@ref)'s default preconditioner: one V-cycle of the hierarchy [`multigrid`](@ref) builds
+below `L`.
+"""
+struct MultigridCycle end
+
+"""
+    DiagonalScaling()
+
+The Jacobi preconditioner of [`CGSolver`](@ref), `z = r/(−d)` with `d` the diagonal of `L`.
+"""
+struct DiagonalScaling end
+
+"""
+    CGSolver(; max_iter = 1000, rtol = nothing, preconditioner = MultigridCycle())
 
 Conjugate gradients on `−L`, which is symmetric positive (semi)definite by construction (see
-`FlowGeometries.Operators.LaplacianCoefficients`). The preconditioner is a multigrid V-cycle, Jacobi with `multigrid = false`, or with
-`spectral` a transform solver that [`preconditions`](@ref), that transform's inverse of the continuous
-Laplacian (see [`SpectralPreconditioner`](@ref)); `spectral` takes precedence over `multigrid`. On a
-singular problem the iterate and residual are kept orthogonal to `L`'s null space.
+`FlowGeometries.Operators.LaplacianCoefficients`). The preconditioner is [`MultigridCycle`](@ref)`()`,
+[`DiagonalScaling`](@ref)`()`, or a transform solver that [`preconditions`](@ref), whose inverse of the
+continuous Laplacian then preconditions (see [`SpectralPreconditioner`](@ref)). On a singular problem the
+iterate and residual are kept orthogonal to `L`'s null space.
 
 Under a spectral preconditioner the step is the flexible form `β = −⟨z₊, A p⟩/⟨p, A p⟩` (Notay,
 *SIAM J. Sci. Comput.* 22 (2000) 1444–1460), which converges when the preconditioner is not exactly
@@ -374,38 +380,51 @@ The solve stops when the residual falls to `rtol` of the right-hand side, both m
 cell-measure norm; `rtol = nothing` is `100·eps(T)` for the field's element type `T`. Works on any
 grid, mask and boundary condition.
 """
-struct CGSolver{R<:Union{Nothing,AbstractFloat},S<:Union{Nothing,AbstractPoissonSolver}} <:
+struct CGSolver{R<:Union{Nothing,AbstractFloat},P<:Union{MultigridCycle,DiagonalScaling,AbstractPoissonSolver}} <:
        AbstractPoissonSolver
     max_iter::Int
     rtol::R
-    multigrid::Bool
-    spectral::S
+    preconditioner::P
 end
 
 CGSolver(; max_iter::Int = 1000, rtol::Union{Nothing,AbstractFloat} = nothing,
-         multigrid::Bool = true, spectral::Union{Nothing,AbstractPoissonSolver} = nothing) =
-    CGSolver(max_iter, rtol, multigrid, spectral)
+         preconditioner::Union{MultigridCycle,DiagonalScaling,AbstractPoissonSolver} = MultigridCycle()) =
+    CGSolver(max_iter, rtol, preconditioner)
 
 @inline _rtol(s::CGSolver, ::Type{T}) where {T} = s.rtol === nothing ? 100 * eps(T) : T(s.rtol)
 
 # Cell by cell, so every condition on a bounded direction is honoured, and a mask with it.
 supports_boundary(::CGSolver, ::FlowGeometries.Operators.AbstractBoundaryCondition) = true
 inverts_discrete_laplacian(::CGSolver) = true
-supports_backend(s::CGSolver, backend, grid) =
-    s.spectral === nothing || supports_backend(s.spectral, backend, grid)
-_backend_message(s::CGSolver, backend) = _backend_message(s.spectral, backend)
+supports_backend(s::CGSolver, backend, grid) = _preconditioner_backend(s.preconditioner, backend, grid)
+_preconditioner_backend(p::AbstractPoissonSolver, backend, grid) = supports_backend(p, backend, grid)
+_preconditioner_backend(::Union{MultigridCycle,DiagonalScaling}, backend, grid) = true
+_backend_message(s::CGSolver, backend) = _backend_message(s.preconditioner, backend)
 
-function _require_spectral(s::CGSolver, grid, boundary)
-    p = s.spectral
-    p === nothing && return s
+_require_spectral(s::CGSolver, grid, boundary) = (_require_preconditioner(s.preconditioner, grid, boundary); s)
+
+_require_preconditioner(::Union{MultigridCycle,DiagonalScaling}, grid, boundary) = nothing
+function _require_preconditioner(p::AbstractPoissonSolver, grid, boundary)
     preconditions(p) || throw(ArgumentError(
         "$(nameof(typeof(p))) cannot precondition CGSolver: it has no inverse of the continuous " *
         "Laplacian on this grid's nodes."))
     _require_library(p)
     _require_boundary(p, boundary)
     _require_domain(p, grid)
-    return s
+    return nothing
 end
+
+# The solver a dual grid takes when the primal's was `solver`, the dual's condition `bc`. A transform
+# that does not apply to the dual's type or condition gives way to conjugate gradients preconditioned by
+# multigrid: either way the solve is of the dual `L`.
+_dual_request(solver::AutoSolver, dual, bc, backend) = solver
+_dual_request(solver::AbstractPoissonSolver, dual, bc, backend) =
+    _applicable(solver, dual, bc, backend) ? solver : CGSolver()
+_dual_request(solver::CGSolver, dual, bc, backend) = _dual_cg(solver, solver.preconditioner, dual, bc, backend)
+
+_dual_cg(solver, ::Union{MultigridCycle,DiagonalScaling}, dual, bc, backend) = solver
+_dual_cg(solver, p::AbstractPoissonSolver, dual, bc, backend) =
+    _applicable(p, dual, bc, backend) ? solver : CGSolver(solver.max_iter, solver.rtol, MultigridCycle())
 
 """
     SpectralPreconditioner{S,ST,A,LV,T}
@@ -441,12 +460,19 @@ function _constant_rayleigh(c::FlowGeometries.Operators.LaplacianCoefficients, :
     return -T(sum(L1 .* c.measure)) / c.total
 end
 
-function _precondition!(z, r, grid, c::FlowGeometries.Operators.LaplacianCoefficients{N,T},
+function _precondition!(z, r, grid, c::FlowGeometries.Operators.LaplacianCoefficients,
                         pre::SpectralPreconditioner, ::Any;
-                        execution = ComputationalBackends.SerialBackend()) where {N,T}
+                        execution = ComputationalBackends.SerialBackend())
+    smooth_from_zero!(z, r, pre.level, pre.scratch, pre.ω, pre.ν; execution = execution)
+    _spectral_correction!(z, r, grid, c, pre, loop_backend(execution, length(z)))
+    smooth!(z, r, pre.level, pre.scratch, pre.ω, pre.ν; execution = execution)
+    return z
+end
+
+# `z += M t` for the residual `t = r − A z` the presmoothing leaves, the loops on `lb`.
+function _spectral_correction!(z, r, grid, c::FlowGeometries.Operators.LaplacianCoefficients{N,T},
+                               pre::SpectralPreconditioner, lb) where {N,T}
     t, Mt, s = pre.residual, pre.correction, pre.scratch
-    lb = loop_backend(execution, length(z))
-    smooth_from_zero!(z, r, pre.level, s, pre.ω, pre.ν; execution = execution)
     FlowGeometries.Operators.apply_laplacian!(s, z, c; execution = lb)
     @. t = r + s                                        # r − A z with A = −L
     meas = c.measure
@@ -458,7 +484,6 @@ function _precondition!(z, r, grid, c::FlowGeometries.Operators.LaplacianCoeffic
     spectral_inverse!(Mt, t, grid, pre.solver, pre.state)
     shift = iszero(pre.λ0) ? zero(T) : t̄ / pre.λ0
     @. z += shift - Mt
-    smooth!(z, r, pre.level, s, pre.ω, pre.ν; execution = execution)
     return z
 end
 
@@ -520,11 +545,13 @@ _laplacian(grid, boundary) =
 
 # Read-only during a solve, so it goes on the plan and every task reads the same one: the multigrid
 # hierarchy, or a spectral preconditioner's `λ₀`.
-function prepare_shared(solver::CGSolver, grid, boundary::FlowGeometries.Operators.AbstractBoundaryCondition;
-                        coefficients = _laplacian(grid, boundary))
-    solver.spectral === nothing || return (_constant_rayleigh(coefficients, eltype(grid)), coefficients)
-    return solver.multigrid ? multigrid(coefficients, boundary) : nothing
-end
+prepare_shared(solver::CGSolver, grid, boundary::FlowGeometries.Operators.AbstractBoundaryCondition;
+               coefficients = _laplacian(grid, boundary)) =
+    _shared(solver.preconditioner, grid, boundary, coefficients)
+
+_shared(::MultigridCycle, grid, boundary, c) = multigrid(c, boundary)
+_shared(::DiagonalScaling, grid, boundary, c) = nothing
+_shared(::AbstractPoissonSolver, grid, boundary, c) = (_constant_rayleigh(c, eltype(grid)), c)
 
 function prepare_solver(solver::CGSolver, grid, boundary::FlowGeometries.Operators.AbstractBoundaryCondition;
                         execution = ComputationalBackends.SerialBackend(),
@@ -533,17 +560,22 @@ function prepare_solver(solver::CGSolver, grid, boundary::FlowGeometries.Operato
     dims = size(grid)
     ws = CGWorkspace(_zeros(execution, T, dims), _zeros(execution, T, dims),
                      _zeros(execution, T, dims), _zeros(execution, T, dims))
-    if solver.spectral !== nothing
-        λ0, c = shared
-        st = prepare_solver(solver.spectral, grid, boundary; execution = execution)
-        # The sweep weight and count of the multigrid smoother (see `multigrid`).
-        pre = SpectralPreconditioner(solver.spectral, st, _zeros(execution, T, dims),
-                                     _zeros(execution, T, dims), _zeros(execution, T, dims), c, T(λ0),
-                                     T(0.8), 2)
-        return CGState(ws, pre, nothing)
-    end
-    bufs = shared === nothing ? nothing : multigrid_buffers(shared; execution = execution)
-    return CGState(ws, shared, bufs)
+    return CGState(ws, _task_preconditioner(solver.preconditioner, grid, boundary, shared, execution)...)
+end
+
+# The preconditioner one task applies and the buffers its cycles write, from the plan's `shared` part.
+_task_preconditioner(::MultigridCycle, grid, boundary, mg, execution) =
+    (mg, multigrid_buffers(mg; execution = execution))
+_task_preconditioner(::DiagonalScaling, grid, boundary, _, execution) = (nothing, nothing)
+function _task_preconditioner(p::AbstractPoissonSolver, grid, boundary, shared, execution)
+    T = eltype(grid)
+    dims = size(grid)
+    λ0, c = shared
+    st = prepare_solver(p, grid, boundary; execution = execution)
+    # The sweep weight and count of the multigrid smoother (see `multigrid`).
+    pre = SpectralPreconditioner(p, st, _zeros(execution, T, dims), _zeros(execution, T, dims),
+                                 _zeros(execution, T, dims), c, T(λ0), T(0.8), 2)
+    return (pre, nothing)
 end
 
 function solve_poisson!(
@@ -556,13 +588,15 @@ function solve_poisson!(
     kwargs...,
 ) where {G,T,N}
     _require_boundary(solver, boundary)
-    c = coefficients
+    # The fine-grid loops; the preconditioner sizes each of its levels' loops itself.
+    return _cg_solve!(Φ, RHS, grid, solver, coefficients, state, execution, loop_backend(execution, length(Φ)))
+end
+
+# Conjugate gradients on `A = −L`, the fine-grid loops on `lb`.
+function _cg_solve!(Φ::AbstractArray{T}, RHS, grid, solver::CGSolver, c, state::CGState, execution, lb) where {T}
     ws = state.workspace
     r, p, Ap, z = ws.r, ws.p, ws.Ap, ws.z
     rtol = _rtol(solver, T)
-    # The fine-grid loops; the preconditioner sizes each of its levels' loops itself.
-    lb = loop_backend(execution, length(Φ))
-
     pre = state.preconditioner
     flex = _flexible(pre)
 

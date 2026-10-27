@@ -319,7 +319,7 @@ function suite(set::Symbol)
     structured_case("periodic $(n2)²", _periodic(n2, 2))
     structured_case("masked $(n2)²", _masked(n2))
     structured_case("bounded $(n2)², Dirichlet", _bounded(n2, 2); boundary = FG.Operators.Dirichlet())
-    structured_case("masked $(n2)², jacobi", _masked(n2); solver = HD.CGSolver(; multigrid = false))
+    structured_case("masked $(n2)², jacobi", _masked(n2); solver = HD.CGSolver(; preconditioner = HD.DiagonalScaling()))
     structured_case("curvilinear $(ncurv[1])×$(ncurv[2]), stretched", _curvilinear(ncurv...))
     println()
 
