@@ -213,7 +213,8 @@ FFT and NUFSHT routes support; the scattered fit and FastSphericalHarmonics hold
 the solver's [`prepare_spectral`](@ref) state for `grid`, reused across calls and released with
 [`close!`](@ref); without one, a state is built for the call and released on return. A fit stopped
 short of its tolerance returns with its convergence in `χ_solve`; [`helmholtz_project_spectral`](@ref)
-projects raw coefficients.
+projects raw coefficients. [`helmholtz_decompose_spectral!`](@ref) writes into a result held across
+calls.
 """
 function helmholtz_decompose_spectral(
     u::AbstractArray, grid::FlowGeometries.Grids.AbstractGrid;
@@ -221,7 +222,29 @@ function helmholtz_decompose_spectral(
     execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
     state = nothing,
 )
-    return _spectral_dispatch(u, grid, solver, execution, state)
+    return _with_spectral_state(grid, solver, execution, state) do s, exec, st
+        _decompose_spectral!(s, FlowGeometries.Grids.grid_geometry(grid), allocate_result(st, grid), u, grid,
+                             exec, st)
+    end
+end
+
+"""
+    helmholtz_decompose_spectral!(result, u, grid; solver = AutoSolver(), execution = AutoBackend(),
+                                  state = nothing) -> result
+
+[`helmholtz_decompose_spectral`](@ref) into `result`, from [`allocate_result`](@ref)`(state, grid)` for
+the state the call runs through, every array overwritten and every diagnostic set. With a held `state`
+the call allocates no field-sized array.
+"""
+function helmholtz_decompose_spectral!(
+    result::HelmholtzResult, u::AbstractArray, grid::FlowGeometries.Grids.AbstractGrid;
+    solver::AbstractPoissonSolver = AutoSolver(),
+    execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+    state = nothing,
+)
+    return _with_spectral_state(grid, solver, execution, state) do s, exec, st
+        _decompose_spectral!(s, FlowGeometries.Grids.grid_geometry(grid), result, u, grid, exec, st)
+    end
 end
 
 helmholtz_decompose_spectral(u::AbstractArray{<:Any,N}, v::AbstractArray{<:Any,N},
@@ -242,22 +265,22 @@ releases the foreign plans it holds.
 function prepare_spectral end
 
 """
-    _spectral_dispatch(u, grid, solver, execution, state)
+    _with_spectral_state(f, grid, solver, execution, state)
 
-Resolve a solver with a spectral route ([`_spectral_candidates`](@ref) under `AutoSolver`) that runs
-under `execution`, and dispatch to its extension's `_decompose_spectral(solver, geometry, u, grid,
-execution, state)`, which places `u` in the memory its transforms run in. Without a `state`, one is built
-for the call and released on return.
+`f(s, exec, st)` with `s` a solver with a spectral route ([`_spectral_candidates`](@ref) under
+`AutoSolver`) that runs under `exec`, the resolved `execution`, and `st` its state for `grid`: `state`, or
+one built for the call and released on return. `f` calls the route's extension,
+`_decompose_spectral!(s, geometry, result, u, grid, exec, st)`, which places `u` in the memory its
+transforms run in.
 """
-function _spectral_dispatch(u::AbstractArray, grid::FlowGeometries.Grids.AbstractGrid,
-                            solver::AbstractPoissonSolver, execution, state)
+function _with_spectral_state(f::F, grid::FlowGeometries.Grids.AbstractGrid, solver::AbstractPoissonSolver,
+                              execution, state) where {F}
     exec = resolve_execution_backend(execution)
     s = _resolve_spectral_solver(grid, solver, exec)
-    geom = FlowGeometries.Grids.grid_geometry(grid)
-    state === nothing || return _decompose_spectral(s, geom, u, grid, exec, state)
+    state === nothing || return f(s, exec, state)
     st = prepare_spectral(s, grid; execution = exec)
     try
-        return _decompose_spectral(s, geom, u, grid, exec, st)
+        return f(s, exec, st)
     finally
         close!(st)
     end
@@ -287,68 +310,83 @@ _auto_spectral_solver(grid::FlowGeometries.Grids.AbstractGrid, execution) =
     _first_applicable(_spectral_candidates(grid), grid, FlowGeometries.Operators.Neumann(), execution, nothing)
 
 # Hook implemented by spectral extensions: dispatch on the solver type.
-function _decompose_spectral end
+function _decompose_spectral! end
 
-# The `HelmholtzResult` of a component-last spectral velocity `velocity_hat` on a uniform, unmasked,
-# periodic Cartesian grid. `K` is the derivative symbol, one array per axis shaped to broadcast along it;
-# `kdotu` takes `k·û` and `scratch` each spectral scalar in turn, and `invert!(out, scratch)` writes its
-# physical field into `out`, free to overwrite `scratch`. `N + P + 2` inverse transforms: `u_div` (`N`),
-# the rotation potential (`P`), `χ` and the divergence. `u_harm` is each component's mean and
+"""
+    allocate_result(state, grid) -> HelmholtzResult
+
+The result [`helmholtz_decompose_spectral!`](@ref) writes through the spectral `state` on `grid`, its arrays
+in the memory the state's transforms run in.
+"""
+allocate_result(state, grid::FlowGeometries.Grids.AbstractGrid)
+
+# A result of `N` components over cells `dims`, `P` rotation-potential arrays, allocated like `proto`.
+function _spectral_result(proto::AbstractArray, ::Type{T}, dims::Tuple, ::Val{N}, ::Val{P}) where {T,N,P}
+    u_rot, u_div, u_harm = ntuple(_ -> similar(proto, T, (dims..., N)), Val(3))
+    χ = similar(proto, T, dims)
+    Rpot = ntuple(_ -> similar(proto, T, dims), Val(P))
+    dummy = SolverResult{T}(false, 0, zero(T))
+    return HelmholtzResult{N,P,T,typeof(u_rot),typeof(χ),typeof(Rpot)}(
+        u_rot, u_div, u_harm, χ, Rpot, similar(proto, T, dims), zero(T), zero(T), dummy, ntuple(_ -> dummy, Val(P)))
+end
+
+function _check_spectral_result(r::HelmholtzResult, dims::Tuple, ::Val{N}) where {N}
+    (size(r.u_rot) == (dims..., N) && size(r.χ) == dims) || throw(DimensionMismatch(
+        "the result holds parts of size $(size(r.u_rot)) and scalars of size $(size(r.χ)); this grid's are " *
+        "$((dims..., N)) and $dims"))
+    return nothing
+end
+
+# The decomposition of a component-last spectral velocity `velocity_hat` on a uniform, unmasked, periodic
+# Cartesian grid, into `result`. `K` is the derivative symbol, one array per axis shaped to broadcast along
+# it; `kdotu` takes `k·û` and `scratch` each spectral scalar in turn, multiplied by `scale`, the inverse
+# transform's normalization, and `invert!(out, scratch)` writes its physical field into `out`, free to
+# overwrite `scratch`. `N + P + 2` inverse transforms: `u_div` (`N`), the rotation potential (`P`), `χ` and
+# the divergence. `u_harm` is each component's `k = 0` coefficient times `scale`, its mean, and
 # `u_rot = U − u_div − u_harm`. Every cell has the same measure, so the fractions are ratios of plain sums
 # of squares, which run on the array's own device.
-function _cartesian_result(grid::FlowGeometries.Grids.StructuredGrid{T,<:FlowGeometries.Geometry.AbstractCartesianGeometry,N},
-                           U, velocity_hat, K, kdotu, scratch, invert!::F) where {N,T,F}
+function _cartesian_result!(result::HelmholtzResult{N,P,T}, U, velocity_hat, K, kdotu, scratch, scale::T,
+                            invert!::F) where {N,P,T,F}
     comp(A, c) = _component(A, c, Val(N))
-    # `1/k²`, zero where `k² = 0`, formed where it is read.
-    inv_k2 = Broadcast.broadcasted(x -> iszero(x) ? zero(T) : one(T) / x,
+    # `scale/k²`, zero where `k² = 0`, formed where it is read.
+    inv_k2 = Broadcast.broadcasted(x -> iszero(x) ? zero(T) : scale / x,
                                    lazy_axis_sum(ntuple(d -> K[d] .^ 2, Val(N))))
-    fill!(kdotu, zero(eltype(kdotu)))
-    for b in 1:N
-        Kb, ûb = K[b], comp(velocity_hat, b)
-        kdotu .+= Kb .* ûb
-    end
-
-    P = FlowGeometries.Operators.n_rotation_components(N)
-    dims = size(grid)
-
-    # Allocated like `U`, so the result lives where the input does.
-    u_div = similar(U, T, (dims..., N))
+    kdotu .= _k_dot(K, velocity_hat, Val(N))
     for a in 1:N
-        Ka = K[a]
-        scratch .= Ka .* kdotu .* inv_k2
-        invert!(comp(u_div, a), scratch)
+        scratch .= K[a] .* kdotu .* inv_k2
+        invert!(comp(result.u_div, a), scratch)
     end
 
     # One array per component, as on the staggered path, so `streamfunction` and `vector_potential`
     # index either the same way.
     pairs = FlowGeometries.Operators.rotation_pairs(Val(N))
-    Rpot = ntuple(Val(P)) do p
+    for p in 1:P
         a, b = pairs[p]
-        Ka, Kb, ûa, ûb = K[a], K[b], comp(velocity_hat, a), comp(velocity_hat, b)
-        scratch .= -im .* (Ka .* ûb .- Kb .* ûa) .* inv_k2
-        invert!(similar(U, T, dims), scratch)
+        scratch .= -im .* (K[a] .* comp(velocity_hat, b) .- K[b] .* comp(velocity_hat, a)) .* inv_k2
+        invert!(result.rotation_potential[p], scratch)
     end
 
     scratch .= -im .* kdotu .* inv_k2
-    χ = invert!(similar(U, T, dims), scratch)
-    scratch .= im .* kdotu
-    divergence = invert!(similar(U, T, dims), scratch)
+    invert!(result.χ, scratch)
+    scratch .= (im * scale) .* kdotu
+    invert!(result.divergence, scratch)
 
-    u_harm = similar(U, T, (dims..., N))
+    zero_mode = ntuple(_ -> 1:1, Val(N))
     for c in 1:N
-        Uc = _component(U, c, Val(N))
-        fill!(_component(u_harm, c, Val(N)), sum(Uc) / length(Uc))
+        mean = Broadcast.broadcasted(x -> real(x) * scale, view(comp(velocity_hat, c), zero_mode...))
+        comp(result.u_harm, c) .= mean
+        comp(result.u_rot, c) .= comp(U, c) .- comp(result.u_div, c) .- mean
     end
 
-    u_rot = similar(U, T, (dims..., N))
-    @. u_rot = U - u_div - u_harm
-
+    # `Σ |u_harm|²` is the cell count times the sum of the squared means.
     den = sum(abs2, U)
-    hfrac = iszero(den) ? zero(T) : sqrt(sum(abs2, u_harm) / den)
+    harm2 = (length(U) ÷ N) * sum(x -> abs2(real(x) * scale), view(velocity_hat, zero_mode..., :))
+    result.harmonic_fraction = iszero(den) ? zero(T) : sqrt(harm2 / den)
+    result.residual_fraction = zero(T)
     ok = SolverResult{T}(true, 1, zero(T))
-    return HelmholtzResult{N,P,T,typeof(u_div),typeof(χ),typeof(Rpot)}(
-        u_rot, u_div, u_harm, χ, Rpot, divergence, hfrac, zero(T), ok, ntuple(_ -> ok, Val(P)),
-    )
+    result.χ_solve = ok
+    result.rot_solve = ntuple(_ -> ok, Val(P))
+    return result
 end
 
 """
@@ -356,16 +394,22 @@ end
     _measure_ratio(A, B, w) -> T
 
 `‖A‖/‖B‖` for component-last arrays over the cells or nodes of `grid`, weighted by its measure, or by
-the cell weights `w` held in the arrays' own memory; zero where `B` is zero. The reductions run where
-the arrays live.
+the cell weights `w` held in the arrays' own memory; zero where `B` is zero. `A` may be an unmaterialized
+broadcast. The reductions run where the arrays live and allocate no array.
 """
-_measure_ratio(A::AbstractArray, B::AbstractArray, grid::FlowGeometries.Grids.AbstractGrid) =
+_measure_ratio(A, B::AbstractArray, grid::FlowGeometries.Grids.AbstractGrid) =
     _measure_ratio(A, B, FlowGeometries.Grids.measure(grid))
 
-function _measure_ratio(A::AbstractArray{T}, B::AbstractArray{T}, w::AbstractArray) where {T}
-    sq(X) = sum(c -> sum(w .* abs2.(selectdim(X, ndims(X), c))), 1:size(X, ndims(X)))
-    den = sq(B)
-    return iszero(den) ? zero(T) : T(sqrt(sq(A) / den))
+function _measure_ratio(A, B::AbstractArray{T}, w::AbstractArray) where {T}
+    den = _weighted_square(B, w)
+    return iszero(den) ? zero(T) : T(sqrt(_weighted_square(A, w) / den))
+end
+
+# `Σ_c Σ_i w[i] |X[i, c]|²` over a component-last `X`, lazily.
+function _weighted_square(X, w::AbstractArray)
+    Xb = Broadcast.instantiate(Broadcast.broadcasted(identity, X))
+    W = reshape(w, size(w)..., 1)
+    return sum(Broadcast.instantiate(Broadcast.broadcasted((wi, x) -> wi * abs2(x), W, Xb)))
 end
 
 """

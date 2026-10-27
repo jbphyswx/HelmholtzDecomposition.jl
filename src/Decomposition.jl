@@ -617,21 +617,8 @@ directions under `Neumann`, where `v` is the boundary datum of `χ`.
 function _divergent_faces!(g::NTuple{N,AbstractArray}, χ, v::NTuple{N,AbstractArray},
                            fm::FlowGeometries.Operators.FaceMetrics{N}, backend) where {N}
     FlowGeometries.Operators.gradient!(g, χ, fm; execution = backend)
-    map((gd, vd, ad) -> _edge_datum!(gd, vd, ad, backend), g, v, fm.area_op)
+    map((gd, vd, ad) -> (gd .= ifelse.(iszero.(ad), vd, gd)), g, v, fm.area_op)
     return g
-end
-
-function _edge_datum!(gd, vd, ad, backend)
-    fcart = CartesianIndices(size(gd))
-    FlowGeometries.Execution.run_indices(length(gd), backend,
-                                         FlowGeometries.Execution.Written(gd)) do lin
-        @inbounds begin
-            F = fcart[lin]
-            iszero(ad[F]) && (gd[F] = vd[F])
-        end
-        return nothing
-    end
-    return nothing
 end
 
 """
@@ -690,15 +677,10 @@ function _face_norm(f::NTuple{N,AbstractArray}, fm::FlowGeometries.Operators.Fac
     return sqrt(sum(map((fd, ad, gd) -> _face_sum(fd, ad, gd, backend, T), f, fm.area_flux, fm.gap)))
 end
 
-function _face_sum(fd, ad, gd, backend, ::Type{T}) where {T}
-    fcart = CartesianIndices(size(fd))
-    return FlowGeometries.Execution.reduce_indices(+, zero(T), length(fd), backend) do lin
-        @inbounds begin
-            F = fcart[lin]
-            T(ad[F] * gd[F] * abs2(fd[F]))
-        end
+_face_sum(fd, ad, gd, backend, ::Type{T}) where {T} =
+    FlowGeometries.Execution.reduce_cells(+, zero(T), size(fd), backend) do F
+        @inbounds T(ad[F] * gd[F] * abs2(fd[F]))
     end
-end
 
 """
     _remainder_norm(U, A, B, C, grid, meas, backend) -> T
@@ -707,24 +689,20 @@ end
 """
 function _remainder_norm(U, A, B, C, grid::FlowGeometries.Grids.FaceIndexedGrid{T,G,N}, meas, backend) where {G,T,N}
     msk = FlowGeometries.Grids.mask(grid)
-    cart = CartesianIndices(size(grid))
-    u, a, b, c = map(X -> ntuple(k -> _component(X, k, Val(N)), Val(N)), (U, A, B, C))
-    acc = FlowGeometries.Execution.reduce_indices(+, zero(T), length(cart), backend) do lin
-        @inbounds begin
-            I = cart[lin]
-            if msk[I]
-                s = zero(T)
-                for k in 1:N
-                    s += abs2(u[k][I] - a[k][I] - b[k][I] - c[k][I])
-                end
-                s * meas[I]
-            else
-                zero(T)
-            end
+    parts = map(X -> ntuple(k -> _component(X, k, Val(N)), Val(N)), (U, A, B, C))
+    acc = sum(map(parts...) do u, a, b, c
+        _weighted_cells(msk, meas, size(grid), backend, T) do I
+            @inbounds abs2(u[I] - a[I] - b[I] - c[I])
         end
-    end
+    end)
     return sqrt(acc)
 end
+
+# `Σ f(I)·meas[I]` over the active cells `I`, one reduction on `backend`.
+_weighted_cells(f::F, msk, meas, dims, backend, ::Type{T}) where {F,T} =
+    FlowGeometries.Execution.reduce_cells(+, zero(T), dims, backend) do I
+        @inbounds msk[I] ? (@inline f(I)) * meas[I] : zero(T)
+    end
 
 """
     count_holes(grid) -> Int
@@ -771,22 +749,11 @@ velocity_norm(U, grid::FlowGeometries.Grids.FaceIndexedGrid;
 # its operators divide by. A measure is nonzero on inactive cells, so the mask is read separately.
 function _velocity_norm(U, grid::FlowGeometries.Grids.FaceIndexedGrid{T,G,N}, meas, execution) where {G,T,N}
     msk = FlowGeometries.Grids.mask(grid)
-    cart = CartesianIndices(size(grid))
-    comps = ntuple(c -> _component(U, c, Val(N)), Val(N))
-    acc = FlowGeometries.Execution.reduce_indices(+, zero(T), length(cart), execution) do lin
-        @inbounds begin
-            I = cart[lin]
-            if msk[I]
-                s = zero(T)
-                for c in 1:N
-                    s += abs2(comps[c][I])
-                end
-                s * meas[I]
-            else
-                zero(T)
-            end
+    acc = sum(map(ntuple(c -> _component(U, c, Val(N)), Val(N))) do u
+        _weighted_cells(msk, meas, size(grid), execution, T) do I
+            @inbounds abs2(u[I])
         end
-    end
+    end)
     return sqrt(acc)
 end
 

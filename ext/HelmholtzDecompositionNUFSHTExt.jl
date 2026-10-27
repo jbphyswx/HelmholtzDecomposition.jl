@@ -247,14 +247,26 @@ end
 """
     NUSHTSpectralState
 
-What the spin-weighted decomposition reuses on one spherical node set: the spin-1 and spin-0 plans of its
-nodes, built under the backend of the call, the expansion degree, the radius, and each node's measure in
-the plans' memory. One per task; [`close!`](@ref HelmholtzDecomposition.close!) releases the plans.
+What the spin-weighted decomposition reuses on one spherical node set, in the plans' memory: the spin-1 and
+spin-0 plans of its nodes, built under the backend of the call; each node's measure and the spin-1 plan
+weighted by it, with the LSMR workspace its fit runs in; the velocity staged as two columns and as the
+spin-1 field; the fit's coefficients and the four coefficient arrays formed from them; the four fields
+synthesized from those; the per-order sign and the per-degree factors `R/L` and `L/R`; the expansion degree
+and the radius. One per task; [`close!`](@ref HelmholtzDecomposition.close!) releases the plans.
 """
-struct NUSHTSpectralState{T,PP,P0,W}
+struct NUSHTSpectralState{T,PP,P0,W,O,WS,S,V,A,F}
     planp::PP
     plan0::P0
     w::W
+    op::O
+    ws::WS
+    stage::S
+    V::V
+    coeffs::NTuple{5,A}
+    fields::NTuple{4,V}
+    sgn::F
+    RoverL::F
+    LoverR::F
     lmax::Int
     R::T
 end
@@ -278,16 +290,29 @@ function HD.prepare_spectral(solver::HD.SphericalNUSHTSolver,
         NUFSHT.close!(planp)
         rethrow()
     end
-    w = copyto!(similar(NUFSHT.allocate_coefficients(planp), T, size(grid)...), Array{T}(FG.Grids.measure(grid)))
-    return NUSHTSpectralState(planp, plan0, w, lmax, R)
+    mem = NUFSHT.allocate_coefficients(planp)
+    CT = Complex{T}
+    M = length(θ)
+    w = copyto!(similar(mem, T, size(grid)...), Array{T}(FG.Grids.measure(grid)))
+    op = FTB.RangeWeighted(planp, vec(w))
+    coeffs = ntuple(_ -> fill!(similar(mem, CT, lmax + 1, 2lmax + 1), zero(CT)), Val(5))
+    fields = ntuple(_ -> similar(mem, CT, M), Val(4))
+    sgn = _order_row(m -> isodd(m) ? one(T) : -one(T), mem, T, lmax)
+    RoverL = _degree_column(ℓ -> iszero(ℓ) ? zero(T) : R / sqrt(T(ℓ * (ℓ + 1))), mem, T, lmax)
+    LoverR = _degree_column(ℓ -> sqrt(T(ℓ * (ℓ + 1))) / R, mem, T, lmax)
+    return NUSHTSpectralState(planp, plan0, w, op, FTB.LSMRWorkspace(op), similar(mem, T, M, 2), similar(mem, CT, M),
+                              coeffs, fields, sgn, RoverL, LoverR, lmax, R)
 end
 
+HD.allocate_result(st::NUSHTSpectralState{T}, grid::FG.Grids.AbstractGrid{<:FG.Geometry.AbstractSphericalGeometry,T}) where {T} =
+    HD._spectral_result(st.stage, T, size(grid), Val(2), Val(1))
+
 """
-    _spin_hodge(solver, state, U, grid) -> HelmholtzResult
+    _spin_hodge!(result, solver, state, U, grid) -> result
 
 The decomposition of `U`, component-last `(u_east, u_north)` over `grid`'s nodes, through `state`'s spin-1
-and spin-0 plans of those nodes, in the plans' memory: `U` is staged there whole and every part comes back
-there. The fit weights each node by its cell's measure.
+and spin-0 plans of those nodes, in the plans' memory: `U` is staged there whole and every part is written
+into `result` there. The fit weights each node by its cell's measure.
 
 With `ₛY_ℓm = N_ℓ d^ℓ_{m,−s}(θ) e^{imφ}` (NUFSHT's convention) and the Wigner-d derivative relations,
 `∇Y_ℓm` has `u_θ + i u_φ = L ₁Y_ℓm` and `u_θ − i u_φ = −L ₋₁Y_ℓm`, `L = √(ℓ(ℓ+1))`; `k̂ × ∇` multiplies
@@ -299,52 +324,54 @@ one, `χ + iψ = R ₊a/L`, and `∇·u = −L·(₊a − ₋a)/(2R)` per mode.
 `₋a_{ℓm} = (−1)^{m+1} conj(₊a_{ℓ,−m})`: one fit gives both. Each part's coefficients obey the same
 relation, so its spin −1 field is the conjugate of its spin 1 field and `(u_θ, u_φ) = (Re V, Im V)`.
 """
-function _spin_hodge(solver::HD.SphericalNUSHTSolver, st::NUSHTSpectralState{T}, U::AbstractArray{T}, grid) where {T}
-    planp, plan0, w, lmax, R = st.planp, st.plan0, st.w, st.lmax, st.R
-    CT = Complex{T}
+function _spin_hodge!(result::HD.HelmholtzResult{2,1,T}, solver::HD.SphericalNUSHTSolver,
+                      st::NUSHTSpectralState{T}, U::AbstractArray{T}, grid) where {T}
+    planp, plan0, w = st.planp, st.plan0, st.w
     sz = size(grid)
     M = prod(sz)
     size(U) == (sz..., 2) || throw(DimensionMismatch(
         "velocity array size $(size(U)) does not match (dims..., 2) = $((sz..., 2))"))
-    mem = NUFSHT.allocate_coefficients(planp)
+    HD._check_spectral_result(result, sz, Val(2))
 
     # `U` in the plans' memory, `(u_east, u_north)` as two columns; with `θ̂` south and `φ̂` east,
     # `V = u_θ + i u_φ = −u_north + i u_east`.
-    stage = copyto!(similar(mem, T, M, 2), U)
-    V = similar(mem, CT, M)
+    stage = copyto!(st.stage, U)
+    V = st.V
     V .= complex.(.-view(stage, :, 2), view(stage, :, 1))
 
-    ap = fill!(similar(mem, CT, lmax + 1, 2lmax + 1), zero(CT))
-    _, iters, resid, ok = NUFSHT.nusht_solve_spin!(ap, V, planp; weights = vec(w), rtol = solver.rtol,
+    ap, sym, anti, cΦ, cδ = st.coeffs
+    fill!(ap, zero(eltype(ap)))
+    _, iters, resid, ok = NUFSHT.nusht_solve_spin!(ap, V, st.op; ws = st.ws, rtol = solver.rtol,
                                                    maxiter = solver.maxiter)
     fit = HD.SolverResult{T}(ok, iters, T(resid))
 
     # Column `m` of `apr` holds `₊a_{ℓ,−m}`, so `₋a = sgn · conj(apr)`. The `|m| > ℓ` slots are zero in
     # `ap` and stay zero in every array formed from it.
     apr = view(ap, :, reverse(axes(ap, 2)))
-    sgn = _order_row(m -> isodd(m) ? one(T) : -one(T), mem, T, lmax)
-    RoverL = _degree_column(ℓ -> iszero(ℓ) ? zero(T) : R / sqrt(T(ℓ * (ℓ + 1))), mem, T, lmax)
-    LoverR = _degree_column(ℓ -> sqrt(T(ℓ * (ℓ + 1))) / R, mem, T, lmax)
-    sym = similar(ap)           # the rotational part
-    anti = similar(ap)          # the divergent part
-    sym .= (ap .+ sgn .* conj.(apr)) ./ 2
-    anti .= (ap .- sgn .* conj.(apr)) ./ 2
-    cΦ = RoverL .* ap           # χ + iψ
-    cδ = .-LoverR .* anti       # ∇·u
+    sym .= (ap .+ st.sgn .* conj.(apr)) ./ 2            # the rotational part
+    anti .= (ap .- st.sgn .* conj.(apr)) ./ 2           # the divergent part
+    cΦ .= st.RoverL .* ap                               # χ + iψ
+    cδ .= .-st.LoverR .* anti                           # ∇·u
 
-    synth(c, plan) = NUFSHT.nusht_type2_spin!(similar(mem, CT, M), c, plan)
-    rot, div, Φ, δ = synth(sym, planp), synth(anti, planp), synth(cΦ, plan0), synth(cδ, plan0)
+    rot, div, Φ, δ = st.fields
+    NUFSHT.nusht_type2_spin!(rot, sym, planp)
+    NUFSHT.nusht_type2_spin!(div, anti, planp)
+    NUFSHT.nusht_type2_spin!(Φ, cΦ, plan0)
+    NUFSHT.nusht_type2_spin!(δ, cδ, plan0)
 
-    u_rot = _store_part!(similar(mem, T, sz..., 2), rot, M)
-    u_div = _store_part!(similar(mem, T, sz..., 2), div, M)
-    u_harm = fill!(similar(u_rot), zero(T))
-    χ = reshape(real.(Φ), sz)
-    ψ = reshape(imag.(Φ), sz)
-    divergence = reshape(real.(δ), sz)
+    _store_part!(result.u_rot, rot, M)
+    _store_part!(result.u_div, div, M)
+    fill!(result.u_harm, zero(T))
+    vec(result.χ) .= real.(Φ)
+    vec(result.rotation_potential[1]) .= imag.(Φ)
+    vec(result.divergence) .= real.(δ)
     Us = reshape(stage, sz..., 2)
-    rfrac = HD._measure_ratio(Us .- u_rot .- u_div, Us, w)
-    return HD.HelmholtzResult{2,1,T,typeof(u_rot),typeof(χ),Tuple{typeof(ψ)}}(
-        u_rot, u_div, u_harm, χ, (ψ,), divergence, zero(T), rfrac, fit, (fit,))
+    result.harmonic_fraction = zero(T)
+    result.residual_fraction = HD._measure_ratio(Broadcast.broadcasted((u, a, b) -> u - a - b, Us, result.u_rot, result.u_div),
+                                                 Us, w)
+    result.χ_solve = fit
+    result.rot_solve = (fit,)
+    return result
 end
 
 # The part with spin-1 field `Vp = u_θ + i u_φ` into `u`, component-last `(u_east, u_north)` over `M`
@@ -357,16 +384,17 @@ function _store_part!(u, Vp, M::Int)
 end
 
 """
-    _decompose_spectral(solver, geometry, U, grid, execution, state) -> HelmholtzResult
+    _decompose_spectral!(solver, geometry, result, U, grid, execution, state) -> result
 
-Helmholtz decomposition of a tangent velocity field on any spherical node set, through `state`'s plans; the
-parts come back in their memory. `U` is component-last carrying `(u_east, u_north)`, and the parts come
-back in that layout. `S²` is simply connected, so `u_harm` is zero; the fit's residual at the nodes is
+Helmholtz decomposition of a tangent velocity field on any spherical node set, through `state`'s plans,
+into `result` in their memory. `U` is component-last carrying `(u_east, u_north)`, and the parts are
+written in that layout. `S²` is simply connected, so `u_harm` is zero; the fit's residual at the nodes is
 `residual_fraction`.
 """
-HD._decompose_spectral(solver::HD.SphericalNUSHTSolver, ::FG.Geometry.AbstractSphericalGeometry, U::AbstractArray{T},
-                       grid::FG.Grids.AbstractGrid{<:FG.Geometry.AbstractSphericalGeometry,T}, execution,
-                       st::NUSHTSpectralState) where {T} =
-    _spin_hodge(solver, st, U, grid)
+HD._decompose_spectral!(solver::HD.SphericalNUSHTSolver, ::FG.Geometry.AbstractSphericalGeometry,
+                        result::HD.HelmholtzResult, U::AbstractArray{T},
+                        grid::FG.Grids.AbstractGrid{<:FG.Geometry.AbstractSphericalGeometry,T}, execution,
+                        st::NUSHTSpectralState) where {T} =
+    _spin_hodge!(result, solver, st, U, grid)
 
 end # module

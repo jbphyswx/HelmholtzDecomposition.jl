@@ -476,8 +476,8 @@ function _spectral_correction!(z, r, grid, c::FlowGeometries.Operators.Laplacian
     FlowGeometries.Operators.apply_laplacian!(s, z, c; execution = lb)
     @. t = r + s                                        # r − A z with A = −L
     meas = c.measure
-    tsum = FlowGeometries.Execution.reduce_indices(+, zero(T), length(t), lb) do lin
-        @inbounds t[lin] * meas[lin]
+    tsum = FlowGeometries.Execution.reduce_cells(+, zero(T), size(t), lb) do I
+        @inbounds t[I] * meas[I]
     end
     t̄ = tsum / c.total
     @. t = t - t̄
@@ -504,11 +504,10 @@ product, the one conjugate gradients minimizes in.
 """
 function _dot_measure(a, b, grid, c::FlowGeometries.Operators.LaplacianCoefficients{N,T};
                       execution = ComputationalBackends.SerialBackend()) where {N,T}
-    # `measure` is zero on inactive cells, so no mask term is needed; each cell reads only its own
-    # entries, so the index is linear.
+    # `measure` is zero on inactive cells, so no mask term is needed.
     meas = c.measure
-    return FlowGeometries.Execution.reduce_indices(+, zero(T), length(a), execution) do lin
-        @inbounds a[lin] * b[lin] * meas[lin]
+    return FlowGeometries.Execution.reduce_cells(+, zero(T), size(a), execution) do I
+        @inbounds a[I] * b[I] * meas[I]
     end
 end
 
@@ -649,7 +648,7 @@ end
 function _cg_step!(Φ, r, p, Ap, α::T, c::FlowGeometries.Operators.LaplacianCoefficients, lb) where {T}
     meas = c.measure
     if _one_component(c)
-        rr, rs = FlowGeometries.Execution.reduce_indices(_tadd, (zero(T), zero(T)), length(r), lb) do i
+        rr, rs = FlowGeometries.Execution.reduce_cells(_tadd, (zero(T), zero(T)), size(r), lb) do i
             @inbounds begin
                 Φ[i] += α * p[i]
                 ri = r[i] - α * Ap[i]
@@ -661,7 +660,7 @@ function _cg_step!(Φ, r, p, Ap, α::T, c::FlowGeometries.Operators.LaplacianCoe
         r̄ = rs / c.total
         return max(rr - r̄ * rs, zero(T)), r̄
     end
-    rr = FlowGeometries.Execution.reduce_indices(+, zero(T), length(r), lb) do i
+    rr = FlowGeometries.Execution.reduce_cells(+, zero(T), size(r), lb) do i
         @inbounds begin
             Φ[i] += α * p[i]
             ri = r[i] - α * Ap[i]
@@ -681,8 +680,8 @@ function _cg_dots!(r, z, Ap, r̄::T, c::FlowGeometries.Operators.LaplacianCoeffi
                    ::Val{F}) where {T,F}
     meas = c.measure
     if _one_component(c)
-        rz, zs, rs, zA, As = FlowGeometries.Execution.reduce_indices(_tadd, ntuple(_ -> zero(T), Val(5)),
-                                                                     length(r), lb) do i
+        rz, zs, rs, zA, As = FlowGeometries.Execution.reduce_cells(_tadd, ntuple(_ -> zero(T), Val(5)),
+                                                                   size(r), lb) do i
             @inbounds begin
                 m = meas[i]
                 ri = iszero(m) ? r[i] : r[i] - r̄
@@ -696,7 +695,7 @@ function _cg_dots!(r, z, Ap, r̄::T, c::FlowGeometries.Operators.LaplacianCoeffi
         return rz - z̄ * rs, z̄, zA - z̄ * As
     end
     c.singular && FlowGeometries.Operators.project_out_constant!(z, c; execution = lb)
-    rz, zA = FlowGeometries.Execution.reduce_indices(_tadd, (zero(T), zero(T)), length(r), lb) do i
+    rz, zA = FlowGeometries.Execution.reduce_cells(_tadd, (zero(T), zero(T)), size(r), lb) do i
         @inbounds begin
             zm = z[i] * meas[i]
             return (r[i] * zm, F ? zm * Ap[i] : zero(T))
@@ -709,12 +708,12 @@ end
 function _cg_direction!(p, z, z̄::T, β::T, c::FlowGeometries.Operators.LaplacianCoefficients, lb) where {T}
     meas = c.measure
     if iszero(z̄)
-        FlowGeometries.Execution.run_indices(length(p), lb) do i
+        FlowGeometries.Execution.run_cells(size(p), lb) do i
             @inbounds p[i] = iszero(β) ? z[i] : z[i] + β * p[i]
             return nothing
         end
     else
-        FlowGeometries.Execution.run_indices(length(p), lb) do i
+        FlowGeometries.Execution.run_cells(size(p), lb) do i
             @inbounds begin
                 zi = iszero(meas[i]) ? z[i] : z[i] - z̄
                 p[i] = iszero(β) ? zi : zi + β * p[i]

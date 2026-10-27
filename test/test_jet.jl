@@ -38,5 +38,9 @@ Test.@testset "dispatch: held periodic spectral decomposition" begin
         JET.@test_opt target_modules = targets HD.prepare_spectral(solver, grid; execution = serial)
         JET.@test_opt target_modules = targets HD.helmholtz_decompose_spectral(
             u, grid; solver, execution = serial, state = st)
+        res = HD.allocate_result(st, grid)
+        JET.@test_opt target_modules = targets HD.allocate_result(st, grid)
+        JET.@test_opt target_modules = targets HD.helmholtz_decompose_spectral!(
+            res, u, grid; solver, execution = serial, state = st)
     end
 end

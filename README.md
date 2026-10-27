@@ -170,16 +170,21 @@ using NonuniformFFTs: NonuniformFFTs
 using FlowTransformBindings: FlowTransformBindings as FTB
 # One coordinate vector per direction, plus a control volume per node.
 pts = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (x, y), areas;
-                                periodic = (true, true), period = (Lx, Ly))
+                                topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (Lx, Ly))
 res = HD.helmholtz_decompose_spectral(U, pts)   # U is (M, 2); parts, χ, ψ and ∇·u at the points
 
 # Or name the library and the mode count:
 solver = HD.CartesianNUFFTSolver(FTB.NonuniformFFTsBackend(); nk = (32, 32))
 res = HD.helmholtz_decompose_spectral(U, pts; solver)
 
-# A time series on one point set plans its transforms once; `close!` releases them.
-state = HD.prepare_solver(solver, pts, FG.Operators.Neumann())
-results = [HD.helmholtz_decompose_spectral(U, pts; solver, state) for U in snapshots]
+# A time series on one point set plans its transforms once and writes into one result; `close!`
+# releases the plans.
+state = HD.prepare_spectral(solver, pts)
+res = HD.allocate_result(state, pts)
+for U in snapshots
+    HD.helmholtz_decompose_spectral!(res, U, pts; solver, state)
+    # read res here
+end
 HD.close!(state)
 ```
 

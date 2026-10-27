@@ -35,6 +35,13 @@ Test.@testset "spectral path against closed forms" begin
     st = HD.prepare_spectral(HD.CartesianSpectralSolver(), grid)
     held = HD.helmholtz_decompose_spectral(cat(fx, fy; dims = 3), grid; solver = HD.CartesianSpectralSolver(), state = st)
     Test.@test held.χ == g.χ && held.u_div == g.u_div
+    # Written into a result held across calls: the same values, the previous field's overwritten.
+    res = HD.allocate_result(st, grid)
+    for V in (cat(-fy, fx; dims = 3), cat(fx, fy; dims = 3))
+        HD.helmholtz_decompose_spectral!(res, V, grid; solver = HD.CartesianSpectralSolver(), state = st)
+    end
+    Test.@test res.χ == held.χ && res.u_div == held.u_div && res.u_rot == held.u_rot &&
+               res.divergence == held.divergence && res.harmonic_fraction == held.harmonic_fraction
 
     # The ABC flow is Beltrami, `∇ × u = u`, so its divergence-free vector potential is `A = u`.
     m = 8

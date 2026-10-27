@@ -164,5 +164,7 @@ HelmholtzDecomposition.helmholtz_project_spectral!
 HelmholtzDecomposition.helmholtz_project_spectral
 HelmholtzDecomposition.helmholtz_potentials_spectral
 HelmholtzDecomposition.helmholtz_decompose_spectral
+HelmholtzDecomposition.helmholtz_decompose_spectral!
+HelmholtzDecomposition.prepare_spectral
 HelmholtzDecomposition.velocity_norm
 ```

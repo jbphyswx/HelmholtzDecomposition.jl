@@ -136,11 +136,13 @@ Test.@testset "the periodic spectral result is assembled on the device" begin
     U = randn(n, n, 2)
     ks = FTB.wavenumber_axes(Float64, (1.0, 1.0), (n, n))
     V̂ = cat(FFTW.rfft(U[:, :, 1]), FFTW.rfft(U[:, :, 2]); dims = 3)
-    assemble(U, V̂, invert!) = HD._cartesian_result(grid, U, V̂, HD._derivative_symbol(V̂, Float64, ks),
-                                                    similar(V̂, size(V̂)[1:2]), similar(V̂, size(V̂)[1:2]), invert!)
-    href = assemble(U, V̂, (out, x) -> copyto!(out, FFTW.irfft(x, n)))
+    assemble(U, V̂, invert!) = HD._cartesian_result!(HD._spectral_result(U, Float64, (n, n), Val(2), Val(1)), U, V̂,
+                                                     HD._derivative_symbol(V̂, Float64, ks),
+                                                     similar(V̂, size(V̂)[1:2]), similar(V̂, size(V̂)[1:2]),
+                                                     1 / n^2, invert!)
+    href = assemble(U, V̂, (out, x) -> copyto!(out, FFTW.brfft(x, n)))
     dres = assemble(JLArrays.JLArray(U), JLArrays.JLArray(V̂),
-                    (out, x) -> copyto!(out, JLArrays.JLArray(FFTW.irfft(Array(x), n))))
+                    (out, x) -> copyto!(out, JLArrays.JLArray(FFTW.brfft(Array(x), n))))
     Test.@test dres.u_rot isa JLArrays.JLArray
     Test.@test Array(dres.u_rot) ≈ href.u_rot
     Test.@test Array(dres.u_div) ≈ href.u_div

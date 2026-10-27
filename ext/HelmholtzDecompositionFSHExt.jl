@@ -250,21 +250,26 @@ function HD.prepare_spectral(solver::HD.SphericalSpectralSolver,
     return FSHSpectralState(cache, fill!(V, zero(ComplexF64)))
 end
 
+HD.allocate_result(::FSHSpectralState, grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2}) where {T} =
+    HD._spectral_result(Array{T}(undef, 0), T, size(grid), Val(2), Val(1))
+
 """
-    _decompose_spectral(solver, geometry, U, grid, execution, state) -> HelmholtzResult
+    _decompose_spectral!(solver, geometry, result, U, grid, execution, state) -> result
 
 Helmholtz decomposition of a tangent velocity field on the Fejér first-rule grid, by spin-weighted
-quadrature through `state`'s plans. `U` is component-last carrying `(u_east, u_north)`. `S²` is simply
-connected, so `u_harm` is zero; `χ`, the streamfunction `ψ` (`u_rot = k̂ × ∇ψ`) and `∇·u` come from the
-same coefficients.
+quadrature through `state`'s plans, into `result`. `U` is component-last carrying `(u_east, u_north)`.
+`S²` is simply connected, so `u_harm` is zero; `χ`, the streamfunction `ψ` (`u_rot = k̂ × ∇ψ`) and `∇·u`
+come from the same coefficients.
 """
-function HD._decompose_spectral(
+function HD._decompose_spectral!(
     ::HD.SphericalSpectralSolver,
     ::FG.Geometry.AbstractSphericalGeometry,
+    result::HD.HelmholtzResult{2,1,T},
     U::AbstractArray{T,3},
     grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractSphericalGeometry,2},
     execution, st::FSHSpectralState,
 ) where {T<:AbstractFloat}
+    HD._check_spectral_result(result, size(grid), Val(2))
     nlon, nlat = size(grid)
     R = Float64(FG.Geometry.radius(FG.Grids.grid_geometry(grid)))
     φ = FG.Grids.coordinates(grid, 2)
@@ -289,12 +294,9 @@ function HD._decompose_spectral(
         return Dv, FSH.spinsph_evaluate!(P, 0; cache = cache), FSH.spinsph_evaluate!(St, 0; cache = cache)
     end
 
-    u_div = similar(U)
-    u_rot = similar(U)
-    u_harm = zero(U)
-    χ = Matrix{T}(undef, nlon, nlat)
-    ψ = similar(χ)
-    δ = similar(χ)
+    u_div, u_rot, χ, δ = result.u_div, result.u_rot, result.χ, result.divergence
+    ψ = result.rotation_potential[1]
+    fill!(result.u_harm, zero(T))
     @inbounds for i in 1:nlon, j in 1:nlat
         row = _fsh_row(j, nlat, flip)
         d = D[row, i]
@@ -307,9 +309,11 @@ function HD._decompose_spectral(
         δ[i, j] = -real(Δ[row, i]) / R
     end
     ok = HD.SolverResult{T}(true, 1, zero(T))
-    rfrac = HD._measure_ratio(U .- u_rot .- u_div .- u_harm, U, grid)
-    return HD.HelmholtzResult{2,1,T,typeof(u_rot),typeof(χ),Tuple{typeof(ψ)}}(
-        u_rot, u_div, u_harm, χ, (ψ,), δ, zero(T), rfrac, ok, (ok,))
+    result.harmonic_fraction = zero(T)
+    result.residual_fraction = HD._measure_ratio(Broadcast.broadcasted((u, a, b) -> u - a - b, U, u_rot, u_div), U, grid)
+    result.χ_solve = ok
+    result.rot_solve = (ok,)
+    return result
 end
 
 end # module

@@ -334,26 +334,33 @@ function HD.prepare_spectral(::HD.CartesianSpectralSolver,
                                  fplan, bplan, one(T) / T(prod(dims)))
 end
 
-function HD._decompose_spectral(
+HD.allocate_result(st::PeriodicSpectralState{T},
+                   grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N}) where {T,N} =
+    HD._spectral_result(st.work, T, size(grid), Val(N), Val(FG.Operators.n_rotation_components(N)))
+
+function HD._decompose_spectral!(
     ::HD.CartesianSpectralSolver,
     ::FG.Geometry.AbstractCartesianGeometry,
+    result::HD.HelmholtzResult{N,P,T},
     U::AbstractArray{T,M},
     grid::FG.Grids.StructuredGrid{T,<:FG.Geometry.AbstractCartesianGeometry,N},
     execution, st::PeriodicSpectralState,
-) where {T,M,N}
+) where {N,P,T,M}
+    HD._check_spectral_result(result, size(grid), Val(N))
     Ud = FG.Execution.on_backend(execution, U)
     for c in 1:N
         copyto!(st.work, HD._component(Ud, c, Val(N)))
         LinearAlgebra.mul!(st.spec, st.fplan, st.work)
         copyto!(HD._component(st.velocity_hat, c, Val(N)), st.spec)
     end
-    # A multi-dimensional complex-to-real plan consumes its input, the scratch refilled for every inverse.
+    # A multi-dimensional complex-to-real plan consumes its input, the scratch refilled for every inverse,
+    # and applies to arrays of the alignment it was built for, so each inverse lands in `work`.
     invert! = function (out, x)
         LinearAlgebra.mul!(st.work, st.bplan, x)
-        out .= st.work .* st.scale
+        copyto!(out, st.work)
         return out
     end
-    return HD._cartesian_result(grid, Ud, st.velocity_hat, st.K, st.kdotu, st.spec, invert!)
+    return HD._cartesian_result!(result, Ud, st.velocity_hat, st.K, st.kdotu, st.spec, st.scale, invert!)
 end
 
 end # module

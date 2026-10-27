@@ -91,10 +91,15 @@ Test.@testset "a held state gives the one-shot result" begin
     U = first(field(x))
     s = HD.CartesianNUFFTSolver(FTB.NonuniformFFTsBackend(); nk = (12, 12), tol = 1e-12, rtol = 1e-12, maxiter = 400)
     st = HD.prepare_spectral(s, grid)
+    res = HD.allocate_result(st, grid)
     for V in (U, 2 .* U)
         held = HD.helmholtz_decompose_spectral(V, grid; solver = s, state = st)
         once = HD.helmholtz_decompose_spectral(V, grid; solver = s)
         Test.@test isapprox(held.χ, once.χ; rtol = 1e-12) && isapprox(held.u_rot, once.u_rot; rtol = 1e-12)
+        # Written into one result held across the fields.
+        HD.helmholtz_decompose_spectral!(res, V, grid; solver = s, state = st)
+        Test.@test isapprox(res.χ, held.χ; rtol = 1e-12) && isapprox(res.u_rot, held.u_rot; rtol = 1e-12) &&
+                   isapprox(res.divergence, held.divergence; rtol = 1e-12)
     end
     HD.close!(st)
 end

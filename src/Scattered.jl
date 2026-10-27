@@ -391,7 +391,8 @@ end
     L = T(FlowGeometries.Grids.period(grid, d))
     (isfinite(L) && L > 0) || throw(ArgumentError(
         "direction $d of this point set has period $L; a non-uniform FFT expands in a periodic " *
-        "basis. Pass `periodic = (true, …)` alongside `period` when building the grid."))
+        "basis. Pass `topology = (FlowGeometries.Grids.Periodic(), …)` alongside `period` when building the " *
+        "grid."))
     return L
 end
 
@@ -485,19 +486,23 @@ function _scattered_state(packing, lib, solver::CartesianNUFFTSolver, grid, ::Ty
         packing, plan, packed, buf, velocity_hat, cg, ks, K, weight, measure, parts, spectra)
 end
 
-_decompose_spectral(solver::CartesianNUFFTSolver{L,D}, ::FlowGeometries.Geometry.AbstractCartesianGeometry,
-                    U::AbstractMatrix{T}, grid::_CartesianCloud{T,D}, execution,
-                    state::ScatteredState) where {L,D,T} =
-    _decompose_scattered(solver, U, state, grid)
+allocate_result(st::ScatteredState{D,T}, grid::_CartesianCloud{T,D}) where {D,T} =
+    _spectral_result(st.measure, T, (length(st.measure),), Val(D), Val(FlowGeometries.Operators.n_rotation_components(D)))
 
-function _decompose_scattered(solver::CartesianNUFFTSolver{L,D}, U::AbstractMatrix{T},
-                              st::ScatteredState{D,T}, grid) where {L,D,T}
+_decompose_spectral!(solver::CartesianNUFFTSolver{L,D}, ::FlowGeometries.Geometry.AbstractCartesianGeometry,
+                     result::HelmholtzResult, U::AbstractMatrix{T}, grid::_CartesianCloud{T,D}, execution,
+                     state::ScatteredState) where {L,D,T} =
+    _decompose_scattered!(result, solver, U, state, grid)
+
+function _decompose_scattered!(result::HelmholtzResult{D,P,T}, solver::CartesianNUFFTSolver{L,D},
+                               U::AbstractMatrix{T}, st::ScatteredState{D,T}, grid) where {D,P,L,T}
     nk = solver.nk
     M = FlowTransformBindings.npoints(st.plan)
     size(U, 2) == D || throw(DimensionMismatch(
         "velocity has $(size(U, 2)) components for a $D-dimensional point set"))
     size(U, 1) == M || throw(DimensionMismatch(
         "velocity has $(size(U, 1)) rows against $M nodes in the plan"))
+    _check_spectral_result(result, (M,), Val(D))
 
     velocity_hat = st.velocity_hat
     fit = SolverResult{T}(true, 0, zero(T))
@@ -515,34 +520,28 @@ function _decompose_scattered(solver::CartesianNUFFTSolver{L,D}, U::AbstractMatr
 
     rot, div, harm = st.parts
     helmholtz_project_spectral!(rot, div, harm, velocity_hat, st.ks)
-
-    # The outputs follow the caller's array type.
-    u_rot = similar(U, T, M, D)
-    u_div = similar(U, T, M, D)
-    u_harm = similar(U, T, M, D)
-    _synthesize!(u_rot, rot, st)
-    _synthesize!(u_div, div, st)
-    _synthesize!(u_harm, harm, st)
+    _synthesize!(result.u_rot, rot, st)
+    _synthesize!(result.u_div, div, st)
+    _synthesize!(result.u_harm, harm, st)
 
     # χ, the `P` rotation-potential components and the divergence, as `P + 2` real scalars.
-    P = FlowGeometries.Operators.n_rotation_components(D)
     _scalar_spectra!(st.spectra, velocity_hat, st.K, Val(D))
-    scalars = similar(U, T, M, P + 2)
-    _synthesize!(scalars, st.spectra, st)
-    χ = scalars[:, 1]
-    Rpot = ntuple(p -> scalars[:, 1 + p], Val(P))
-    divergence = scalars[:, P + 2]
+    _synthesize!((result.χ, result.rotation_potential..., result.divergence), st.spectra, st)
 
-    hfrac = _measure_ratio(u_harm, U, grid)
-    rfrac = _measure_ratio(U .- u_rot .- u_div .- u_harm, U, grid)
-    return HelmholtzResult{D,P,T,typeof(u_rot),typeof(χ),typeof(Rpot)}(
-        u_rot, u_div, u_harm, χ, Rpot, divergence, hfrac, rfrac, fit, ntuple(_ -> fit, Val(P)))
+    result.harmonic_fraction = _measure_ratio(result.u_harm, U, st.measure)
+    result.residual_fraction =
+        _measure_ratio(Broadcast.broadcasted((u, a, b, h) -> u - a - b - h, U, result.u_rot, result.u_div, result.u_harm),
+                       U, st.measure)
+    result.χ_solve = fit
+    result.rot_solve = ntuple(_ -> fit, Val(P))
+    return result
 end
 
-# The `n` real fields whose spectra are the last axis of `spec`, at the plan's points, into the
-# columns of `out`: one type 2 per real-transform field, one per pair of fields as `a + ib`.
-function _synthesize!(out::AbstractMatrix, spec::AbstractArray, st::ScatteredState)
-    n = size(out, 2)
+# The `n` real fields whose spectra are the last axis of `spec`, at the plan's points, into the columns
+# of `out`, a matrix or a tuple of vectors: one type 2 per real-transform field, one per pair of fields as
+# `a + ib`.
+function _synthesize!(out, spec::AbstractArray, st::ScatteredState)
+    n = _ncolumns(out)
     for q in 1:_nfits(st.packing, n)
         _load_modes!(st.packed, st.packing, spec, q, n)
         FlowTransformBindings.nufft_type2!(st.buf, st.plan, st.packed)
@@ -550,6 +549,11 @@ function _synthesize!(out::AbstractMatrix, spec::AbstractArray, st::ScatteredSta
     end
     return out
 end
+
+_ncolumns(out::AbstractMatrix) = size(out, 2)
+_ncolumns(out::Tuple) = length(out)
+@inline _column(out::AbstractMatrix, a::Int) = view(out, :, a)
+@inline _column(out::Tuple, a::Int) = out[a]
 
 # Fit `q`'s samples: component `q`, or components `2q − 1` and `2q` as `u + iv`. An odd component
 # count leaves the last one alone in the real part.
@@ -595,16 +599,12 @@ function _load_modes!(packed, ::_ComplexPairs, spec, q::Int, D::Int)
 end
 
 function _store_samples!(out, ::_RealComponents, buf, q::Int, D::Int)
-    @inbounds for i in axes(out, 1)
-        out[i, q] = buf[i, 1]
-    end
+    copyto!(_column(out, q), view(buf, :, 1))
     return out
 end
 function _store_samples!(out, ::_ComplexPairs, buf, q::Int, D::Int)
     a, b = 2q - 1, 2q
-    @inbounds for i in axes(out, 1)
-        out[i, a] = real(buf[i, 1])
-        b <= D && (out[i, b] = imag(buf[i, 1]))
-    end
+    _column(out, a) .= real.(view(buf, :, 1))
+    b <= D && (_column(out, b) .= imag.(view(buf, :, 1)))
     return out
 end

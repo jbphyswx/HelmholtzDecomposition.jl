@@ -159,10 +159,15 @@ Test.@testset "a held spectral state gives the one-shot result" begin
         Random.seed!(37)
         fields = [randn(size(grid)..., 2) for _ in 1:2]
         st = HD.prepare_spectral(solver, grid; execution = serial)
+        res = HD.allocate_result(st, grid)
         for U in fields
             held = HD.helmholtz_decompose_spectral(U, grid; solver, execution = serial, state = st)
             once = HD.helmholtz_decompose_spectral(U, grid; solver, execution = serial)
             Test.@test held.u_rot == once.u_rot && held.χ == once.χ
+            # Written into one result held across the fields, the same values.
+            HD.helmholtz_decompose_spectral!(res, U, grid; solver, execution = serial, state = st)
+            Test.@test res.u_rot == held.u_rot && res.u_div == held.u_div && res.χ == held.χ &&
+                       res.divergence == held.divergence && res.residual_fraction == held.residual_fraction
         end
         HD.close!(st)
     end

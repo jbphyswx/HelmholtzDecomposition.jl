@@ -1,6 +1,6 @@
 # The transform solvers and the order `AutoSolver` tries them in. Each solver type is declared here and
 # implemented by the extension of the library it transforms with, which adds its `prepare_solver`,
-# `solve_poisson!`, `_decompose_spectral` and capability methods.
+# `solve_poisson!`, `allocate_result`, `_decompose_spectral!` and capability methods.
 
 """
     CartesianSpectralSolver()

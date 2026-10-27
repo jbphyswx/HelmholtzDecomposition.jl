@@ -55,6 +55,13 @@ FlowGeometries.Execution.run_chunks(f::F, n::Integer, b::LoopSizedThreads,
 FlowGeometries.Execution.reduce_indices(f::F, op::O, init, n::Integer, b::LoopSizedThreads) where {F,O} =
     FlowGeometries.Execution.reduce_indices(f, op, init, n, loop_backend(b, n))
 
+FlowGeometries.Execution.reduce_cells(f::F, op::O, init, dims::NTuple{N,Int}, b::LoopSizedThreads) where {F,O,N} =
+    FlowGeometries.Execution.reduce_cells(f, op, init, dims, loop_backend(b, prod(dims)))
+
+FlowGeometries.Execution.run_cells(f::F, dims::NTuple{N,Int}, b::LoopSizedThreads,
+                                   outs::FlowGeometries.Execution.Written...) where {F,N} =
+    FlowGeometries.Execution.run_cells(f, dims, loop_backend(b, prod(dims)), outs...)
+
 resolve_execution_backend(b::ComputationalBackends.AbstractExecutionBackend) = throw(ArgumentError(
     "$(typeof(b)) parallelises over fields, not over the index space within one field. Pass it " *
     "to `helmholtz_decompose_batch` instead; `plan_helmholtz`'s `execution` selects how the loops " *

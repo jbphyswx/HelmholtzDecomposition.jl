@@ -25,7 +25,7 @@ HelmholtzDecomposition._unavailable_message
 HelmholtzDecomposition._backend_message
 HelmholtzDecomposition._auto_candidates
 HelmholtzDecomposition._spectral_candidates
-HelmholtzDecomposition._spectral_dispatch
+HelmholtzDecomposition._with_spectral_state
 ```
 
 ## Solver kernels
@@ -73,7 +73,6 @@ HelmholtzDecomposition._unpack!
 ```@docs
 HelmholtzDecomposition.copy_slice!
 HelmholtzDecomposition._resolve_batch_backend
-HelmholtzDecomposition._extension_loaded
 HelmholtzDecomposition._unsupported_backend_message
 ```
 

@@ -175,10 +175,10 @@ end
 
 function _jacobi_first!(out, b, c::FlowGeometries.Operators.LaplacianCoefficients, ω::T, backend) where {T}
     d = c.diag
-    FlowGeometries.Execution.run_indices(length(out), backend) do lin
+    FlowGeometries.Execution.run_cells(size(out), backend) do I
         @inbounds begin
-            dI = d[lin]
-            out[lin] = iszero(dI) ? zero(eltype(out)) : ω * b[lin] / -dI
+            dI = d[I]
+            out[I] = ifelse(iszero(dI), zero(eltype(out)), ω * b[I] / -dI)
         end
         return nothing
     end
@@ -192,7 +192,7 @@ function _jacobi_sweep!(out, x, b, c::FlowGeometries.Operators.LaplacianCoeffici
     FlowGeometries.Operators.apply_laplacian!(out, x, c; execution = backend) do I, L
         @inbounds begin
             dI = d[I]
-            return iszero(dI) ? x[I] : x[I] + ω * (b[I] + L) / -dI
+            return ifelse(iszero(dI), x[I], x[I] + ω * (b[I] + L) / -dI)
         end
     end
     return out
@@ -265,11 +265,13 @@ function _line_sweep!(x, b, c::FlowGeometries.Operators.LaplacianCoefficients{N,
     grid, meas, diag, coef = c.grid, c.measure, c.diag, c.coef
     periodic = FlowGeometries.Grids.isperiodic(grid, d)
     cp, dp, w = line.cp, line.dp, line.w
+    others = _drop(dims, Val(d))
     FlowGeometries.Execution.run_indices(length(rest), lb) do ℓ
         @inbounds begin
             J = Tuple(rest[ℓ])
+            inner = all(map((j, n) -> 1 < j < n, J, others))
             iseven(sum(J; init = 0) + colour) &&
-                _solve_line!(x, b, grid, meas, diag, coef, cp, dp, w, J, dims[d], periodic, T, Val(d))
+                _solve_line!(x, b, grid, meas, diag, coef, cp, dp, w, J, dims[d], periodic, inner, T, Val(d))
         end
         return nothing
     end
@@ -284,9 +286,11 @@ end
 # One line's row of `V·(−L)`, `K x = V b + (coupling to the other directions' neighbours)`: diagonal the
 # sum of the cell's face coefficients, `−c` to each neighbour along direction `d`. An inactive cell, or one
 # with no face, keeps its value. The Thomas factors go to `cp`, `dp` and, for a periodic line, the second
-# solution of the Sherman–Morrison correction to `w` (Press et al., *Numerical Recipes*, §2.7).
+# solution of the Sherman–Morrison correction to `w` (Press et al., *Numerical Recipes*, §2.7). On a line
+# strictly inside along every other direction, `inner`, the rows before the last read their neighbours at
+# fixed offsets.
 @inline function _solve_line!(x, b, grid, meas, diag, coef, cp, dp, w, J::NTuple{M,Int}, n::Int,
-                              periodic::Bool, ::Type{T}, dir::Val) where {M,T}
+                              periodic::Bool, inner::Bool, ::Type{T}, dir::Val) where {M,T}
     I1 = _line_index(1, J, dir)
     In = _line_index(n, J, dir)
     if n == 1
@@ -304,7 +308,8 @@ end
     wprev = zero(T)
     @inbounds for i in 1:n
         I = _line_index(i, J, dir)
-        k, a, cc, d = _line_row(x, b, grid, meas, diag, coef, I, false, T, dir)
+        k, a, cc, d = (inner && i < n) ? _line_row_inner(x, b, meas, diag, coef, I, T, dir) :
+                                         _line_row(x, b, grid, meas, diag, coef, I, false, T, dir)
         if periodic
             i == 1 && (k -= γ; a = zero(T))
             i == n && (k -= α * β / γ; cc = zero(T))
@@ -360,6 +365,34 @@ end
         s = V * T(b[I]) + _cross_terms(x, grid, coef, I, Val(N), T, Val(d))
         return (k, a, cc, s)
     end
+end
+
+# `_line_row` at a cell whose face above along `d` is `I + e_d` and whose neighbours along every other
+# direction are `I ± e`.
+@inline function _line_row_inner(x, b, meas, diag, coef::NTuple{N}, I::CartesianIndex{N}, ::Type{T},
+                                 ::Val{d}) where {N,T,d}
+    @inbounds begin
+        V = T(meas[I])
+        k = -T(diag[I]) * V
+        (iszero(V) || iszero(k)) && return (one(T), zero(T), zero(T), T(x[I]))
+        cd = coef[d]
+        a = -T(cd[I])
+        cc = -T(cd[I + FlowGeometries.Grids._unit_index(Val(N), d)])
+        s = V * T(b[I]) + _cross_inner(x, coef, I, Val(N), T, Val(d))
+        return (k, a, cc, s)
+    end
+end
+
+@inline _cross_inner(x, coef, I::CartesianIndex, ::Val{0}, ::Type{T}, ::Val) where {T} = zero(T)
+@inline function _cross_inner(x, coef, I::CartesianIndex{N}, ::Val{e}, ::Type{T}, line::Val{l}) where {N,e,T,l}
+    e == l && return _cross_inner(x, coef, I, Val(e - 1), T, line)
+    @inbounds begin
+        ce = coef[e]
+        u = FlowGeometries.Grids._unit_index(Val(N), e)
+        Fhi = I + u
+        s = T(ce[I]) * T(x[I - u]) + T(ce[Fhi]) * T(x[Fhi])
+    end
+    return s + _cross_inner(x, coef, I, Val(e - 1), T, line)
 end
 
 # `Σ c (x_neighbour)` over the faces of `I` normal to every direction but the line's `l`, a neighbour past a
