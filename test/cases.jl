@@ -13,7 +13,7 @@ function _grids()
         ("periodic", FG.Grids.StructuredGrid(cart, range(0.0, 1.0 - 1 / 12; length = 12), range(0.0, 0.9; length = 10);
                                              topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (1.0, 1.0))),
         ("masked", FG.Grids.StructuredGrid(cart, xs, ys; mask = mask)),
-        ("spherical", FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(1.0), FG.Axes.PeriodicAxis(0.0, 2π, 16),
+        ("spherical", FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(1.0), FG.Axes.PeriodicUniformAxis(0.0, 2π, 16),
                                               range(-π / 2 + π / 20, π / 2 - π / 20; length = 10))),
         ("3d", FG.Grids.StructuredGrid(cart, range(0.0, 1.0; length = 6), range(0.0, 0.9; length = 5),
                                        range(0.0, 0.6; length = 4))),

@@ -15,7 +15,7 @@ using Random: Random
 Test.@testset "GPU parity" begin
     Test.@test CUDA.functional()
     N, L = 64, 1.0
-    axis = FG.Axes.PeriodicAxis(0.0, L, N)
+    axis = FG.Axes.PeriodicUniformAxis(0.0, L, N)
     grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), axis, axis)
     Random.seed!(7)
     U = randn(N, N, 2)

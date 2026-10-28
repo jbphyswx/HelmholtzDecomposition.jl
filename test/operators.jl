@@ -43,13 +43,13 @@ function grid_kinds()
         ("channel", FG.Grids.StructuredGrid(CART, xp, ys; topology = (FG.Grids.Periodic(), FG.Grids.Bounded()), period = 1.0),
          OPS.Neumann(), false),
         ("masked hole", FG.Grids.StructuredGrid(CART, xs, ys; mask = hole), OPS.Neumann(), false),
-        ("spherical lat-lon", FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(1.0), FG.Axes.PeriodicAxis(0.0, 2π, 16),
+        ("spherical lat-lon", FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(1.0), FG.Axes.PeriodicUniformAxis(0.0, 2π, 16),
                                                       range(-π / 2 + π / 20, π / 2 - π / 20; length = 10)), OPS.Neumann(), false),
         ("3-D periodic", FG.Grids.StructuredGrid(CART, xp, range(0.0, 0.8 - 0.1; length = 8), range(0.0, 0.5 - 0.1; length = 5);
                                                  topology = ntuple(_ -> FG.Grids.Periodic(), 3), period = (1.0, 0.8, 0.5)),
          OPS.Neumann(), false),
         ("3-D bounded", FG.Grids.StructuredGrid(CART, xs, ys, range(0.0, 0.5; length = 6)), OPS.Neumann(), true),
-        ("3-D spherical shell", FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(1.0), FG.Axes.PeriodicAxis(0.0, 2π, 12),
+        ("3-D spherical shell", FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(1.0), FG.Axes.PeriodicUniformAxis(0.0, 2π, 12),
                                                         range(-1.0, 1.0; length = 6), range(1.0, 1.6; length = 4)),
          OPS.Neumann(), false),
         ("curvilinear, Neumann", warped_grid(11, 9), OPS.Neumann(), true),
@@ -137,7 +137,7 @@ Test.@testset "closed forms" begin
 
     # A channel, periodic in `x` and walled in `y`, has one loop: a uniform `(U, V)` is the gradient of
     # `V y` plus the harmonic `(U, 0)`, harmonic fraction `|U| / |(U, V)|`.
-    ch = FG.Grids.StructuredGrid(CART, FG.Axes.PeriodicAxis(0.0, 1.0, n), xs)
+    ch = FG.Grids.StructuredGrid(CART, FG.Axes.PeriodicUniformAxis(0.0, 1.0, n), xs)
     U, V = 0.6, 0.8
     uc = zeros(n, n, 2); uc[:, :, 1] .= U; uc[:, :, 2] .= V
     rc = run(uc, ch)
@@ -147,7 +147,7 @@ Test.@testset "closed forms" begin
 
     # A zonal flow `u_east = C / cos φ` on a latitude band is divergence-free and curl-free, and the band
     # is an annulus: the field is its own harmonic part.
-    band = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(1.0), FG.Axes.PeriodicAxis(0.0, 2π, 16),
+    band = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(1.0), FG.Axes.PeriodicUniformAxis(0.0, 2π, 16),
                                    range(-1.0, 1.0; length = 7))
     ub = zeros(16, 7, 2)
     ub[:, :, 1] .= 0.7 ./ cos.(FG.Grids.coordinates(band, 2))'
@@ -160,7 +160,7 @@ Test.@testset "closed forms" begin
     # The collocated round trip has the symbol `cos²(kh/2)`: `(sin kx, 0)` on a periodic grid comes back
     # scaled by it, so `residual_fraction = sin²(kh/2)`.
     for (m, np) in ((1, 16), (3, 12))
-        ax = FG.Axes.PeriodicAxis(0.0, 1.0, np)
+        ax = FG.Axes.PeriodicUniformAxis(0.0, 1.0, np)
         grid = FG.Grids.StructuredGrid(CART, ax, ax)
         us = zeros(np, np, 2)
         us[:, :, 1] .= sin.(2π * m .* collect(ax))

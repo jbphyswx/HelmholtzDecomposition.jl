@@ -41,7 +41,7 @@ using FlowGeometries: FlowGeometries as FG
 using FFTW: FFTW
 
 N, L = 64, 1.0
-axis = FG.Axes.PeriodicAxis(0.0, L, N)       # N cells around a period L
+axis = FG.Axes.PeriodicUniformAxis(0.0, L, N)       # N cells around a period L
 grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), axis, axis)
 
 U = cat(u, v; dims = 3)                 # component-last (dims..., N)
@@ -51,7 +51,7 @@ result.residual_fraction                # the collocated round trip's share, sec
 ```
 
 Uniformity and periodicity are read from the axis type, so a `collect`ed axis is neither provably
-uniform nor periodic and no direct transform applies to it. A `PeriodicAxis` is also `isbits`, so a
+uniform nor periodic and no direct transform applies to it. A `PeriodicUniformAxis` is also `isbits`, so a
 grid built from one moves to a device for free.
 
 The staggered split is exact on faces (`HD.face_velocity`, `HD.face_divergent`, `HD.face_rotational`,
@@ -108,7 +108,7 @@ A1, A2, A3 = HD.vector_potential(res3)   # the 3-D vector potential
 
 ```julia
 NLON, NLAT = 128, 64
-λ = FG.Axes.PeriodicAxis(0.0, 2π, NLON)
+λ = FG.Axes.PeriodicUniformAxis(0.0, 2π, NLON)
 φ = FG.Axes.UniformAxis(-π / 2 + π / (2NLAT), π / NLAT, NLAT)
 grid = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(6.371e6), λ, φ)
 

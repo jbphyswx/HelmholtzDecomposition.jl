@@ -19,7 +19,7 @@ Test.@testset "transforms invert L" begin
     # `L Φ = f` with `L` applied from the coefficients, for the periodic FFT, the cosine and sine
     # transforms of a bounded box under either condition, a channel, and DST-I on a bounded dual grid.
     n = 12
-    xp = FG.Axes.PeriodicAxis(0.0, 1.0, n)
+    xp = FG.Axes.PeriodicUniformAxis(0.0, 1.0, n)
     xb = range(0.0, 1.0; length = n)
     box = FG.Grids.StructuredGrid(CART, xb, xb)
     dplan = HD.plan_helmholtz(box; solver = HD.CGSolver(), execution = CB.SerialBackend())
@@ -49,7 +49,7 @@ Test.@testset "spherical transforms" begin
     sph = FG.Geometry.SphericalGeometry(1.0)
     nlat = 24
     cc = FG.Connectivity.structured_grid(FG.SphericalSampling.Fejer1Sampling(), nlat; geometry = sph)
-    ll = FG.Grids.StructuredGrid(sph, FG.Axes.PeriodicAxis(0.0, 2π, 48),
+    ll = FG.Grids.StructuredGrid(sph, FG.Axes.PeriodicUniformAxis(0.0, 2π, 48),
                                  range(-π / 2 + π / 48, π / 2 - π / 48; length = 24))
     for (name, grid, solver) in (("Fejér first rule, FastSphericalHarmonics", cc, HD.SphericalSpectralSolver()),
                                  ("longitude–latitude, NUFSHT", ll,
@@ -92,7 +92,7 @@ end
 # whose rotation potential holds zero on the corners inside the hole, and on a stretched curvilinear mesh.
 Test.@testset "multigrid iterations do not grow with resolution" begin
     sph = FG.Geometry.SphericalGeometry(1.0)
-    latlon(n) = FG.Grids.StructuredGrid(sph, FG.Axes.PeriodicAxis(0.0, 2π, 2n),
+    latlon(n) = FG.Grids.StructuredGrid(sph, FG.Axes.PeriodicUniformAxis(0.0, 2π, 2n),
                                         range(-π / 2 + π / (2n), π / 2 - π / (2n); length = n))
     function holed(n)
         x = collect(range(0.0, 1.0; length = n))

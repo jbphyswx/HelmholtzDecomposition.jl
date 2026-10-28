@@ -107,7 +107,7 @@ Test.@testset "AutoSolver on a periodic grid, on each device backend" begin
     # Whatever solver each backend's arrays take, the decomposition is the serial host one, which the FFT
     # solves exactly, to conjugate gradients' accuracy: `κ(L) · 100eps`, `κ(L) ≈ 30` on this grid.
     n = 12
-    ax = FG.Axes.PeriodicAxis(0.0, 1.0, n)
+    ax = FG.Axes.PeriodicUniformAxis(0.0, 1.0, n)
     grid = FG.Grids.StructuredGrid(CART, ax, ax)
     Random.seed!(23)
     fields = [randn(n, n, 2) for _ in 1:2]

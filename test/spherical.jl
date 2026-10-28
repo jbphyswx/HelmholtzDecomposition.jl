@@ -20,7 +20,7 @@ const SB_AUTO = HD.SpectralBackends.AutoSpectralBackend()
 nrm(A) = sqrt(sum(abs2, A))
 
 # A longitude–latitude grid whose cells tile the sphere.
-latlon(nlat::Int) = FG.Grids.StructuredGrid(SPH, FG.Axes.PeriodicAxis(0.0, 2π, 2nlat),
+latlon(nlat::Int) = FG.Grids.StructuredGrid(SPH, FG.Axes.PeriodicUniformAxis(0.0, 2π, 2nlat),
                                             range(-π / 2 + π / (2nlat), π / 2 - π / (2nlat); length = nlat))
 
 # A sampling's own grid: its longitude a periodic axis, its recipe kept.
@@ -118,7 +118,7 @@ Test.@testset "coverage of the sphere" begin
     nlat = 16
     nu = HD.SphericalNUSHTSolver()
     gl = sampled(FG.SphericalSampling.GaussLegendreSampling(), nlat)
-    band = FG.Grids.StructuredGrid(SPH, FG.Axes.PeriodicAxis(0.0, 2π, 2nlat), range(-1.3, 1.3; length = nlat))
+    band = FG.Grids.StructuredGrid(SPH, FG.Axes.PeriodicUniformAxis(0.0, 2π, 2nlat), range(-1.3, 1.3; length = nlat))
     Test.@test HD.sampling_known(nu, gl)
     Test.@test !HD.sampling_known(nu, latlon(nlat)) && !HD.sampling_known(nu, band)
     Test.@test HD._resolve_spectral_solver(gl, HD.AutoSolver()) isa HD.SphericalNUSHTSolver
